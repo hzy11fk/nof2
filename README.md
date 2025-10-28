@@ -22,8 +22,8 @@
 ### 1. 下载与安装
 
 ```bash
-# git clone https://github.com/hzy11fk/nof2.git
-# cd nof2
+git clone https://github.com/hzy11fk/nof2.git
+cd nof2
 
 # (推荐) 创建并激活 Python 虚拟环境
 python -m venv .venv
