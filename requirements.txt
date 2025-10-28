@@ -1,0 +1,10 @@
+ccxt>=4.0.0      # 交易所 API 库
+pandas>=1.5.0      # 数据分析库, 用于处理 K 线数据
+pandas-ta>=0.3.0   # Pandas 技术分析扩展库, 用于计算指标
+aiohttp>=3.8.0     # 异步 HTTP 客户端/服务器 (用于 web server)
+aiohttp-cors>=0.7.0 # 处理 API 跨域请求 (如果需要将 API 给不同域的前端使用)
+numpy>=1.20.0      # 数字计算基础库 (通常是 pandas 的依赖)
+python-dotenv>=1.0.0 # 用于加载 .env 文件
+pydantic-settings>=2.0.0 # 用于加载和验证配置
+pydantic>=2.0.0    # 数据验证库 (pydantic-settings 的依赖)
+# requests         # 可选: bark_notifier.py 可能需要 requests 库
