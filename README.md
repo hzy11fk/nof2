@@ -1,4 +1,5 @@
-# AI Alpha Trader (自主交易机器人)
+# nof2 
+参考nof1设计的AI自主分析交易机器人
 
 ## 项目简介
 
@@ -21,8 +22,8 @@
 ### 1. 下载与安装
 
 ```bash
-# git clone [your-repository-url]
-# cd [repository-directory]
+# git clone https://github.com/hzy11fk/nof2.git
+# cd nof2
 
 # (推荐) 创建并激活 Python 虚拟环境
 python -m venv .venv
