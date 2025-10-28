@@ -1,26 +1,22 @@
-# 文件: alpha_trader.py (V43 - 支持加仓和部分平仓指令)
-
 import logging
 import asyncio
 import time
 import json
 import pandas as pd
-import pandas_ta as ta # 确保导入 pandas_ta
+import pandas_ta as ta 
 import re
 from collections import deque
 from config import settings
 from alpha_ai_analyzer import AlphaAIAnalyzer
-# [修改] 导入更新后的 Portfolio V22
-from alpha_portfolio import AlphaPortfolio # 假设这是 V22
+from alpha_portfolio import AlphaPortfolio # 
 from datetime import datetime
-from typing import Tuple, Dict, Any # 增加类型提示
+from typing import Tuple, Dict, Any 
 
 class AlphaTrader:
     def __init__(self, exchange):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.exchange = exchange
         self.symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
-        # [修改] 使用更新后的 Portfolio V22
         self.portfolio = AlphaPortfolio(exchange, self.symbols)
         self.ai_analyzer = AlphaAIAnalyzer(exchange, "ALPHA_TRADER")
         self.is_live_trading = settings.ALPHA_LIVE_TRADING
@@ -30,7 +26,7 @@ class AlphaTrader:
         self.initial_capital = settings.ALPHA_LIVE_INITIAL_CAPITAL if self.is_live_trading else settings.ALPHA_PAPER_CAPITAL
         self.logger.info(f"Initialized with Initial Capital: {self.initial_capital:.2f} USDT")
 
-    # --- _setup_log_handler 到 _get_ai_decision 保持不变 ---
+
     def _setup_log_handler(self):
         class DequeLogHandler(logging.Handler):
             def __init__(self, deque_instance): super().__init__(); self.deque_instance = deque_instance
@@ -53,7 +49,7 @@ class AlphaTrader:
              performance_percent = (self.portfolio.equity / initial_capital_for_calc - 1) * 100
         self.logger.info(f"Overall Performance: {performance_percent:.2f}% (based on initial capital: {initial_capital_for_calc:.2f})")
 
-    # --- _gather_all_market_data V44 版本 (计算指标) ---
+
     async def _gather_all_market_data(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         self.logger.info("Gathering full market data including indicators...")
         market_indicators_data: Dict[str, Dict[str, Any]] = {}
@@ -115,7 +111,7 @@ class AlphaTrader:
         except Exception as e: self.logger.error(f"Error gathering market data: {e}", exc_info=True)
         return market_indicators_data, fetched_tickers
 
-    # --- _build_prompt V44 版本 (处理指标和实盘 UPL) ---
+
     def _build_prompt(self, market_data: Dict[str, Dict[str, Any]], portfolio_state: Dict, tickers: Dict) -> str:
         prompt = f"It has been {(time.time() - self.start_time)/60:.1f} minutes since you started trading...\n"
         prompt += "\n--- Market Data Overview ---\n"
@@ -181,7 +177,7 @@ class AlphaTrader:
         return await self.ai_analyzer.get_ai_response(system_prompt, user_prompt)
 
 
-    # --- [核心修改] _execute_decisions 支持新指令 ---
+
     async def _execute_decisions(self, decisions: list):
         tickers = {}
         if not self.is_live_trading:
@@ -248,7 +244,7 @@ class AlphaTrader:
                              self.logger.error(f"模拟开仓/加仓失败：无法获取 {symbol} 的价格。")
 
 
-                # --- [新增] 处理部分平仓指令 ---
+           
                 elif action == "PARTIAL_CLOSE":
                     try:
                         # 优先使用 size_percent，如果不存在则尝试 size_absolute
@@ -299,7 +295,7 @@ class AlphaTrader:
                 self.logger.error(f"处理 AI 指令时发生意外错误: {order}. 错误: {e}", exc_info=True)
 
 
-    # --- _check_significant_indicator_change 到 _check_and_execute_hard_stops 保持不变 ---
+
     async def _check_significant_indicator_change(self, ohlcv_15m: list) -> (bool, str):
         try:
             if len(ohlcv_15m) < 30: return False, "" # MACD 需要足够数据
@@ -357,7 +353,7 @@ class AlphaTrader:
         return len(positions_to_close) > 0
 
 
-    # --- [核心修改] run_cycle 更新 system_prompt ---
+
     async def run_cycle(self):
         self.logger.info("="*20 + " Starting new AI decision cycle " + "="*20)
         self.invocation_count += 1
@@ -372,7 +368,7 @@ class AlphaTrader:
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
 
-        # <-- [核心修改] 更新 system_prompt 以支持新指令和分析细节 -->
+
         system_prompt = f"""
         You are an expert quantitative trading AI with a strong focus on risk management. Your task is to analyze the market, manage positions based on pre-defined rules, and generate new, well-defined trading orders.
 
@@ -424,7 +420,7 @@ class AlphaTrader:
         -   **To Hold:** Do NOT include in `orders`. Reasoning must be in `chain_of_thought`.
         -   **Symbol Validity:** `symbol` MUST be one of {self.symbols}.
         """
-        # <-- [核心修改结束] -->
+ 
 
         self.logger.info("Getting AI trading decision with new rule-based prompt...")
         ai_decision = await self._get_ai_decision(system_prompt, user_prompt_string)
@@ -434,7 +430,7 @@ class AlphaTrader:
         self.logger.warning("--- AI Chain of Thought (Original English) ---")
         self.logger.warning(original_chain_of_thought)
 
-        # --- 摘要提取邏輯 (保持不變) ---
+ 
         summary_for_ui = "Waiting for AI summary..."
         summary_keyword_pattern = re.compile(r"In summary,", re.IGNORECASE)
         parts = summary_keyword_pattern.split(original_chain_of_thought, maxsplit=1)
@@ -444,30 +440,30 @@ class AlphaTrader:
                 chinese_summary = await self.ai_analyzer.get_translation_response(english_summary)
                 summary_for_ui = chinese_summary
             else:
-                summary_for_ui = "AI 提供了摘要，但內容為空。"
+                summary_for_ui = "AI 提供了摘要，但内容为空。"
         else:
-            self.logger.warning("AI 'chain_of_thought' 中未找到 'In summary,' 關鍵字。")
-            summary_for_ui = "AI 本輪未提供策略摘要。正在檢查日誌..."
+            self.logger.warning("AI 'chain_of_thought' 中未找到 'In summary,' 关键字。")
+            summary_for_ui = "AI 本轮未提供策略摘要。正在检查日志..."
         self.last_strategy_summary = summary_for_ui
 
         if orders:
             self.logger.info(f"AI has proposed {len(orders)} order(s), executing...")
-            # --- 調用更新後的 _execute_decisions ---
+         
             await self._execute_decisions(orders)
         else:
             self.logger.info("AI did not propose any orders this cycle.")
 
         self.logger.info("="*20 + " AI decision cycle finished " + "="*20 + "\n")
 
-    # --- start 方法保持不變 ---
+
     async def start(self):
         print(f"--- AlphaTrader Start Check: self.is_live_trading = {self.is_live_trading} ---") # Debug print
         self.logger.warning(f"🚀 AI Alpha Trader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
 
         if self.is_live_trading:
-            self.logger.warning("!!! 運行在實盤模式 !!! 啟動時同步狀態...")
+            self.logger.warning("!!! 运行在实盘模式 !!! 启动时同步状态...")
             await self.portfolio.sync_state()
-            self.logger.warning("!!! 實盤狀態同步完成 !!!")
+            self.logger.warning("!!! 实盘状态同步完成 !!!")
 
         while True:
             try:
