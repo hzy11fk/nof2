@@ -509,7 +509,7 @@ class AlphaPortfolio:
         else: self.logger.warning(f"{self.mode_str} 部分平仓: {symbol} | 平掉 {size_to_close:.4f} @ {price:.4f} | 本次净盈亏: {net_pnl_part:.2f} | 剩余: {pos['size']:.4f}"); pnl_prefix = "盈利" if net_pnl_part >= 0 else "亏损"; title = f"💰 {self.mode_str} AI 部分平仓: {pnl_prefix} {abs(net_pnl_part):.2f}"; body = (f"品种:{symbol.split('/')[0]}\n方向:{pos.get('side','N/A').upper()}\n平仓价:{price:.4f}\n数量:{size_to_close:.4f}\n剩余:{pos['size']:.4f}\n原因:{reason}"); await send_bark_notification(title, body)
         await self.sync_state()
 
-    # --- [V23.6 核心修复] _parse_fee_from_order (async + BNB 转换) ---
+# --- [V23.10 完整修复版] _parse_fee_from_order (async + BNB 转换) ---
     async def _parse_fee_from_order(self, order_result: dict, symbol: str) -> float:
         """从交易所订单结果中解析手续费 (尝试转换为 USDT 等值)"""
         fees_paid_usdt = 0.0
@@ -524,42 +524,65 @@ class AlphaPortfolio:
         if 'fee' in order_result and isinstance(order_result['fee'], dict):
             fee_info = order_result['fee']
             if 'cost' in fee_info and 'currency' in fee_info:
-                try: fee_cost = float(fee_info['cost']); fee_currency = fee_info['currency']; self.logger.debug(f"Fee Parsing: Found 'fee': {fee_cost} {fee_currency}")
-                except (ValueError, TypeError): self.logger.warning(f"无法解析 'fee.cost': {fee_info}"); fee_cost = None
+                try: 
+                    fee_cost = float(fee_info['cost'])
+                    fee_currency = fee_info['currency']
+                    self.logger.debug(f"Fee Parsing: Found 'fee': {fee_cost} {fee_currency}")
+                except (ValueError, TypeError): 
+                    self.logger.warning(f"无法解析 'fee.cost': {fee_info}"); fee_cost = None
         # 其次尝试 'fees' 列表
         elif 'fees' in order_result and isinstance(order_result['fees'], list) and len(order_result['fees']) > 0:
             first_valid_fee = next((f for f in order_result['fees'] if f and 'cost' in f and 'currency' in f), None)
             if first_valid_fee:
                  try:
-                    fee_cost = float(first_valid_fee['cost']); fee_currency = first_valid_fee['currency']
-                    if len(order_result['fees']) > 1: self.logger.warning(f"{symbol} 含多个费用条目，仅处理第一个: {order_result['fees']}")
+                    fee_cost = float(first_valid_fee['cost'])
+                    fee_currency = first_valid_fee['currency']
+                    if len(order_result['fees']) > 1: 
+                        self.logger.warning(f"{symbol} 含多个费用条目，仅处理第一个: {order_result['fees']}")
                     self.logger.debug(f"Fee Parsing: Found 'fees' list: {fee_cost} {fee_currency}")
-                 except (ValueError, TypeError) as e: self.logger.warning(f"解析 'fees'列表出错: {e}"); fee_cost = None
-            else: self.logger.warning(f"{symbol} 'fees'列表为空或缺字段: {order_result['fees']}")
+                 except (ValueError, TypeError) as e: 
+                    self.logger.warning(f"解析 'fees'列表出错: {e}"); fee_cost = None
+            else: 
+                self.logger.warning(f"{symbol} 'fees'列表为空或缺字段: {order_result['fees']}")
 
         # --- 处理解析出的费用 ---
         if fee_cost is not None and fee_currency is not None:
             if fee_currency == 'USDT':
                 fees_paid_usdt = fee_cost
                 self.logger.debug(f"Fee Parsing: Fee is USDT: {fees_paid_usdt}")
+            
+            # --- [ V23.10 修复逻辑 ] ---
             elif fee_currency == 'BNB':
-                self.logger.warning(f"检测到 {symbol} 手续费以 BNB 支付: {fee_cost} BNB。尝试获取 BNB/USDT 价格进行转换...")
+                self.logger.warning(f"检测到 {symbol} 手续费以 BNB 支付: {fee_cost} BNB。尝试获取 BNB/USDT:USDT 价格进行转换...")
+                
+                # 定义正确的U本位合约符号
+                bnb_contract_symbol = 'BNB/USDT:USDT' 
+                
                 try:
-                    # --- 获取实时 BNB/USDT 价格 ---
-                    bnb_ticker = await self.client.fetch_ticker('BNB/USDT')
-                    bnb_price = bnb_ticker.get('last')
-                    if bnb_price and bnb_price > 0:
-                        fees_paid_usdt = fee_cost * bnb_price
-                        self.logger.warning(f"BNB 手续费已转换为 USDT: {fee_cost} BNB * {bnb_price} USD/BNB = {fees_paid_usdt:.4f} USDT")
+                    # 检查 BNB 合约是否在您的交易列表中
+                    if bnb_contract_symbol not in self.symbols:
+                        self.logger.error(f"BNB 手续费转换失败: '{bnb_contract_symbol}' 不在 self.symbols 列表中。")
+                        fees_paid_usdt = 0.0 # 无法转换
                     else:
-                        self.logger.error("无法获取有效的 BNB/USDT 价格，BNB 手续费将记录为 0 USDT。")
-                        fees_paid_usdt = 0.0
+                        # --- 获取实时 BNB 合约价格 ---
+                        bnb_ticker = await self.client.fetch_ticker(bnb_contract_symbol) # <--- 已修复
+                        bnb_price = bnb_ticker.get('last')
+                        
+                        if bnb_price and bnb_price > 0:
+                            fees_paid_usdt = fee_cost * bnb_price
+                            self.logger.warning(f"BNB 手续费已转换为 USDT: {fee_cost:.6f} BNB * {bnb_price} USD/BNB = {fees_paid_usdt:.4f} USDT")
+                        else:
+                            self.logger.error(f"无法获取有效的 {bnb_contract_symbol} 价格，BNB 手续费将记录为 0 USDT。")
+                            fees_paid_usdt = 0.0
+                
                 except ExchangeError as e:
-                     self.logger.error(f"获取 BNB/USDT ticker 时交易所错误: {e}。BNB 手续费将记录为 0 USDT。")
+                     self.logger.error(f"获取 {bnb_contract_symbol} ticker 时交易所错误: {e}。BNB 手续费将记录为 0 USDT。")
                      fees_paid_usdt = 0.0
                 except Exception as e:
-                    self.logger.error(f"获取 BNB/USDT 价格或转换时发生意外错误: {e}。BNB 手续费将记录为 0 USDT。", exc_info=True)
+                    self.logger.error(f"获取 {bnb_contract_symbol} 价格或转换时发生意外错误: {e}。BNB 手续费将记录为 0 USDT。", exc_info=True)
                     fees_paid_usdt = 0.0
+            # --- [ V23.10 修复结束 ] ---
+                    
             else: # 其他币种
                 self.logger.warning(f"检测到 {symbol} 手续费以非 USDT/BNB 币种支付: {fee_cost} {fee_currency}。将记录为 0 USDT。")
                 fees_paid_usdt = 0.0 # 暂不处理其他币种转换
@@ -567,7 +590,6 @@ class AlphaPortfolio:
             self.logger.warning(f"未能从 {symbol} 订单结果解析费用。将使用 0.0 USDT。")
 
         return fees_paid_usdt
-    # --- [V23.6 修复结束] ---
 
     # --- equity_history, trade_history properties 保持 V23.3 不变 ---
     @property
