@@ -1,4 +1,4 @@
-# 文件: alpha_trade_logger.py (V1 - 专用实盘交易记录器)
+# 文件: alpha_trade_logger.py 
 
 import logging
 import os
