@@ -558,16 +558,41 @@ class AlphaTrader:
         except Exception as e: self.logger.error(f"Err check indicator change: {e}", exc_info=False); return False, ""
 
     async def _check_market_volatility_spike(self, ohlcv_1h: list) -> Tuple[bool, str]:
-        """检查 1h 价格大幅波动"""
+        """
+        [V45.29 修复] 检查 1h 价格大幅波动 (边缘触发)。
+        仅在 "上一根K线" 出现波动，而 "上上一根K线" 没有波动时，才触发一次。
+        """
         try:
-            if len(ohlcv_1h) < 2: return False, ""
-            o, c = ohlcv_1h[-2][1], ohlcv_1h[-2][4]
-            if o > 0:
-                chg = abs(c - o) / o
-                if chg >= (settings.AI_VOLATILITY_TRIGGER_PERCENT / 100.0):
-                    direction = 'up' if c > o else 'down'; return True, f"1h price spike {chg:.1%} ({direction})"
+            # 我们现在需要比较 [-2] 和 [-3]，所以至少需要 3 根K线
+            if len(ohlcv_1h) < 3: 
+                return False, ""
+            
+            # --- V45.29 修复逻辑 ---
+            
+            # 1. 定义波动阈值
+            threshold_pct = settings.AI_VOLATILITY_TRIGGER_PERCENT / 100.0
+            
+            # 2. 检查 "上一根K线" ([-2])
+            o_curr, c_curr = ohlcv_1h[-2][1], ohlcv_1h[-2][4]
+            chg_curr = abs(c_curr - o_curr) / o_curr if o_curr > 0 else 0.0
+            is_spiked_curr = chg_curr >= threshold_pct
+
+            # 3. 检查 "上上一根K线" ([-3])
+            o_prev, c_prev = ohlcv_1h[-3][1], ohlcv_1h[-3][4]
+            chg_prev = abs(c_prev - o_prev) / o_prev if o_prev > 0 else 0.0
+            is_spiked_prev = chg_prev >= threshold_pct
+            
+            # 4. 边缘触发：仅在当前K线有波动，且前一根K线没有波动时触发
+            if is_spiked_curr and not is_spiked_prev:
+                direction = 'up' if c_curr > o_curr else 'down'
+                return True, f"Event: 1h price spike {chg_curr:.1%} ({direction})"
+            
+            # --- 修复结束 ---
+                
             return False, ""
-        except Exception as e: self.logger.error(f"Err check market volatility: {e}", exc_info=False); return False, ""
+        except Exception as e: 
+            self.logger.error(f"Err check market volatility: {e}", exc_info=False)
+            return False, ""
 
     async def _check_and_execute_hard_stops(self):
         """[仅模拟盘] 检查并执行硬止损/止盈"""
