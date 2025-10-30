@@ -124,7 +124,10 @@ class AlphaTrader:
            UPL: [Current Unrealized PNL and Percent (e.g., +$50.00 (+5.5%))]
            Multi-Timeframe Analysis: [Brief assessment across 5m, 15m, 1h, 4h, mentioning ADX/BBands]
            Invalidation Check: [Check condition vs current data]
-           
+           Max Loss Cutoff Check (CRITICAL):
+           - [Check UPL Percent. Is UPL Percent <= -25.0% ?]
+           - [IF YES: This position has hit the maximum loss threshold. The original trade thesis is considered FAILED, regardless of the invalidation condition.]
+           - [Decision: MUST issue a CLOSE order to cut losses.]
            Profit Management:
            - [Assess if UPL > +3% AND price is near a key S/R level (e.g., 4h recent_high, 1h BB_Upper). IF YES, SHOULD issue PARTIAL_CLOSE.]
            
