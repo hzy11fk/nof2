@@ -1,3 +1,9 @@
+# 文件: alpha_trader.py (V45.17 - 集成四大优化建议)
+# 1. [精准判断] 增加 ADX + BBands 市场罗盘
+# 2. [风险管理] 基于总净值 (Equity) 计算仓位，6U 规则改为过滤器
+# 3. [利润保护] 强制 +4% 保本止损 (Breakeven Stop)
+# 4. [利润保护] 鼓励 +3% 接近阻力位时分批平仓 (Partial Close)
+
 import logging
 import asyncio
 import time
@@ -8,9 +14,10 @@ import pandas_ta as ta
 import re
 import httpx
 from collections import deque
+# import Levenshtein # [V45.16 移除]
 from config import settings, futures_settings
 from alpha_ai_analyzer import AlphaAIAnalyzer
-from alpha_portfolio import AlphaPortfolio 
+from alpha_portfolio import AlphaPortfolio # 假设 V23.4 或更高
 from datetime import datetime
 from typing import Tuple, Dict, Any, Set, Optional # [V45.16 移除] Set
 
@@ -39,7 +46,10 @@ class AlphaTrader:
     3.  **Risk Management Foundation (CRITICAL):** Profit is the goal, but capital preservation is the foundation. You MUST strictly follow these rules:
         -   **Single Position Sizing (Open/Add):** When opening a new position OR adding to an existing one, you MUST calculate the size based on **Total Equity**, not Available Cash.
         -   **CALCULATION FORMULA (MANDATORY):** You MUST follow this formula for EACH `BUY`/`SELL` order:
-            1.  Choose a `risk_percent` (e.g., 0.02 for 2%, 0.05 for 5%). This MUST be less than or equal to 0.1 (10%).
+            1.  **Choose a `risk_percent` (DYNAMICALLY):** Your chosen `risk_percent` MUST be based on the **trade confidence** (derived from your 'Signal Confluence Score'):
+                * **High Confidence (Score: 4/4, all signals align, F&G confirms, Volume confirms):** Use a higher risk, e.g., `risk_percent = 0.05` (5% Equity).
+                * **Medium Confidence (Score: 3/4, minor conflicts, F&G neutral):** Use a lower risk, e.g., `risk_percent = 0.025` (2.5% Equity).
+                * **Low Confidence (Score: 1-2/4):** ABORT. Do not trade.
             2.  `calculated_desired_margin = Total Equity * risk_percent`.
             3.  **Check Cash:** Is `calculated_desired_margin` <= `Available Cash`?
                 -   IF NO: **Abort the trade.** (Cash is insufficient for this risk).
@@ -48,7 +58,7 @@ class AlphaTrader:
                 -   IF `calculated_desired_margin` < 6.0: **Abort the trade.** Your risk calculation (${{calculated_desired_margin:.2f}}) is below the 6.0 USDT minimum margin. The trade is too small to be valid.
                 -   IF `calculated_desired_margin` >= 6.0: `final_desired_margin = calculated_desired_margin`. (Proceed)
             5.  `size = (final_desired_margin * leverage) / current_price`.
-            6.  **Check BTC Minimum Size (CRITICAL):**
+            6.  **Check BTC Minimum Size (CRITICAL):** (V45.26 修复)
                 -   IF `symbol` is "BTC/USDT:USDT":
                     -   IF `size` >= 0.001: **Proceed.** (Size is valid).
                     -   IF `size` < 0.001:
@@ -58,22 +68,17 @@ class AlphaTrader:
                         -   **Check Cash Again:** Is `recalculated_margin` <= `Available Cash`?
                             -   IF NO: **Abort the trade.** (Cash is insufficient for the minimum BTC size: ${{recalculated_margin:.2f}} > ${{Available Cash:.2f}}).
                             -   IF YES: **Proceed.** (Use the adjusted values: `final_desired_margin = recalculated_margin`, `size = new_size`).
-        -   **Example (Good):** Total Equity $1000, Available Cash $500, leverage 10x, risk 5%.
-            `calculated_margin = 1000 * 0.05 = 50.0`.
-            Check Cash: `50.0` <= `500.0` (OK).
-            Check Min Margin: `50.0` >= 6.0 (OK).
-            `final_margin = 50.0`. `size = (50.0 * 10) / price`.
-        -   **Example (Abort, Cash):** Total Equity $1000, Available Cash $40, leverage 10x, risk 5%.
-            `calculated_margin = 1000 * 0.05 = 50.0`.
-            Check Cash: `50.0` <= `40.0` (FAIL). Abort trade.
-        -   **Example (Abort, Min Margin):** Total Equity $100, Available Cash $100, leverage 10x, risk 5%.
-            `calculated_margin = 100 * 0.05 = 5.0`.
-            Check Cash: `5.0` <= `100.0` (OK).
-            Check Min Margin: `5.0` >= 6.0 (FAIL). Abort trade.
         -   **Total Exposure:** The sum of all margins for all open positions should generally not exceed 50-60% of your total equity.
-        -   **Correlation Control:** Avoid holding highly correlated assets in the same direction.
+        -   **Correlation Control (Hard Cap):** (V45.28 优化) You MUST limit total risk exposure to highly correlated assets.
+            -   Define 'Core Crypto Group' as [BTC, ETH]. Total margin for this group MUST NOT exceed 30% of Total Equity.
+            -   Define 'Altcoin Group' as [SOL, BNB, DOGE, XRP]. Total margin for this group MUST NOT exceed 40% of Total Equity.
+            -   If opening a new position (e.g., SOL) would breach its group cap, you MUST ABORT the trade.
 
     4.  **Complete Trade Plans (Open/Add):** Every new `BUY` or `SELL` order is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
+        -   **Smarter Invalidation:** (V45.28 优化) Your `invalidation_condition` MUST be based on a clear technical breakdown of the *original trade thesis*.
+            -   *Trend Trade Example:* `Invalidation='1h Close below the EMA 50'` (if thesis was a 1h uptrend).
+            -   *Trend Trade Example:* `Invalidation='4h ADX drops below 20'` (if thesis was a 4h trend).
+            -   *Ranging Trade Example:* `Invalidation='15m RSI breaks above 60'` (if thesis was a 15m overbought short).
         -   **Profit-Taking Strategy:** You SHOULD consider using multiple take-profit levels (by using `PARTIAL_CLOSE` later) rather than a single `take_profit`.
 
     5.  **Market State Recognition (Using ADX & BBands):**
@@ -89,7 +94,8 @@ class AlphaTrader:
         -   **3. Chop (Uncertain):**
             -   **Condition:** 1h or 4h **ADX_14 is between 20 and 25**.
             -   **Strategy:** This is an uncertain market. **WAIT** for a clear signal (ADX > 25 or ADX < 20).
-    6.  **Market Sentiment Filter (Fear & Greed Index):**
+
+    6.  **Market Sentiment Filter (Fear & Greed Index):** (V45.26 优化)
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter for your decisions.
         -   **Extreme Fear (Index < 25):** The market is panicking.
             -   **Action:** Be EXTREMELY cautious with new LONG signals (high risk of failure). Prioritize capital preservation. SHORT signals (breakdowns) are higher confidence.
@@ -101,6 +107,7 @@ class AlphaTrader:
             -   **Action:** LONG signals (pullbacks) are higher confidence. Be cautious with new SHORTs.
         -   **Extreme Greed (Index > 75):** The market is euphoric (high risk of reversal).
             -   **Action:** Be EXTREMELY cautious opening new LONGs (risk of "buying the top"). Actively look for `PARTIAL_CLOSE` opportunities on existing LONG positions.
+
     **Multi-Timeframe Confirmation Requirement (CRITICAL):**
     - You MUST analyze and confirm signals across available timeframes: **5min, 15min, 1hour, and 4hour**.
     - **High-Confidence Signal Definition:** A signal is only high-confidence when it aligns with the **Market State** (see Rule 5) and shows alignment across **at least 3** timeframes.
@@ -124,33 +131,43 @@ class AlphaTrader:
         - Regime: [Trending Bullish (ADX>25) / Trending Bearish (ADX>25) / Ranging (ADX<20) / Chop (ADX 20-25)]
         - Key Support/Resistance Levels: [Identify major S/R levels, including BB_Upper/Lower and recent_high/low for relevant symbols]
         - Volume Analysis: [Assess volume confirmation]
+        - Market Sentiment: [MUST state the F&G Index value and its implication, e.g., "Extreme Greed (80)"]
 
         Portfolio Overview:
         Total Equity: $X, Available Cash: $Y, Current Margin Usage: Z%
-        Current Market Correlation Assessment: [Evaluate if positions are overly correlated]
+        Current Market Correlation Assessment: [Assess if positions are overly correlated based on Correlation Control (Rule 3) hard caps]
 
         Let's break down each position:
         1. [SYMBOL] ([SIDE]):
            UPL: [Current Unrealized PNL and Percent (e.g., +$50.00 (+5.5%))]
            Multi-Timeframe Analysis: [Brief assessment across 5m, 15m, 1h, 4h, mentioning ADX/BBands]
+           
            Invalidation Check: [Check condition vs current data]
-           Max Loss Cutoff Check (CRITICAL):
+           
+           Max Loss Cutoff Check (CRITICAL): (V45.27 优化)
            - [Check UPL Percent. Is UPL Percent <= -25.0% ?]
            - [IF YES: This position has hit the maximum loss threshold. The original trade thesis is considered FAILED, regardless of the invalidation condition.]
            - [Decision: MUST issue a CLOSE order to cut losses.]
+           
+           Pyramiding Check (Adding to a Winner): (V45.28 优化)
+           - [Is UPL Percent > +2.5% AND is the original trend (ADX > 25) still strong?]
+           - [AND has price pulled back to a key support (for Long) / resistance (for Short) (e.g., 1h EMA 20)?]
+           - [IF YES: Consider an `ADD` order. This new entry is treated as a separate trade and MUST follow the full Rule 3 (Sizing) / Rule 4 (SL/TP) logic.]
+           - [CRITICAL: You MUST NEVER add to a losing position (UPL < 0). Averaging down is forbidden.]
+           
            Profit Management:
            - [Assess if UPL > +3% AND price is near a key S/R level (e.g., 4h recent_high, 1h BB_Upper). IF YES, SHOULD issue PARTIAL_CLOSE.]
            
            Trailing Stop Assessment (MANDATORY CHECK):
            - [Check Rule 3: Is UPL > +4.0%? IF YES, MUST issue UPDATE_STOPLOSS to breakeven. IF NO, evaluate other trailing stop logic.]
            
-           Decision: [Hold/Close/Partial Close/Add/Update StopLoss + Reason]
+           Decision: [Hold/Close/Partial Close/Add/Update StopLoss + Reason. NOTE: Max Loss Cutoff check overrides all "Hold" decisions.]
 
         ... [Repeat for each open position] ...
 
         New Trade Opportunities Analysis:
         Available Margin for New Trades: [Calculate based on Total Equity and risk rules]
-        Correlation Check: [Ensure new trades don't over-concentrate]
+        Correlation Check: [Ensure new trades don't breach Rule 3 Correlation Control hard caps]
 
         Multi-Timeframe Signal Requirements (Must meet 3+ factors on 5m, 15m, 1h, 4h):
         - Trend alignment (or Ranging setup) confirmed by Market State (ADX/BBands)
@@ -177,7 +194,7 @@ class AlphaTrader:
 
     **Order Object Rules:**
     -   **To Open or Add:** `{{"action": "BUY", "symbol": "...", "size": [CALCULATED_SIZE], "leverage": 10, "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Calculation: Based on Total Equity. final_margin={{final_margin_usd:.2f}} (must be >= 6.0). size=(Final Margin)*lev/price=... Multi-TF confirm: [...]. Market State: [...]"}}`
-    -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Manual decision..."}}`
+    -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
     -   **To Close Partially (Take Profit):** `{{"action": "PARTIAL_CLOSE", "symbol": "...", "size_percent": 0.5, "reasoning": "Taking 50% profit near resistance per Rule 4..."}}` (or `size_absolute`)
     -   **To Update Stop Loss (Trailing/Breakeven):** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Moving stop loss to breakeven (Rule 3) / Trailing profit..."}}`
     -   **To Hold:** Do NOT include in `orders`.
@@ -185,7 +202,6 @@ class AlphaTrader:
 
     **Remember:** Quality over quantity.
     """
-
     def __init__(self, exchange):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.exchange = exchange
@@ -199,6 +215,9 @@ class AlphaTrader:
         self.initial_capital = settings.ALPHA_LIVE_INITIAL_CAPITAL if self.is_live_trading else settings.ALPHA_PAPER_CAPITAL
         self.logger.info(f"Initialized with Initial Capital: {self.initial_capital:.2f} USDT")
         self.formatted_symbols = ", ".join(f'"{s}"' for s in self.symbols)
+        # --- [V45.16 移除] 不再需要 last_translated_english_summary ---
+        # self.last_translated_english_summary: Optional[str] = None
+        # --- [移除结束] ---
         if hasattr(self.portfolio, 'client'): self.client = self.portfolio.client
         else:
             if hasattr(self.portfolio, 'exchange') and isinstance(self.portfolio.exchange, object): self.client = self.portfolio.exchange; self.logger.warning("Portfolio missing 'client', falling back.")
@@ -674,23 +693,30 @@ class AlphaTrader:
             self.logger.info("AI proposed no orders.")
 
         self.logger.info("="*20 + " AI Cycle Finished " + "="*20 + "\n")
-
     async def start(self):
-        """[V45.18 修复] 启动 AlphaTrader 主循环。修复 sync_state() 调用错误。"""
+        """[V45.27 修复] 启动 AlphaTrader 主循环。增加健壮性，确保 sync_state 成功后才能 run_cycle。"""
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
             self.logger.warning("!!! LIVE MODE !!! Syncing state on startup...")
             if not hasattr(self, 'client') and hasattr(self.portfolio, 'client'): self.client = self.portfolio.client
             try: 
-                # 启动时的 sync_state 调用是正确的 (没有参数)
                 await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
             except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
         
         while True:
             try:
-                await self._update_fear_and_greed_index()
-                # [V45.18 修复] 我们仍然需要 tickers 来检查强制止盈 (TP)
-                # 但我们不再将其传递给 sync_state
+                # --- [ V45.27 核心修复 ] ---
+                # 步骤 1: 状态同步 (必须成功)
+                try:
+                    await self.portfolio.sync_state()
+                    self.logger.info("Portfolio state sync successful.")
+                except Exception as e_sync:
+                    self.logger.critical(f"Main loop sync_state failed: {e_sync}. Skipping AI cycle, will retry...", exc_info=True)
+                    await asyncio.sleep(30) # 等待 30 秒后重试同步
+                    continue # 跳过本轮循环，直接进入下一次循环尝试 sync_state
+                # --- [ 修复结束 ] ---
+
+                # 步骤 2: 获取 Tickers (用于强制止盈检查)
                 tickers = {}
                 try:
                     if not hasattr(self, 'client'): self.client = self.portfolio.client
@@ -698,20 +724,16 @@ class AlphaTrader:
                 except Exception as e_tick:
                     self.logger.error(f"Main loop fetch_tickers failed: {e_tick}", exc_info=False)
                 
-                # --- [V45.18 核心修复] ---
-                # 移除传递给 sync_state 的 tickers 参数
-                await self.portfolio.sync_state() 
-                # --- [修复结束] ---
-                
+                # 步骤 3: 记录状态
                 await self._log_portfolio_status()
                 
+                # 步骤 4: 强制止盈 (FTP) 逻辑 (实盘)
                 if self.is_live_trading and futures_settings.ENABLE_FORCED_TAKE_PROFIT:
                     try:
                         if not hasattr(self, 'client'): self.logger.error("Forced TP check failed: No client.")
                         else:
-                            # 复用上面获取的 tickers
                             latest_tickers = tickers
-                            if not latest_tickers: # 如果获取失败，再试一次
+                            if not latest_tickers: 
                                  latest_tickers = await self.client.fetch_tickers(self.symbols)
                                  
                             open_positions = self.portfolio.position_manager.get_all_open_positions(); positions_to_force_close = []
@@ -729,15 +751,11 @@ class AlphaTrader:
                             if positions_to_force_close:
                                  tasks=[self.portfolio.live_close(s, f"Forced TP (R>={futures_settings.FORCED_TAKE_PROFIT_PERCENT}%)") for s in positions_to_force_close]; await asyncio.gather(*tasks);
                                  self.logger.info("Forced TP done, re-syncing..."); 
-                                 
-                                 # --- [V45.18 核心修复] ---
-                                 # 此处也移除 tickers 参数
-                                 await self.portfolio.sync_state()
-                                 # --- [修复结束] ---
-                                 
-                                 await self.log_portfolio_status()
+                                 await self.portfolio.sync_state() # 强制止盈后立即再次同步
+                                 await self._log_portfolio_status()
                     except Exception as e_ftp: self.logger.error(f"Forced TP error: {e_ftp}", exc_info=True)
                 
+                # 步骤 5: 决定是否触发 AI
                 trigger_ai, reason, now = False, "", time.time(); interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS;
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
@@ -752,11 +770,16 @@ class AlphaTrader:
                         if not event: event, ev_reason = await self._check_market_volatility_spike(ohlcv_1h) # 1h 波动检查
                         if event: trigger_ai, reason = True, ev_reason
                 
+                # 步骤 6: (安全地) 运行 AI 循环
                 if trigger_ai:
-                    self.logger.warning(f"🔥 AI triggered! Reason: {reason}")
+                    self.logger.warning(f"🔥 AI triggered! Reason: {reason} (Sync was successful)")
                     if reason != "Scheduled": self.last_event_trigger_ai_time = now
                     await self.run_cycle(); self.last_run_time = now
                 
                 await asyncio.sleep(10)
+                
             except asyncio.CancelledError: self.logger.warning("Task cancelled, shutting down..."); break
-            except Exception as e: self.logger.critical(f"Main loop fatal error: {e}", exc_info=True); await asyncio.sleep(60)
+            except Exception as e: 
+                # 这是捕获 FTP 或 AI Trigger 逻辑中未捕获的错误
+                self.logger.critical(f"Main loop fatal error (outside sync): {e}", exc_info=True); 
+                await asyncio.sleep(60)
