@@ -148,34 +148,84 @@ class AlphaPortfolio:
                 self._save_paper_state()
         except Exception as e: self.logger.critical(f"{self.mode_str} sync_state 顶层执行失败: {e}", exc_info=True)
 
-    def get_state_for_prompt(self):
-        # ... (V23.6 代码不变) ...
+# 修复：为实盘模式增加 UPL (未实现盈亏) 计算
+    def get_state_for_prompt(self, tickers: dict = None):
+        """
+        [V23.8 修复]
+        获取用于 AI Prompt 的状态。
+        在实盘模式下，现在需要传入 tickers 字典来实时计算 UPL。
+        """
         position_details = []
+        
         if self.is_live:
+            # --- [ 实盘模式 UPL 计算 ] ---
+            if tickers is None: # 提供一个回退，以防万一
+                tickers = {}
+                self.logger.warning("get_state_for_prompt (live) 未收到 tickers! UPL 将丢失。")
+
             open_positions = self.position_manager.get_all_open_positions()
             for symbol, state in open_positions.items():
-                    pos_str = ( f"- {symbol.split(':')[0]}: Side={state['side'].upper()}, Size={state['total_size']:.4f}, Entry={state['avg_entry_price']:.4f}, "
-                                f"TP={state.get('ai_suggested_take_profit', 'N/A')}, SL={state.get('ai_suggested_stop_loss', 'N/A')}, "
-                                f"Invalidation='{state.get('invalidation_condition', 'N/A')}'")
-                    position_details.append(pos_str)
+                
+                # --- [新增 UPL 计算块] ---
+                upl_str = "UPL=N/A"
+                try:
+                    # 从传入的 tickers 获取当前价格
+                    current_price = tickers.get(symbol, {}).get('last')
+                    if current_price and isinstance(current_price, (int, float)) and current_price > 0:
+                        entry_price = state.get('avg_entry_price', 0.0)
+                        size = state.get('total_size', 0.0)
+                        side = state.get('side')
+                        upl = 0.0
+
+                        if side == 'long':
+                            upl = (current_price - entry_price) * size
+                        elif side == 'short':
+                            upl = (entry_price - current_price) * size
+                        
+                        # 同时计算 PNL 百分比
+                        margin = state.get('margin', 0.0) # V2.2 PositionManager 应该有这个
+                        pnl_percent = (upl / margin) * 100 if margin > 0 else 0.0
+                        upl_str = f"UPL={upl:.2f}$ ({pnl_percent:.2f}%)" # 包含 $ 符号和百分比
+                    else:
+                        upl_str = "UPL=NoPrice"
+                except Exception as e:
+                    self.logger.error(f"实盘 get_state_for_prompt UPL 计算失败 {symbol}: {e}")
+                    upl_str = f"UPL=CalcErr"
+                # --- [新增 UPL 计算块 结束] ---
+
+                # 将 upl_str 添加到输出字符串中
+                pos_str = ( f"- {symbol.split(':')[0]}: Side={state['side'].upper()}, Size={state['total_size']:.4f}, Entry={state['avg_entry_price']:.4f}, "
+                            f"{upl_str}, " # <--- 新增的 UPL 信息
+                            f"TP={state.get('ai_suggested_take_profit', 'N/A')}, SL={state.get('ai_suggested_stop_loss', 'N/A')}, "
+                            f"Invalidation='{state.get('invalidation_condition', 'N/A')}'")
+                position_details.append(pos_str)
+            # --- [ 实盘模式修复结束 ] ---
+
         else:
+            # --- [ 模拟盘模式 (不变) ] ---
             for symbol, pos in self.paper_positions.items():
                 if pos and isinstance(pos, dict) and pos.get('size', 0) > 0:
+                    # 模拟盘的 UPL 在 sync_state 中已算好，直接使用
                     pos_str = ( f"- {symbol.split(':')[0]}: Side={pos['side'].upper()}, Size={pos['size']:.4f}, Entry={pos['entry_price']:.4f}, "
                                 f"UPL={pos.get('unrealized_pnl', 0.0):.2f}, TP={pos.get('take_profit', 'N/A')}, SL={pos.get('stop_loss', 'N/A')}, "
                                 f"Invalidation='{pos.get('invalidation_condition', 'N/A')}'")
                     position_details.append(pos_str)
+        
         if not position_details: position_details.append("No open positions.")
+        
         initial_capital_for_calc = settings.ALPHA_LIVE_INITIAL_CAPITAL if self.is_live else settings.ALPHA_PAPER_CAPITAL
         performance_percent_str = "N/A (Invalid Initial)"
+        
         if initial_capital_for_calc > 0:
             current_equity_val = float(self.equity) if self.equity is not None else 0.0
             performance_percent = (current_equity_val / initial_capital_for_calc - 1) * 100
             performance_percent_str = f"{performance_percent:.2f}%"
+            
         return { "account_value_usd": f"{float(self.equity):.2f}" if self.equity is not None else "0.00",
                  "cash_usd": f"{float(self.cash):.2f}" if self.cash is not None else "0.00",
                  "performance_percent": performance_percent_str,
                  "open_positions": "\n".join(position_details)}
+    # --- [ 修复结束 ] ---
 
     async def live_open(self, symbol, side, size, leverage, reason: str = "N/A", stop_loss: float = None, take_profit: float = None, invalidation_condition: str = "N/A"):
         # ... (V23.6 代码不变, 包含最终名义价值检查 5.1U) ...
