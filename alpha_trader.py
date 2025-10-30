@@ -657,45 +657,63 @@ class AlphaTrader:
     async def _check_bollinger_band_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         [新增 V45.29] 检查 15m K线是否穿越了布林带上轨或下轨。
-        这对于 AI 的 'Ranging' (均值回归) 和 'Trending' (突破) 策略都很重要。
+        [V45.30 修复] 改为使用与 _gather_all_market_data 一致的手动计算逻辑，不再依赖 ta.bbands。
         """
         try:
-            if len(ohlcv_15m) < 22: # 需要 20 + 2 根 K线
+            # 需要 20 (period) + 2 (for compare) = 22 根 K线
+            if len(ohlcv_15m) < 22: 
                 return False, ""
             
             df = pd.DataFrame(ohlcv_15m, columns=['ts','o','h','l','c','v'])
             df.rename(columns={'timestamp':'ts', 'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}, inplace=True, errors='ignore')
             
-            # 计算 BBands
-            bbands_df = df.ta.bbands(close=df['c'], length=20, std=2.0)
-            if bbands_df is None or bbands_df.empty or len(bbands_df) < 2:
+            # --- [V45.30 修复] ---
+            # 1. 使用与 _gather_all_market_data 相同的手动计算逻辑
+            period = 20
+            std_dev = 2.0
+            closes = df['c'] # 这是 pd.Series
+            
+            if len(closes) < period: # 再次检查
+                return False, ""
+
+            middle_band = closes.rolling(window=period).mean()
+            rolling_std = closes.rolling(window=period).std()
+            upper_band = middle_band + (rolling_std * std_dev) # 这是 pd.Series
+            lower_band = middle_band - (rolling_std * std_dev) # 这是 pd.Series
+            # --- [修复结束] ---
+
+            # 2. 检查 Series 是否有效 (确保有足够的数据计算)
+            if upper_band.isnull().all() or lower_band.isnull().all():
+                self.logger.warning("BBand check: Calculated bands contain only NaNs.")
                 return False, ""
             
-            upper_band = bbands_df['BBU_20_2.0']
-            lower_band = bbands_df['BBL_20_2.0']
-            close_price = df['c']
-            
-            # 获取上一根 K 线和当前 K 线的数据
-            close_prev = close_price.iloc[-2]
-            close_curr = close_price.iloc[-1]
+            # 3. 获取上一根 K 线和当前 K 线的数据
+            # 确保索引 -2 和 -1 存在且非 NaN (iloc[-1] 是最新数据, iloc[-2] 是上一根)
+            if pd.isna(upper_band.iloc[-2]) or pd.isna(upper_band.iloc[-1]) or \
+               pd.isna(lower_band.iloc[-2]) or pd.isna(lower_band.iloc[-1]):
+                self.logger.debug("BBand check: Skipping, not enough data for prev/curr comparison (NaN).")
+                return False, ""
+
+            close_prev = closes.iloc[-2]
+            close_curr = closes.iloc[-1]
             upper_prev = upper_band.iloc[-2]
             upper_curr = upper_band.iloc[-1]
             lower_prev = lower_band.iloc[-2]
             lower_curr = lower_band.iloc[-1]
 
-            # 检查是否上穿上轨 (之前在带内，现在在带外)
+            # 4. 检查是否上穿上轨 (之前在带内，现在在带外)
             if close_prev <= upper_prev and close_curr > upper_curr:
                 return True, "Event: 15m Price Crossed BB_Upper"
                 
-            # 检查是否下穿下轨 (之前在带内，现在在带外)
+            # 5. 检查是否下穿下轨 (之前在带内，现在在带外)
             if close_prev >= lower_prev and close_curr < lower_curr:
                 return True, "Event: 15m Price Crossed BB_Lower"
                 
             return False, ""
         except Exception as e:
-            self.logger.error(f"Err check BBand breach: {e}", exc_info=False)
+            # 增加 exc_info=True 来记录完整的错误堆栈
+            self.logger.error(f"Err check BBand breach: {e}", exc_info=True) 
             return False, ""
-
 
     async def _update_fear_and_greed_index(self):
         """
