@@ -35,7 +35,7 @@ class AlphaPortfolio:
         self.paper_equity: float = settings.ALPHA_PAPER_CAPITAL
         self.paper_positions: dict = {symbol: {} for symbol in symbols}
         self.paper_trade_history: list = []
-        self.paper_equity_history: deque = deque(maxlen=2000)
+        self.paper_equity_history: deque = deque(maxlen=30000)
         if self.is_live: self.cash, self.equity = 0.0, 0.0
         else: self.cash, self.equity = settings.ALPHA_PAPER_CAPITAL, settings.ALPHA_PAPER_CAPITAL
         self.state_file = os.path.join('data', 'alpha_portfolio_state_PAPER.json')
