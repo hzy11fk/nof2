@@ -226,74 +226,122 @@ class AlphaPortfolio:
                  "performance_percent": performance_percent_str,
                  "open_positions": "\n".join(position_details)}
     # --- [ 修复结束 ] ---
-
     async def live_open(self, symbol, side, size, leverage, reason: str = "N/A", stop_loss: float = None, take_profit: float = None, invalidation_condition: str = "N/A"):
-        # ... (V23.6 代码不变, 包含最终名义价值检查 5.1U) ...
-        is_adding = self.position_manager.is_open(symbol); action_type = "加仓" if is_adding else "开新仓"
+        """[V45.32 修复] 加仓时，杠杆强制等于现有持仓杠杆，不做任何改变，以规避 -4161 错误。"""
+        
+        is_adding = self.position_manager.is_open(symbol); action_type = "加仓" if is_adding else "开新仓" #
         self.logger.warning(f"!!! {self.mode_str} AI 请求 {action_type}: {side.upper()} {size} {symbol} !!!")
+        
         current_pos_state = None
+        final_leverage_to_record = int(leverage) # 默认使用 AI 的杠杆（用于开新仓）
+
         if is_adding:
-            current_pos_state = self.position_manager.get_position_state(symbol)
+            current_pos_state = self.position_manager.get_position_state(symbol) #
             if not current_pos_state or current_pos_state.get('side') != side:
                 self.logger.error(f"!!! {self.mode_str} {action_type} 失败: 方向 ({side}) 与现有 ({current_pos_state.get('side') if current_pos_state else 'N/A'}) 不符。将覆盖。")
                 is_adding = False; current_pos_state = None
+            else:
+                # --- [ V45.32 核心逻辑 ] ---
+                # 如果是加仓，获取当前杠杆
+                current_leverage = current_pos_state.get('leverage')
+                if current_leverage and isinstance(current_leverage, (int, float)) and current_leverage > 0:
+                    self.logger.warning(f"{self.mode_str} {action_type}: 检测到现有杠杆 {current_leverage}x。将忽略 AI 请求的 {leverage}x 并使用现有杠杆。")
+                    final_leverage_to_record = int(current_leverage) # 强制使用现有杠杆
+                else:
+                    self.logger.error(f"{self.mode_str} {action_type}: 无法获取现有杠杆！将回退使用 AI 杠杆 {leverage}x。")
+                    # 此时 is_adding 仍然为 True, 但我们会尝试在下面设置杠杆
+                # --- [ 核心逻辑结束 ] ---
+
         try:
             raw_exchange = self.client.exchange
-            if not raw_exchange.markets: await self.client.load_markets()
+            if not raw_exchange.markets: await self.client.load_markets() #
             market = raw_exchange.markets.get(symbol);
             if not market: raise ValueError(f"无市场信息 {symbol}")
-            ticker = await self.client.fetch_ticker(symbol); current_price = ticker.get('last')
+            ticker = await self.client.fetch_ticker(symbol); current_price = ticker.get('last') #
             if not current_price or current_price <= 0: raise ValueError(f"无有效价格 {symbol}")
-            required_margin_initial = (size * current_price) / leverage
+
+            # 使用最终确定的杠杆来计算保证金
+            required_margin_initial = (size * current_price) / final_leverage_to_record
             if required_margin_initial <= 0: raise ValueError("保证金无效 (<= 0)")
+            
             max_allowed_margin = self.cash * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
             if max_allowed_margin <= 0: raise ValueError(f"最大允许保证金无效 (<= 0), 可用现金: {self.cash}")
+            
             adjusted_size = size; required_margin_final = required_margin_initial
+            
             if required_margin_initial > max_allowed_margin:
                 self.logger.warning(f"!!! {self.mode_str} {action_type} 保证金超限 ({required_margin_initial:.2f} > {max_allowed_margin:.2f})，缩减 !!!")
-                adj_size_raw = (max_allowed_margin * leverage) / current_price
+                adj_size_raw = (max_allowed_margin * final_leverage_to_record) / current_price # 使用 final_leverage 计算
                 adjusted_size = float(raw_exchange.amount_to_precision(symbol, adj_size_raw))
                 min_amount = market.get('limits', {}).get('amount', {}).get('min')
                 if min_amount is not None and adjusted_size < min_amount:
                      self.logger.error(f"!!! {self.mode_str} {action_type} 缩减后过小 ({adjusted_size} < {min_amount})，取消 !!!")
                      await send_bark_notification(f"⚠️ {self.mode_str} AI {action_type} 被拒", f"品种: {symbol}\n原因: 缩减后过小"); return
                 self.logger.warning(f"缩减后 Size: {adjusted_size}")
-                required_margin_final = (adjusted_size * current_price) / leverage
+                required_margin_final = (adjusted_size * current_price) / final_leverage_to_record
+            
             final_notional_value = adjusted_size * current_price
-            if final_notional_value < self.MIN_NOTIONAL_VALUE_USDT_FINAL_CHECK:
+            if final_notional_value < self.MIN_NOTIONAL_VALUE_USDT_FINAL_CHECK: #
                 self.logger.error(f"!!! {self.mode_str} {action_type} 最终名义价值检查失败 !!!")
                 self.logger.error(f"最终名义价值 {final_notional_value:.4f} USDT < 阈值 {self.MIN_NOTIONAL_VALUE_USDT_FINAL_CHECK} USDT。取消。")
                 await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n原因: 最终名义价值过低 (<{self.MIN_NOTIONAL_VALUE_USDT_FINAL_CHECK} USDT)"); return
+            
             estimated_fee = adjusted_size * current_price * market.get('taker', self.FEE_RATE)
-            if self.cash < required_margin_final + estimated_fee:
+            if self.cash < required_margin_final + estimated_fee: #
                  self.logger.error(f"!!! {self.mode_str} {action_type} 现金不足 !!! (需 {required_margin_final + estimated_fee:.2f}, 可用 {self.cash:.2f})")
                  await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n原因: 现金不足"); return
-            await self.client.set_margin_mode(futures_settings.FUTURES_MARGIN_MODE, symbol)
-            await self.client.set_leverage(leverage, symbol)
+            
+            await self.client.set_margin_mode(futures_settings.FUTURES_MARGIN_MODE, symbol) #
+
+            # --- [ V45.32 修复: 杠杆设置 ] ---
+            if not is_adding:
+                # 只有开新仓时，才设置杠杆
+                self.logger.debug(f"{self.mode_str} {action_type}: 正在设置 AI 杠杆 {final_leverage_to_record}x。")
+                await self.client.set_leverage(final_leverage_to_record, symbol) #
+            else:
+                # 如果是加仓，我们什么也不做，以避免 -4161 错误
+                self.logger.info(f"{self.mode_str} {action_type}: 正在使用现有杠杆 {final_leverage_to_record}x，不发送 set_leverage。")
+            # --- [ V45.32 修复结束 ] ---
+
             exchange_side = 'BUY' if side == 'long' else 'SELL'
-            order_result = await self.client.create_market_order(symbol, exchange_side, adjusted_size)
+            order_result = await self.client.create_market_order(symbol, exchange_side, adjusted_size) #
+            
             entry_price = float(order_result.get('average', order_result.get('price')))
             if not entry_price or entry_price <= 0: entry_price = float(order_result['price'])
             filled_size = float(order_result['filled']); timestamp = int(order_result['timestamp'])
-            fee = await self._parse_fee_from_order(order_result, symbol)
+            
+            # --- [ V23.9 修复 ] ---
+            if filled_size <= 0:
+                self.logger.error(f"!!! {self.mode_str} {action_type} 失败: 交易所返回成交量为 0 (Filled=0)。")
+                return
+            # --- [ 修复结束 ] ---
+
+            fee = await self._parse_fee_from_order(order_result, symbol) #
             success = False
-            if is_adding: success = self.position_manager.add_entry(symbol=symbol, entry_price=entry_price, size=filled_size, entry_fee=fee, leverage=leverage, stop_loss=stop_loss, take_profit=take_profit, timestamp=timestamp, invalidation_condition=invalidation_condition)
-            else: self.position_manager.open_position(symbol=symbol, side=side, entry_price=entry_price, size=filled_size, entry_fee=fee, leverage=leverage, stop_loss=stop_loss, take_profit=take_profit, timestamp=timestamp, reason=reason, invalidation_condition=invalidation_condition); success = True # open_position 总是成功（覆盖）
+            
+            # 确保传递给 position_manager 的杠杆是最终使用的杠杆
+            # (final_leverage_to_record 此时已是正确的值)
+
+            if is_adding: 
+                success = self.position_manager.add_entry(symbol=symbol, entry_price=entry_price, size=filled_size, entry_fee=fee, leverage=final_leverage_to_record, stop_loss=stop_loss, take_profit=take_profit, timestamp=timestamp, invalidation_condition=invalidation_condition) #
+            else: 
+                self.position_manager.open_position(symbol=symbol, side=side, entry_price=entry_price, size=filled_size, entry_fee=fee, leverage=final_leverage_to_record, stop_loss=stop_loss, take_profit=take_profit, timestamp=timestamp, reason=reason, invalidation_condition=invalidation_condition); success = True # open_position 总是成功（覆盖）
+            
             if success:
                  self.logger.warning(f"!!! {self.mode_str} {action_type} 成功: {side.upper()} {filled_size} {symbol} @ {entry_price} (Fee: {fee}) | AI原因: {reason}")
                  title = f"📈 {self.mode_str} AI {action_type}: {side.upper()} {symbol.split('/')[0]}"
-                 final_pos_state = self.position_manager.get_position_state(symbol)
+                 final_pos_state = self.position_manager.get_position_state(symbol) #
                  final_avg = final_pos_state.get('avg_entry_price', entry_price) if final_pos_state else entry_price
                  final_size = final_pos_state.get('total_size', filled_size) if final_pos_state else filled_size
-                 body = f"价格: {entry_price:.4f}\n数量: {filled_size}\n杠杆: {leverage}x\n手续费: {fee:.4f}\n保证金: {required_margin_final:.2f}\nTP/SL: {take_profit}/{stop_loss}"
+                 # 在正文中显示最终使用的杠杆
+                 body = f"价格: {entry_price:.4f}\n数量: {filled_size}\n杠杆: {final_leverage_to_record}x\n手续费: {fee:.4f}\n保证金: {required_margin_final:.2f}\nTP/SL: {take_profit}/{stop_loss}"
                  if is_adding: body += f"\n新均价: {final_avg:.4f}\n总数量: {final_size:.4f}"
                  body += f"\nAI原因: {reason}";
                  if adjusted_size != size: body += f"\n(请求 {size} 缩减至 {filled_size})"
-                 await send_bark_notification(title, body); await self.sync_state()
+                 await send_bark_notification(title, body); await self.sync_state() #
             else: raise RuntimeError(f"{action_type} 失败但未抛异常")
-        except InsufficientFunds as e: self.logger.error(f"!!! {self.mode_str} {action_type} 失败 (资金不足): {e}", exc_info=False); await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n原因: 资金不足")
+        except InsufficientFunds as e: self.logger.error(f"!!! {self.mode_str} {action_type} 失败 (资金不足): {e}", exc_info=False); await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n原因: 资金不足") #
         except Exception as e: self.logger.error(f"!!! {self.mode_str} {action_type} 失败: {e}", exc_info=True); await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n错误: {e}")
-
 
     async def live_partial_close(self, symbol: str, size_percent: Optional[float] = None, size_absolute: Optional[float] = None, reason: str = "N/A"):
         """[实盘] 部分平仓"""
@@ -590,7 +638,6 @@ class AlphaPortfolio:
             self.logger.warning(f"未能从 {symbol} 订单结果解析费用。将使用 0.0 USDT。")
 
         return fees_paid_usdt
-
     # --- equity_history, trade_history properties 保持 V23.3 不变 ---
     @property
     def equity_history(self):
