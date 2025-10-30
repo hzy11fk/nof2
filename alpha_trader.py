@@ -589,6 +589,84 @@ class AlphaTrader:
         for symbol, price, reason in to_close:
             self.logger.warning(f"AUTO-CLOSING (Paper): {symbol} | Reason: {reason}"); await self.portfolio.paper_close(symbol, price, reason)
         return len(to_close) > 0
+
+
+    async def _check_rsi_threshold_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
+        """
+        [新增 V45.29] 检查 15m RSI 是否穿越了超买/超卖阈值。
+        这对于 AI 的 'Ranging' 策略至关重要。
+        """
+        try:
+            if len(ohlcv_15m) < 16: # 需要 14 + 2 根 K线
+                return False, ""
+            
+            df = pd.DataFrame(ohlcv_15m, columns=['ts','o','h','l','c','v'])
+            df.rename(columns={'timestamp':'ts', 'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}, inplace=True, errors='ignore')
+            
+            # 计算 RSI
+            rsi_df = df.ta.rsi(close=df['c'], length=14)
+            if rsi_df is None or rsi_df.empty or len(rsi_df) < 2:
+                return False, ""
+            
+            rsi_prev = rsi_df.iloc[-2] # 上一根 K 线的 RSI
+            rsi_curr = rsi_df.iloc[-1] # 当前 K 线的 RSI
+            
+            # 检查超买 (从下往上穿过 70)
+            if rsi_prev < 70 and rsi_curr >= 70:
+                return True, "Event: 15m RSI Breach Overbought (70)"
+                
+            # 检查超卖 (从上往下穿过 30)
+            if rsi_prev > 30 and rsi_curr <= 30:
+                return True, "Event: 15m RSI Breach Oversold (30)"
+                
+            return False, ""
+        except Exception as e:
+            self.logger.error(f"Err check RSI threshold: {e}", exc_info=False)
+            return False, ""
+
+    async def _check_bollinger_band_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
+        """
+        [新增 V45.29] 检查 15m K线是否穿越了布林带上轨或下轨。
+        这对于 AI 的 'Ranging' (均值回归) 和 'Trending' (突破) 策略都很重要。
+        """
+        try:
+            if len(ohlcv_15m) < 22: # 需要 20 + 2 根 K线
+                return False, ""
+            
+            df = pd.DataFrame(ohlcv_15m, columns=['ts','o','h','l','c','v'])
+            df.rename(columns={'timestamp':'ts', 'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}, inplace=True, errors='ignore')
+            
+            # 计算 BBands
+            bbands_df = df.ta.bbands(close=df['c'], length=20, std=2.0)
+            if bbands_df is None or bbands_df.empty or len(bbands_df) < 2:
+                return False, ""
+            
+            upper_band = bbands_df['BBU_20_2.0']
+            lower_band = bbands_df['BBL_20_2.0']
+            close_price = df['c']
+            
+            # 获取上一根 K 线和当前 K 线的数据
+            close_prev = close_price.iloc[-2]
+            close_curr = close_price.iloc[-1]
+            upper_prev = upper_band.iloc[-2]
+            upper_curr = upper_band.iloc[-1]
+            lower_prev = lower_band.iloc[-2]
+            lower_curr = lower_band.iloc[-1]
+
+            # 检查是否上穿上轨 (之前在带内，现在在带外)
+            if close_prev <= upper_prev and close_curr > upper_curr:
+                return True, "Event: 15m Price Crossed BB_Upper"
+                
+            # 检查是否下穿下轨 (之前在带内，现在在带外)
+            if close_prev >= lower_prev and close_curr < lower_curr:
+                return True, "Event: 15m Price Crossed BB_Lower"
+                
+            return False, ""
+        except Exception as e:
+            self.logger.error(f"Err check BBand breach: {e}", exc_info=False)
+            return False, ""
+
+
     async def _update_fear_and_greed_index(self):
         """
         [新增] 异步获取并缓存 Fear & Greed Index。
@@ -693,13 +771,17 @@ class AlphaTrader:
             self.logger.info("AI proposed no orders.")
 
         self.logger.info("="*20 + " AI Cycle Finished " + "="*20 + "\n")
+
+
+
     async def start(self):
-        """[V45.27 修复] 启动 AlphaTrader 主循环。增加健壮性，确保 sync_state 成功后才能 run_cycle。"""
+        """[V45.29 修复] 启动 AlphaTrader 主循环。增加健壮性 (sync_state) 并链接所有4个事件触发器。"""
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
             self.logger.warning("!!! LIVE MODE !!! Syncing state on startup...")
             if not hasattr(self, 'client') and hasattr(self.portfolio, 'client'): self.client = self.portfolio.client
             try: 
+                # 启动时的 sync_state 调用是正确的 (没有参数)
                 await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
             except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
         
@@ -708,19 +790,19 @@ class AlphaTrader:
                 # --- [ V45.27 核心修复 ] ---
                 # 步骤 1: 状态同步 (必须成功)
                 try:
-                    await self.portfolio.sync_state()
+                    await self.portfolio.sync_state() #
                     self.logger.info("Portfolio state sync successful.")
                 except Exception as e_sync:
                     self.logger.critical(f"Main loop sync_state failed: {e_sync}. Skipping AI cycle, will retry...", exc_info=True)
                     await asyncio.sleep(30) # 等待 30 秒后重试同步
                     continue # 跳过本轮循环，直接进入下一次循环尝试 sync_state
                 # --- [ 修复结束 ] ---
-
+                
                 # 步骤 2: 获取 Tickers (用于强制止盈检查)
                 tickers = {}
                 try:
                     if not hasattr(self, 'client'): self.client = self.portfolio.client
-                    tickers = await self.client.fetch_tickers(self.symbols)
+                    tickers = await self.client.fetch_tickers(self.symbols) #
                 except Exception as e_tick:
                     self.logger.error(f"Main loop fetch_tickers failed: {e_tick}", exc_info=False)
                 
@@ -732,9 +814,10 @@ class AlphaTrader:
                     try:
                         if not hasattr(self, 'client'): self.logger.error("Forced TP check failed: No client.")
                         else:
+                            # 复用上面获取的 tickers
                             latest_tickers = tickers
-                            if not latest_tickers: 
-                                 latest_tickers = await self.client.fetch_tickers(self.symbols)
+                            if not latest_tickers: # 如果获取失败，再试一次
+                                 latest_tickers = await self.client.fetch_tickers(self.symbols) #
                                  
                             open_positions = self.portfolio.position_manager.get_all_open_positions(); positions_to_force_close = []
                             for symbol, state in open_positions.items():
@@ -749,9 +832,11 @@ class AlphaTrader:
                                     if rate >= threshold: self.logger.warning(f"!!! Forced TP !!! {symbol} | R {rate:.2%} >= {threshold:.2%}"); positions_to_force_close.append(symbol)
                             
                             if positions_to_force_close:
-                                 tasks=[self.portfolio.live_close(s, f"Forced TP (R>={futures_settings.FORCED_TAKE_PROFIT_PERCENT}%)") for s in positions_to_force_close]; await asyncio.gather(*tasks);
+                                 tasks=[self.portfolio.live_close(s, f"Forced TP (R>={futures_settings.FORCED_TAKE_PROFIT_PERCENT}%)") for s in positions_to_force_close]; await asyncio.gather(*tasks); #
                                  self.logger.info("Forced TP done, re-syncing..."); 
+                                 
                                  await self.portfolio.sync_state() # 强制止盈后立即再次同步
+                                 
                                  await self._log_portfolio_status()
                     except Exception as e_ftp: self.logger.error(f"Forced TP error: {e_ftp}", exc_info=True)
                 
@@ -762,24 +847,47 @@ class AlphaTrader:
                 if not trigger_ai:
                     sym=self.symbols[0]; ohlcv_15m, ohlcv_1h = [], []
                     try: 
-                        ohlcv_15m, ohlcv_1h = await asyncio.gather(self.exchange.fetch_ohlcv(sym, '15m', limit=150), self.exchange.fetch_ohlcv(sym, '1h', limit=20))
+                        # 确保为 BBands(20) 和 RSI(14) 获取足够的数据
+                        ohlcv_15m, ohlcv_1h = await asyncio.gather(
+                            self.exchange.fetch_ohlcv(sym, '15m', limit=150), 
+                            self.exchange.fetch_ohlcv(sym, '1h', limit=20)
+                        )
                     except Exception as e_fetch: self.logger.error(f"Event check: Fetch OHLCV fail: {e_fetch}")
+                    
                     cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES * 60
+                    
                     if now - self.last_event_trigger_ai_time > cooldown:
-                        event, ev_reason = await self._check_significant_indicator_change(ohlcv_15m) # 15m MACD 检查
-                        if not event: event, ev_reason = await self._check_market_volatility_spike(ohlcv_1h) # 1h 波动检查
-                        if event: trigger_ai, reason = True, ev_reason
+                        
+                        # --- [V45.29 优化] 链式检查所有事件 ---
+                        event, ev_reason = await self._check_significant_indicator_change(ohlcv_15m) # 1. 15m MACD 交叉
+                        
+                        if not event: 
+                            # 2. 15m RSI 穿越 (新)
+                            # (假设您已添加 _check_rsi_threshold_breach)
+                            event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m)
+                        
+                        if not event: 
+                            # 3. 15m BBands 穿越 (新)
+                            # (假设您已添加 _check_bollinger_band_breach)
+                            event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m)
+
+                        if not event: 
+                            # 4. 1h 波动 (旧)
+                            event, ev_reason = await self._check_market_volatility_spike(ohlcv_1h) #
+                        # --- [优化结束] ---
+
+                        if event: 
+                            trigger_ai, reason = True, ev_reason
                 
                 # 步骤 6: (安全地) 运行 AI 循环
                 if trigger_ai:
                     self.logger.warning(f"🔥 AI triggered! Reason: {reason} (Sync was successful)")
                     if reason != "Scheduled": self.last_event_trigger_ai_time = now
-                    await self.run_cycle(); self.last_run_time = now
+                    await self.run_cycle(); self.last_run_time = now #
                 
                 await asyncio.sleep(10)
-                
             except asyncio.CancelledError: self.logger.warning("Task cancelled, shutting down..."); break
             except Exception as e: 
                 # 这是捕获 FTP 或 AI Trigger 逻辑中未捕获的错误
                 self.logger.critical(f"Main loop fatal error (outside sync): {e}", exc_info=True); 
-                await asyncio.sleep(60)
+                await asyncio.sleep(60)        
