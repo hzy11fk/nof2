@@ -391,7 +391,7 @@ class AlphaTrader:
 
         # 1. 获取数据 & 构建 Prompt (已更新)
         market_data, tickers = await self._gather_all_market_data()
-        portfolio_state = self.portfolio.get_state_for_prompt()
+        portfolio_state = self.portfolio.get_state_for_prompt(tickers)
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
         # 2. 格式化 System Prompt (已更新)
