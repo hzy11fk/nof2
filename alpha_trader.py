@@ -48,6 +48,16 @@ class AlphaTrader:
                 -   IF `calculated_desired_margin` < 6.0: **Abort the trade.** Your risk calculation (${{calculated_desired_margin:.2f}}) is below the 6.0 USDT minimum margin. The trade is too small to be valid.
                 -   IF `calculated_desired_margin` >= 6.0: `final_desired_margin = calculated_desired_margin`. (Proceed)
             5.  `size = (final_desired_margin * leverage) / current_price`.
+            6.  **Check BTC Minimum Size (CRITICAL):**
+                -   IF `symbol` is "BTC/USDT:USDT":
+                    -   IF `size` >= 0.001: **Proceed.** (Size is valid).
+                    -   IF `size` < 0.001:
+                        -   **Action:** Recalculate based on the minimum size.
+                        -   `new_size = 0.001`
+                        -   `recalculated_margin = (0.001 * current_price) / leverage`
+                        -   **Check Cash Again:** Is `recalculated_margin` <= `Available Cash`?
+                            -   IF NO: **Abort the trade.** (Cash is insufficient for the minimum BTC size: ${{recalculated_margin:.2f}} > ${{Available Cash:.2f}}).
+                            -   IF YES: **Proceed.** (Use the adjusted values: `final_desired_margin = recalculated_margin`, `size = new_size`).
         -   **Example (Good):** Total Equity $1000, Available Cash $500, leverage 10x, risk 5%.
             `calculated_margin = 1000 * 0.05 = 50.0`.
             Check Cash: `50.0` <= `500.0` (OK).
