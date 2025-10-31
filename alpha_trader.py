@@ -1,8 +1,9 @@
-# 文件: alpha_trader.py (V45.17 - 集成四大优化建议)
-# 1. [精准判断] 增加 ADX + BBands 市场罗盘
-# 2. [风险管理] 基于总净值 (Equity) 计算仓位，6U 规则改为过滤器
-# 3. [利润保护] 强制 +4% 保本止损 (Breakeven Stop)
-# 4. [利润保护] 鼓励 +3% 接近阻力位时分批平仓 (Partial Close)
+# 文件: alpha_trader.py (V45.34 - 硬风控重构版)
+# 1. [硬风控] 将 多阶段止盈(+4%/+10%) 移至 start() 循环。
+# 2. [硬风控] 将 AI设置的SL/TP执行 移至 start() 循环。
+# 3. [硬风控] 增加 粉尘仓位(<1U) 自动平仓。
+# 4. [硬风控] 将 最大亏损(-20%) 移至 start() 循环。
+# 5. [AI Prompt] AI 现在专注于“更新SL/TP”和“识别反转行情”。
 
 import logging
 import asyncio
@@ -14,12 +15,11 @@ import pandas_ta as ta
 import re
 import httpx
 from collections import deque
-# import Levenshtein # [V45.16 移除]
 from config import settings, futures_settings
 from alpha_ai_analyzer import AlphaAIAnalyzer
-from alpha_portfolio import AlphaPortfolio # 假设 V23.4 或更高
+from alpha_portfolio import AlphaPortfolio 
 from datetime import datetime
-from typing import Tuple, Dict, Any, Set, Optional # [V45.16 移除] Set
+from typing import Tuple, Dict, Any, Set, Optional
 
 try:
     import pandas as pd
@@ -28,6 +28,12 @@ except ImportError:
 
 class AlphaTrader:
     
+    # --- [ V45.34 PROMPT 优化 ] ---
+    # 1. [移除] 删除了旧的 "Rule 2 (Profit Protection Mandate)"。
+    # 2. [移除] 删除了 CoT 模板中的 "Profit Management", "Max Loss Cutoff", "Trailing Stop Assessment"。
+    # 3. [新增] "Rule 2: Active SL/TP Management" -> AI 必须主动更新 SL/TP。
+    # 4. [新增] CoT 模板中增加 "Reversal & Profit Save Check" -> AI 主动识别反转以平仓。
+    # 5. [新增] CoT 模板中增加 "SL/TP Target Update Check" -> AI 执行 Rule 2。
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -36,13 +42,12 @@ class AlphaTrader:
     Your discipline is demonstrated by strict adherence to the risk management rules below, which are your foundation for sustained profitability.
 
     **Core Mandates & Rules:**
-    1.  **Rule-Based Position Management:** For every open position, you MUST check its `Invalidation_Condition`. If this condition is met, you MUST issue a `CLOSE` order. This is your top priority for existing positions.
+    1.  **Rule-Based Position Management:** For every open position, you MUST check its `InvalidATION_CONDITION`. If this condition is met, you MUST issue a `CLOSE` order. This is your top priority for existing positions.
 
-    2.  **Profit Protection Mandate (CRITICAL):**
-        -   For any open position where the Unrealized PNL (UPL) is **greater than +4.0%** (based on margin-calculated return%)...
-        -   ...you **MUST** issue an `UPDATE_STOPLOSS` order.
-        -   The `new_stop_loss` price MUST be set **at or better than** the position's `avg_entry_price`.
-        -   **Objective:** Ensure a significantly profitable trade NEVER turns into a losing trade.
+    2.  **Active SL/TP Management (CRITICAL):** Your main task for existing positions is to actively manage risk.
+        -   For *every* open position on *every* analysis cycle, you MUST assess if the existing `ai_suggested_stop_loss` or `ai_suggested_take_profit` targets are still optimal.
+        -   The system executes these targets automatically, but your job is to UPDATE them.
+        -   If the market structure changes (e.g., a new S/R level appears, volatility drops), you MUST issue `UPDATE_STOPLOSS` or `UPDATE_TAKEPROFIT` orders with new, improved targets and your reasoning.
 
     3.  **Risk Management Foundation (CRITICAL):** Profit is the goal, but capital preservation is the foundation. You MUST strictly follow these rules:
         -   **Leverage Selection:**You should use *lower* leverage (e.g., 5x-8x) for higher volatility assets (e.g., SOL, DOGE) and *moderate* leverage (e.g., 10x-15x) for lower volatility assets (e.g., BTC, ETH). Your chosen leverage (e.g., `leverage: 8`) MUST be stated in the reasoning.
@@ -71,16 +76,16 @@ class AlphaTrader:
                             -   IF NO: **Abort the trade.** (Cash is insufficient for the minimum BTC size: ${{recalculated_margin:.2f}} > ${{Available Cash:.2f}}).
                             -   IF YES: **Proceed.** (Use the adjusted values: `final_desired_margin = recalculated_margin`, `size = new_size`).
         -   **Total Exposure:** The sum of all margins for all open positions should generally not exceed 50-60% of your total equity.
-        -   **Correlation Control (Hard Cap):**You MUST limit total risk exposure to highly correlated assets.
+        -   **Correlation Control (Hard Cap):** You MUST limit total risk exposure to highly correlated assets.
             -   Define 'Core Crypto Group' as [BTC, ETH]. Total margin for this group MUST NOT exceed 30% of Total Equity.
             -   Define 'Altcoin Group' as [SOL, BNB, DOGE, XRP]. Total margin for this group MUST NOT exceed 40% of Total Equity.
             -   If opening a new position (e.g., SOL) would breach its group cap, you MUST ABORT the trade.
 
     4.  **Complete Trade Plans (Open/Add):** Every new `BUY` or `SELL` order is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
-        -   **Smarter Invalidation:** (V45.28 优化) Your `invalidation_condition` MUST be based on a clear technical breakdown of the *original trade thesis*.
+        -   **Smarter Invalidation:** Your `invalidation_condition` MUST be based on a clear technical breakdown of the *original trade thesis*.
             -   *Trend Trade Example:* `Invalidation='1h Close below the EMA 50'` (if thesis was a 1h uptrend).
             -   *Trend Trade Example:* `Invalidation='4h ADX drops below 20'` (if thesis was a 4h trend).
-            -   *Ranging Trade Example:* `Invalidation='15m RSI breaks above 60'` (if thesis was a 15m overbought short).
+            -   *Ranging Trade Example:* `InvalidATION='15m RSI breaks above 60'` (if thesis was a 15m overbought short).
         -   **Profit-Taking Strategy:** You SHOULD consider using multiple take-profit levels (by using `PARTIAL_CLOSE` later) rather than a single `take_profit`.
 
     5.  **Market State Recognition (Using ADX & BBands):**
@@ -97,7 +102,7 @@ class AlphaTrader:
             -   **Condition:** 1h or 4h **ADX_14 is between 20 and 25**.
             -   **Strategy:** This is an uncertain market. **WAIT** for a clear signal (ADX > 25 or ADX < 20).
 
-    6.  **Market Sentiment Filter (Fear & Greed Index):** (V45.26 优化)
+    6.  **Market Sentiment Filter (Fear & Greed Index):**
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter for your decisions.
         -   **Extreme Fear (Index < 25):** The market is panicking.
             -   **Action:** Be EXTREMELY cautious with new LONG signals (high risk of failure). Prioritize capital preservation. SHORT signals (breakdowns) are higher confidence.
@@ -144,26 +149,23 @@ class AlphaTrader:
            UPL: [Current Unrealized PNL and Percent (e.g., +$50.00 (+5.5%))]
            Multi-Timeframe Analysis: [Brief assessment across 5m, 15m, 1h, 4h, mentioning ADX/BBands]
            
-           Invalidation Check: [Check condition vs current data]
+           Invalidation Check: [Check condition vs current data. If met, MUST issue CLOSE.]
            
-           Max Loss Cutoff Check (CRITICAL):
-           - [Check UPL Percent. Is UPL Percent <= -25.0% ?]
-           - [IF YES: This position has hit the maximum loss threshold. The original trade thesis is considered FAILED, regardless of the invalidation condition.]
-           - [Decision: MUST issue a CLOSE order to cut losses.]
-           
+           Reversal & Profit Save Check (NEW):
+           - [Is this profitable position (UPL > +1.0%) showing strong signs of reversal (e.g., 15m bearish divergence, 1h ADX weakening, F&G Extreme Greed)?]
+           - [IF YES: The risk of giving back profits is high. Prioritize capital preservation. Decision: MUST issue a CLOSE order to secure profits.]
+
            Pyramiding Check (Adding to a Winner):
            - [Is UPL Percent > +2.5% AND is the original trend (ADX > 25) still strong?]
            - [AND has price pulled back to a key support (for Long) / resistance (for Short) (e.g., 1h EMA 20)?]
            - [IF YES: Consider an `ADD` order. This new entry is treated as a separate trade and MUST follow the full Rule 3 (Sizing) / Rule 4 (SL/TP) logic.]
            - [CRITICAL: You MUST NEVER add to a losing position (UPL < 0). Averaging down is forbidden.]
            
-           Profit Management:
-           - [Assess if UPL > +3% AND price is near a key S/R level (e.g., 4h recent_high, 1h BB_Upper). IF YES, SHOULD issue PARTIAL_CLOSE.]
+           SL/TP Target Update Check (NEW):
+           - [Are the current ai_suggested_stop_loss/take_profit targets still optimal based on new data (e.g., move SL up to new 15m BB_Mid, lower TP from 4h BB_Upper)?]
+           - [IF NOT OPTIMAL: Issue UPDATE_STOPLOSS / UPDATE_TAKEPROFIT with new targets and reasoning.]
            
-           Trailing Stop Assessment (MANDATORY CHECK):
-           - [Check Rule 3: Is UPL > +4.0%? IF YES, MUST issue UPDATE_STOPLOSS to breakeven. IF NO, evaluate other trailing stop logic.]
-           
-           Decision: [Hold/Close/Partial Close/Add/Update StopLoss + Reason. NOTE: Max Loss Cutoff check overrides all "Hold" decisions.]
+           Decision: [Hold/Close/Partial Close/Add/Update StopLoss/Update TakeProfit + Reason. NOTE: Invalidation and Reversal checks override all "Hold" decisions.]
 
         ... [Repeat for each open position] ...
 
@@ -199,7 +201,8 @@ class AlphaTrader:
     -   **To Open or Add (SHORT):**`{{"action": "SELL", "symbol": "...", "size": [CALCULATED_SIZE], "leverage": [CHOSEN_LEVERAGE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Leverage chosen: [Why 10x? or Why 5x?]. Calculation: Based on Total Equity. final_margin={{final_margin_usd:.2f}} (must be >= 6.0). size=(Final Margin)*lev/price=... Multi-TF confirm: [...]. Market State: [...]"}}`
     -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
     -   **To Close Partially (Take Profit):** `{{"action": "PARTIAL_CLOSE", "symbol": "...", "size_percent": 0.5, "reasoning": "Taking 50% profit near resistance per Rule 4..."}}` (or `size_absolute`)
-    -   **To Update Stop Loss (Trailing/Breakeven):** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Moving stop loss to breakeven (Rule 3) / Trailing profit..."}}`
+    -   **To Update Stop Loss:** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Actively moving SL to new 15m support level..."}}`
+    -   **To Update Take Profit (NEW):** `{{"action": "UPDATE_TAKEPROFIT", "symbol": "...", "new_take_profit": ..., "reasoning": "Actively moving TP to new 4h resistance level..."}}`
     -   **To Hold:** Do NOT include in `orders`.
     -   **Symbol Validity:** `symbol` MUST be one of {symbol_list}.
 
@@ -219,16 +222,25 @@ class AlphaTrader:
         self.initial_capital = settings.ALPHA_LIVE_INITIAL_CAPITAL if self.is_live_trading else settings.ALPHA_PAPER_CAPITAL
         self.logger.info(f"Initialized with Initial Capital: {self.initial_capital:.2f} USDT")
         self.formatted_symbols = ", ".join(f'"{s}"' for s in self.symbols)
-        # --- [V45.16 移除] 不再需要 last_translated_english_summary ---
-        # self.last_translated_english_summary: Optional[str] = None
-        # --- [移除结束] ---
+        
         if hasattr(self.portfolio, 'client'): self.client = self.portfolio.client
         else:
             if hasattr(self.portfolio, 'exchange') and isinstance(self.portfolio.exchange, object): self.client = self.portfolio.exchange; self.logger.warning("Portfolio missing 'client', falling back.")
             else: self.client = self.exchange; self.logger.warning("Portfolio missing 'client', using exchange directly.")
+        
+        # V45.26 新增
         self.fng_data: Dict[str, Any] = {"value": 50, "value_classification": "Neutral"}
         self.last_fng_fetch_time: float = 0.0
         self.FNG_CACHE_DURATION_SECONDS = 3600 # 1小时缓存 (3600秒)
+        
+        # --- [V45.34 新增] ---
+        # 止盈计数器，用于多阶段止盈。
+        # 结构: {'BTC/USDT:USDT': {'stage1': 0, 'stage2': 0}}
+        # 0 = 未触发, 1 = 已触发
+        # 注意：这将在机器人重启时重置。更健壮的方案是将其存储在 AlphaPositionManager 中。
+        self.tp_counters: Dict[str, Dict[str, int]] = {}
+        # --- [新增结束] ---
+
 
     def _setup_log_handler(self):
         """配置内存日志记录器"""
@@ -438,7 +450,7 @@ class AlphaTrader:
         # --- [修改结束] ---    
         prompt += "\n--- Account Info ---\n"
         prompt += f"Return%: {portfolio_state.get('performance_percent', 'N/A')}\n"
-        prompt += f"Total Equity: {portfolio_state.get('account_value_usd', 'N/A')}\n" # [V45.17 核心] AI 现在需要 Equity
+        prompt += f"Total Equity: {portfolio_state.get('account_value_usd', 'N/A')}\n" # [V4S.17 核心] AI 现在需要 Equity
         prompt += f"Available Cash: {portfolio_state.get('cash_usd', 'N/A')}\n" # [V45.17 核心] AI 同时需要 Cash
         prompt += "Positions:\n"
         prompt += portfolio_state.get('open_positions', "No open positions.")
@@ -450,12 +462,10 @@ class AlphaTrader:
         return await self.ai_analyzer.get_ai_response(system_prompt, user_prompt)
 
     async def _execute_decisions(self, decisions: list, market_data: Dict[str, Dict[str, Any]]):
-        """[V45.25 核心修复] 增加 BTC 最小数量 (0.001) 硬性控制"""
+        """[V4R.34 优化] 增加 UPDATE_TAKEPROFIT 逻辑"""
         
-        # [V45.25 修复] 定义最小保证金和 BTC 最小数量
         MIN_MARGIN_USDT = 6.0
         MIN_SIZE_BTC = 0.001 
-        # [修复结束]
 
         for order in decisions:
             try:
@@ -463,8 +473,8 @@ class AlphaTrader:
                 if not action or not symbol or symbol not in self.symbols: self.logger.warning(f"跳过无效指令: {order}"); continue
                 reason = order.get('reasoning', 'N/A'); current_price = market_data.get(symbol, {}).get('current_price')
                 
-                # [V45.17 修复] 允许 UPDATE_STOPLOSS 在没有价格时也能执行 (价格仅用于开/平仓)
-                if action not in ["UPDATE_STOPLOSS"] and (not current_price or current_price <= 0):
+                # [V45.17 修复] 允许 UPDATE_STOPLOSS/TAKEPROFIT 在没有价格时也能执行
+                if action not in ["UPDATE_STOPLOSS", "UPDATE_TAKEPROFIT"] and (not current_price or current_price <= 0):
                     self.logger.error(f"无价格 {symbol}，跳过: {order}"); continue
                 
                 if action == "CLOSE":
@@ -481,10 +491,6 @@ class AlphaTrader:
                         intended_margin = (original_size * current_price) / leverage if leverage > 0 else 0.0
                         final_size = original_size; final_margin = intended_margin
                         
-                        # 1. 保证金硬控 (V45.14 逻辑)
-                        # 注意：此逻辑是 AI Prompt 中 V45.16 版本的 "Bad, but fixed" 逻辑。
-                        # V45.17 的 Prompt 告诉 AI 不应该走到这一步 (应该在计算时就 Abort)
-                        # 但我们保留这个硬控作为 AI 犯错的最后防线。
                         if intended_margin < MIN_MARGIN_USDT:
                             self.logger.warning(f"!!! 硬控触发 (保证金) !!! AI订单 {symbol} 保证金 {intended_margin:.4f} < {MIN_MARGIN_USDT} USDT.")
                             final_margin = MIN_MARGIN_USDT
@@ -493,15 +499,11 @@ class AlphaTrader:
                                 self.logger.warning(f"已修正保证金为 {MIN_MARGIN_USDT} USDT。新Size: {final_size:.8f}")
                             else: raise ValueError("无法重新计算 size (杠杆/价格无效)")
                         
-                        # --- [V45.25 核心修复] ---
-                        # 2. 最小数量硬控 (在保证金修正之后)
                         if symbol == "BTC/USDT:USDT" and final_size > 0 and final_size < MIN_SIZE_BTC:
                             self.logger.warning(f"!!! 硬控触发 (BTC最小数量) !!! 计算出的 Size {final_size:.8f} < {MIN_SIZE_BTC}.")
                             final_size = MIN_SIZE_BTC
-                            # 重新计算实际保证金 (这会略微提高实际保证金)
                             final_margin = (final_size * current_price) / leverage if leverage > 0 else 0.0
                             self.logger.warning(f"已修正 Size 为 {MIN_SIZE_BTC}。实际保证金变为: {final_margin:.4f} USDT。")
-                        # --- [修复结束] ---
 
                         if final_size <= 0: raise ValueError("最终 size <= 0")
                         
@@ -513,7 +515,6 @@ class AlphaTrader:
                     else: await self.portfolio.paper_open(symbol, side, final_size, price=current_price, leverage=leverage, reason=reason, stop_loss=stop_loss, take_profit=take_profit, invalidation_condition=invalidation_condition)
                 
                 elif action == "PARTIAL_CLOSE":
-                    # (V45.16 的 PARTIAL_CLOSE 逻辑)
                     size_to_close_percent=None; size_to_close_absolute=None
                     try:
                         sp=order.get('size_percent'); sa=order.get('size_absolute')
@@ -527,7 +528,6 @@ class AlphaTrader:
                     else: await self.portfolio.paper_partial_close(symbol, current_price, size_percent=size_to_close_percent, size_absolute=size_to_close_absolute, reason=reason)
 
                 elif action == "UPDATE_STOPLOSS":
-                    # (V45.16 的 UPDATE_STOPLOSS 逻辑)
                     new_stop_loss = 0.0
                     try:
                         nsl=order.get('new_stop_loss');
@@ -537,12 +537,28 @@ class AlphaTrader:
                     except (ValueError,TypeError,KeyError) as e: self.logger.error(f"跳过UPDATE_STOPLOSS参数错误: {order}. Err: {e}"); continue
                     
                     self.logger.warning(f"AI 请求更新止损 {symbol}: {new_stop_loss:.4f}. 原因: {reason}")
-                    # [V45.17 修复] 确保调用 update_position_rules
                     if hasattr(self.portfolio, 'update_position_rules'): 
                         await self.portfolio.update_position_rules(symbol, stop_loss=new_stop_loss, reason=reason)
                     else: 
                         self.logger.error(f"AI 尝试 UPDATE_STOPLOSS 但 portfolio 无 update_position_rules 方法。")
                 
+                # --- [V45.34 新增] ---
+                elif action == "UPDATE_TAKEPROFIT":
+                    new_take_profit = 0.0
+                    try:
+                        ntp=order.get('new_take_profit');
+                        if ntp is None: raise ValueError("缺少 new_take_profit")
+                        new_take_profit=float(ntp)
+                        if new_take_profit<=0: raise ValueError("无效止盈价")
+                    except (ValueError,TypeError,KeyError) as e: self.logger.error(f"跳过UPDATE_TAKEPROFIT参数错误: {order}. Err: {e}"); continue
+                    
+                    self.logger.warning(f"AI 请求更新止盈 {symbol}: {new_take_profit:.4f}. 原因: {reason}")
+                    if hasattr(self.portfolio, 'update_position_rules'): 
+                        await self.portfolio.update_position_rules(symbol, take_profit=new_take_profit, reason=reason)
+                    else: 
+                        self.logger.error(f"AI 尝试 UPDATE_TAKEPROFIT 但 portfolio 无 update_position_rules 方法。")
+                # --- [新增结束] ---
+
                 else: 
                     self.logger.warning(f"收到未知 AI 指令 action: {action} in {order}")
             except Exception as e: 
@@ -777,6 +793,7 @@ class AlphaTrader:
 
         # 2. 格式化 System Prompt (已更新 V45.17)
         try:
+            # [V45.34] 提示词已更新，不再包含 Rule 2
             system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
                 symbol_list=self.formatted_symbols,
                 specific_rules_or_notes=""
@@ -811,7 +828,7 @@ class AlphaTrader:
         self.last_strategy_summary = summary_for_ui
         # --- [修改结束] ---
 
-        # 5. 执行决策 (包含 V45.17, AI 现在会发送 UPDATE_STOPLOSS)
+        # 5. 执行决策 (已更新 V45.34, 增加 UPDATE_TAKEPROFIT)
         if orders:
             self.logger.info(f"AI proposed {len(orders)} order(s), executing...")
             await self._execute_decisions(orders, market_data)
@@ -823,79 +840,182 @@ class AlphaTrader:
 
 
     async def start(self):
-        """[V45.29 修复] 启动 AlphaTrader 主循环。增加健壮性 (sync_state) 并链接所有4个事件触发器。"""
+        """[V45.34 重构] 启动 AlphaTrader 主循环。
+        将所有硬性风控逻辑 (SL, TP, MaxLoss, Dust, Multi-Stage TP) 移至此循环，
+        使其每10秒执行一次，独立于AI。
+        """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
             self.logger.warning("!!! LIVE MODE !!! Syncing state on startup...")
             if not hasattr(self, 'client') and hasattr(self.portfolio, 'client'): self.client = self.portfolio.client
             try: 
-                # 启动时的 sync_state 调用是正确的 (没有参数)
                 await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
             except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
         
+        # --- [V45.34 定义风控阈值] ---
+        # 多阶段止盈阈值
+        MULTI_TP_STAGE_1_PERCENT = 0.04  # 4.0%
+        MULTI_TP_STAGE_2_PERCENT = 0.10  # 10.0%
+        # 最大亏损 (从 config 读取, 默认 -20%)
+        MAX_LOSS_PERCENT = getattr(futures_settings, 'MAX_LOSS_CUTOFF_PERCENT', 20.0) / 100.0
+        # 粉尘仓位阈值
+        DUST_MARGIN_USDT = 1.0
+        # --- [定义结束] ---
+        
         while True:
             try:
-                # --- [ V45.27 核心修复 ] ---
                 # 步骤 1: 状态同步 (必须成功)
                 try:
-                    await self.portfolio.sync_state() #
+                    await self.portfolio.sync_state()
                     self.logger.info("Portfolio state sync successful.")
                 except Exception as e_sync:
                     self.logger.critical(f"Main loop sync_state failed: {e_sync}. Skipping AI cycle, will retry...", exc_info=True)
                     await asyncio.sleep(30) # 等待 30 秒后重试同步
                     continue # 跳过本轮循环，直接进入下一次循环尝试 sync_state
-                # --- [ 修复结束 ] ---
                 
-                # 步骤 2: 获取 Tickers (用于强制止盈检查)
+                # 步骤 2: 获取 Tickers (用于高频风控检查)
                 tickers = {}
                 try:
                     if not hasattr(self, 'client'): self.client = self.portfolio.client
-                    tickers = await self.client.fetch_tickers(self.symbols) #
+                    tickers = await self.client.fetch_tickers(self.symbols)
                 except Exception as e_tick:
-                    self.logger.error(f"Main loop fetch_tickers failed: {e_tick}", exc_info=False)
+                    self.logger.error(f"Main loop fetch_tickers (for risk check) failed: {e_tick}", exc_info=False)
                 
-                # 步骤 3: 记录状态
-                await self._log_portfolio_status()
+                # 步骤 3: 记录状态 (可选, 可注释掉以减少日志)
+                # await self._log_portfolio_status()
                 
-                # 步骤 4: 强制止盈 (FTP) 逻辑 (实盘)
-                if self.is_live_trading and futures_settings.ENABLE_FORCED_TAKE_PROFIT:
+                # --- [ V45.34 核心: 高频硬性风控检查 (每10秒) ] ---
+                if self.is_live_trading and tickers:
+                    
+                    # 待执行的动作
+                    positions_to_close = {} # 使用字典防止重复: {symbol: reason}
+                    positions_to_partial_close = [] # [(symbol, size_pct, reason)]
+                    
+                    # 1. 清理已平仓的计数器
+                    open_symbols = set(self.portfolio.position_manager.get_all_open_positions().keys())
+                    for symbol in list(self.tp_counters.keys()):
+                        if symbol not in open_symbols:
+                            self.logger.info(f"Removing TP counter for closed position: {symbol}")
+                            del self.tp_counters[symbol]
+
+                    # 2. 迭代所有持仓，应用风控规则
                     try:
-                        if not hasattr(self, 'client'): self.logger.error("Forced TP check failed: No client.")
-                        else:
-                            # 复用上面获取的 tickers
-                            latest_tickers = tickers
-                            if not latest_tickers: # 如果获取失败，再试一次
-                                 latest_tickers = await self.client.fetch_tickers(self.symbols) #
-                                 
-                            open_positions = self.portfolio.position_manager.get_all_open_positions(); positions_to_force_close = []
-                            for symbol, state in open_positions.items():
-                                price=latest_tickers.get(symbol,{}).get('last');
-                                if not price or price<=0: continue
-                                entry=state.get('avg_entry_price'); size=state.get('total_size'); side=state.get('side'); lev=state.get('leverage');
-                                if not all([entry, size, side, lev]) or lev<=0: continue
-                                upl = (price - entry) * size if side == 'long' else (entry - price) * size; margin = (entry * size) / lev if lev > 0 else 0.0
-                                if margin > 0:
-                                    rate = upl / margin; threshold = futures_settings.FORCED_TAKE_PROFIT_PERCENT / 100.0;
-                                    self.logger.debug(f"Forced TP {symbol}: R={rate:.4f}, T={threshold:.4f}")
-                                    if rate >= threshold: self.logger.warning(f"!!! Forced TP !!! {symbol} | R {rate:.2%} >= {threshold:.2%}"); positions_to_force_close.append(symbol)
+                        open_positions = self.portfolio.position_manager.get_all_open_positions()
+                        
+                        for symbol, state in open_positions.items():
+                            price = tickers.get(symbol, {}).get('last')
+                            if not price or price <= 0: continue
                             
-                            if positions_to_force_close:
-                                 tasks=[self.portfolio.live_close(s, f"Forced TP (R>={futures_settings.FORCED_TAKE_PROFIT_PERCENT}%)") for s in positions_to_force_close]; await asyncio.gather(*tasks); #
-                                 self.logger.info("Forced TP done, re-syncing..."); 
-                                 
-                                 await self.portfolio.sync_state() # 强制止盈后立即再次同步
-                                 
-                                 await self._log_portfolio_status()
-                    except Exception as e_ftp: self.logger.error(f"Forced TP error: {e_ftp}", exc_info=True)
+                            entry = state.get('avg_entry_price')
+                            size = state.get('total_size')
+                            side = state.get('side')
+                            lev = state.get('leverage')
+                            margin = state.get('margin') # 从 position_manager 获取
+                            
+                            if not all([entry, size, side, lev, margin]) or lev <= 0 or entry <= 0 or margin <= 0:
+                                self.logger.warning(f"Risk Check: Skipping {symbol}, invalid state data.")
+                                continue
+
+                            # 计算利润率 (UPL / Margin)
+                            upl = (price - entry) * size if side == 'long' else (entry - price) * size
+                            rate = upl / margin # 使用 PM 管理器计算的保证金
+
+                            # --- 风控规则应用 (优先级顺序) ---
+                            
+                            # 规则 1: 最大亏损 (Max Loss)
+                            if rate <= -MAX_LOSS_PERCENT:
+                                reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
+                                if symbol not in positions_to_close:
+                                    self.logger.warning(f"!!! HARD STOP: MAX LOSS !!! {symbol} | R {rate:.2%} <= {-MAX_LOSS_PERCENT:.0%}")
+                                    positions_to_close[symbol] = reason
+                                continue # 强制平仓，跳过后续检查
+
+                            # 规则 2: 粉尘仓位 (Dust)
+                            if margin < DUST_MARGIN_USDT:
+                                reason = f"Dust Close (<{DUST_MARGIN_USDT:.1f}U)"
+                                if symbol not in positions_to_close:
+                                    self.logger.warning(f"!!! HARD STOP: DUST !!! {symbol} | Margin {margin:.2f} < {DUST_MARGIN_USDT:.1f}U")
+                                    positions_to_close[symbol] = reason
+                                continue # 强制平仓，跳过后续检查
+
+                            # 规则 3: AI 设置的止损 (AI SL)
+                            ai_sl = state.get('ai_suggested_stop_loss')
+                            if ai_sl and ai_sl > 0:
+                                if (side == 'long' and price <= ai_sl) or (side == 'short' and price >= ai_sl):
+                                    reason = f"AI SL Hit ({ai_sl:.4f})"
+                                    if symbol not in positions_to_close:
+                                        self.logger.warning(f"!!! HARD STOP: AI SL !!! {symbol} | Price {price:.4f} hit SL {ai_sl:.4f}")
+                                        positions_to_close[symbol] = reason
+                                    continue # 强制平仓，跳过后续检查
+
+                            # 规则 4: AI 设置的止盈 (AI TP)
+                            ai_tp = state.get('ai_suggested_take_profit')
+                            if ai_tp and ai_tp > 0:
+                                if (side == 'long' and price >= ai_tp) or (side == 'short' and price <= ai_tp):
+                                    reason = f"AI TP Hit ({ai_tp:.4f})"
+                                    if symbol not in positions_to_close:
+                                        self.logger.warning(f"!!! HARD STOP: AI TP !!! {symbol} | Price {price:.4f} hit TP {ai_tp:.4f}")
+                                        positions_to_close[symbol] = reason
+                                    continue # 强制平仓，跳过后续检查
+
+                            # 规则 5: 多阶段止盈 (Multi-Stage TP)
+                            # (确保计数器存在)
+                            self.tp_counters.setdefault(symbol, {'stage1': 0, 'stage2': 0})
+                            counters = self.tp_counters[symbol]
+
+                            if rate < 0:
+                                # 收益率为负，重置计数器
+                                if counters['stage1'] == 1 or counters['stage2'] == 1:
+                                    self.logger.info(f"Resetting TP counters for {symbol} (UPL negative).")
+                                    counters['stage1'] = 0
+                                    counters['stage2'] = 0
+                            
+                            elif rate >= MULTI_TP_STAGE_2_PERCENT and counters['stage2'] == 0:
+                                # 触发阶段 2 (+10%)
+                                self.logger.warning(f"!!! HARD TP (Stage 2) !!! {symbol} | R {rate:.2%} >= {MULTI_TP_STAGE_2_PERCENT:.0%}")
+                                positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 2 (>{MULTI_TP_STAGE_2_PERCENT:.0%})"))
+                                counters['stage2'] = 1 # 标记为已触发
+                                # (我们假设阶段1也自动触发)
+                                counters['stage1'] = 1 
+                            
+                            elif rate >= MULTI_TP_STAGE_1_PERCENT and counters['stage1'] == 0:
+                                # 触发阶段 1 (+4%)
+                                self.logger.warning(f"!!! HARD TP (Stage 1) !!! {symbol} | R {rate:.2%} >= {MULTI_TP_STAGE_1_PERCENT:.0%}")
+                                positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 1 (>{MULTI_TP_STAGE_1_PERCENT:.0%})"))
+                                counters['stage1'] = 1 # 标记为已触发
+
+                    except Exception as e_risk:
+                        self.logger.error(f"High-frequency risk check error: {e_risk}", exc_info=True)
+
+                    # 3. 执行风控动作
+                    # (我们不需要在这里 re-sync，因为下一次循环会在开头 sync)
+                    
+                    if positions_to_close:
+                         tasks_close = [self.portfolio.live_close(symbol, reason=reason) for symbol, reason in positions_to_close.items()]
+                         await asyncio.gather(*tasks_close)
+                         self.logger.info(f"Hard Close actions executed for: {list(positions_to_close.keys())}")
+                    
+                    if positions_to_partial_close:
+                        # 确保我们不会部分平仓一个刚刚被全平的仓位
+                        final_partial_tasks = []
+                        for symbol, size_pct, reason in positions_to_partial_close:
+                            if symbol not in positions_to_close:
+                                final_partial_tasks.append(self.portfolio.live_partial_close(symbol, size_percent=size_pct, reason=reason))
+                        
+                        if final_partial_tasks:
+                            await asyncio.gather(*final_partial_tasks)
+                            self.logger.info("Hard Partial TP actions executed.")
                 
-                # 步骤 5: 决定是否触发 AI
+                # --- [ V45.34 风控结束 ] ---
+
+
+                # 步骤 5: 决定是否触发 AI (低频)
                 trigger_ai, reason, now = False, "", time.time(); interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS;
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
                 if not trigger_ai:
                     sym=self.symbols[0]; ohlcv_15m, ohlcv_1h = [], []
                     try: 
-                        # 确保为 BBands(20) 和 RSI(14) 获取足够的数据
                         ohlcv_15m, ohlcv_1h = await asyncio.gather(
                             self.exchange.fetch_ohlcv(sym, '15m', limit=150), 
                             self.exchange.fetch_ohlcv(sym, '1h', limit=20)
@@ -905,37 +1025,20 @@ class AlphaTrader:
                     cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES * 60
                     
                     if now - self.last_event_trigger_ai_time > cooldown:
-                        
-                        # --- [V45.29 优化] 链式检查所有事件 ---
-                        event, ev_reason = await self._check_significant_indicator_change(ohlcv_15m) # 1. 15m MACD 交叉
-                        
-                        if not event: 
-                            # 2. 15m RSI 穿越 (新)
-                            # (假设您已添加 _check_rsi_threshold_breach)
-                            event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m)
-                        
-                        if not event: 
-                            # 3. 15m BBands 穿越 (新)
-                            # (假设您已添加 _check_bollinger_band_breach)
-                            event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m)
-
-                        if not event: 
-                            # 4. 1h 波动 (旧)
-                            event, ev_reason = await self._check_market_volatility_spike(ohlcv_1h) #
-                        # --- [优化结束] ---
-
-                        if event: 
-                            trigger_ai, reason = True, ev_reason
+                        event, ev_reason = await self._check_significant_indicator_change(ohlcv_15m) # 1. 15m MACD
+                        if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m) # 2. 15m RSI
+                        if not event: event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m) # 3. 15m BBands
+                        if not event: event, ev_reason = await self._check_market_volatility_spike(ohlcv_1h) # 4. 1h Volatility
+                        if event: trigger_ai, reason = True, ev_reason
                 
                 # 步骤 6: (安全地) 运行 AI 循环
                 if trigger_ai:
                     self.logger.warning(f"🔥 AI triggered! Reason: {reason} (Sync was successful)")
                     if reason != "Scheduled": self.last_event_trigger_ai_time = now
-                    await self.run_cycle(); self.last_run_time = now #
+                    await self.run_cycle(); self.last_run_time = now
                 
-                await asyncio.sleep(10)
+                await asyncio.sleep(10) # 10秒主循环
             except asyncio.CancelledError: self.logger.warning("Task cancelled, shutting down..."); break
             except Exception as e: 
-                # 这是捕获 FTP 或 AI Trigger 逻辑中未捕获的错误
-                self.logger.critical(f"Main loop fatal error (outside sync): {e}", exc_info=True); 
-                await asyncio.sleep(60)        
+                self.logger.critical(f"Main loop fatal error (outside sync/AI): {e}", exc_info=True); 
+                await asyncio.sleep(60)
