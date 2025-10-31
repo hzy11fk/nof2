@@ -1,4 +1,4 @@
-# 文件: exchange_client.py (V4 - 健壮的API重试最终版)
+# 文件: exchange_client.py (V5 - 增加了缺失的 fetch_open_orders)
 
 import logging
 import asyncio
@@ -78,6 +78,12 @@ class ExchangeClient:
     async def fetch_order(self, order_id: str, symbol: str):
         """获取订单信息，并应用重试逻辑。"""
         return await self._retry_async_method(self.exchange.fetch_order, order_id, symbol=symbol)
+
+    # --- [V45.36 修复：添加缺失的方法] ---
+    async def fetch_open_orders(self, symbol: str = None, since: int = None, limit: int = None, params={}):
+        """获取所有未结订单，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.fetch_open_orders, symbol=symbol, since=since, limit=limit, params=params)
+    # --- [修复结束] ---
 
     async def cancel_order(self, order_id: str, symbol: str):
         """取消订单，并应用重试逻辑。"""
