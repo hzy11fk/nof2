@@ -1,9 +1,8 @@
-# 文件: alpha_trader.py (V45.34 - 硬风控重构版)
-# 1. [硬风控] 将 多阶段止盈(+4%/+10%) 移至 start() 循环。
-# 2. [硬风控] 将 AI设置的SL/TP执行 移至 start() 循环。
-# 3. [硬风控] 增加 粉尘仓位(<1U) 自动平仓。
-# 4. [硬风控] 将 最大亏损(-20%) 移至 start() 循环。
-# 5. [AI Prompt] AI 现在专注于“更新SL/TP”和“识别反转行情”。
+# 文件: alpha_trader.py (V45.35 - 趋势市限价单策略)
+# 1. [硬风控] start() 循环执行所有高频风控 (SL/TP/MaxLoss/Dust/Multi-TP)
+# 2. [AI Prompt] AI 专注于动态 SL/TP 更新和反转识别
+# 3. [策略A 核心] AI 现在在 盘整市 和 趋势回调市 中，必须使用限价单 (LIMIT_BUY / LIMIT_SELL)
+# 4. [策略A 核心] 事件触发器 (RSI/BBands) 已修改为 "预测性" (在价格到达前触发)
 
 import logging
 import asyncio
@@ -17,7 +16,7 @@ import httpx
 from collections import deque
 from config import settings, futures_settings
 from alpha_ai_analyzer import AlphaAIAnalyzer
-from alpha_portfolio import AlphaPortfolio 
+from alpha_portfolio import AlphaPortfolio # 假设 V23.4 或更高
 from datetime import datetime
 from typing import Tuple, Dict, Any, Set, Optional
 
@@ -28,12 +27,11 @@ except ImportError:
 
 class AlphaTrader:
     
-    # --- [ V45.34 PROMPT 优化 ] ---
-    # 1. [移除] 删除了旧的 "Rule 2 (Profit Protection Mandate)"。
-    # 2. [移除] 删除了 CoT 模板中的 "Profit Management", "Max Loss Cutoff", "Trailing Stop Assessment"。
-    # 3. [新增] "Rule 2: Active SL/TP Management" -> AI 必须主动更新 SL/TP。
-    # 4. [新增] CoT 模板中增加 "Reversal & Profit Save Check" -> AI 主动识别反转以平仓。
-    # 5. [新增] CoT 模板中增加 "SL/TP Target Update Check" -> AI 执行 Rule 2。
+    # --- [ V45.35 PROMPT 核心升级: 引入限价单策略 ] ---
+    # 1. [Rule 5] 重写：趋势市首选 "LIMIT" (回调)，盘整市 *必须* "LIMIT" (均值回归)。
+    # 2. [Rule 5] 市价单 (MARKET) 仅用于 "高置信度趋势突破"。
+    # 3. [Order Rules] 增加 "LIMIT_BUY" 和 "LIMIT_SELL" 动作模板。
+    # 4. [CoT] 示例已更新，以反映 "PREPARE LIMIT_BUY" 思维。
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -52,7 +50,7 @@ class AlphaTrader:
     3.  **Risk Management Foundation (CRITICAL):** Profit is the goal, but capital preservation is the foundation. You MUST strictly follow these rules:
         -   **Leverage Selection:**You should use *lower* leverage (e.g., 5x-8x) for higher volatility assets (e.g., SOL, DOGE) and *moderate* leverage (e.g., 10x-15x) for lower volatility assets (e.g., BTC, ETH). Your chosen leverage (e.g., `leverage: 8`) MUST be stated in the reasoning.
         -   **Single Position Sizing (Open/Add):** When opening a new position OR adding to an existing one, you MUST calculate the size based on **Total Equity**, not Available Cash.
-        -   **CALCULATION FORMULA (MANDATORY):** You MUST follow this formula for EACH `BUY`/`SELL` order:
+        -   **CALCULATION FORMULA (MANDATORY):** You MUST follow this formula for EACH `BUY`/`SELL`/`LIMIT_BUY`/`LIMIT_SELL` order:
             1.  **Choose a `risk_percent` (DYNAMICALLY):** Your chosen `risk_percent` MUST be based on the **trade confidence** (derived from your 'Signal Confluence Score'):
                 * **High Confidence (Score: 4/4, all signals align, F&G confirms, Volume confirms):** Use a higher risk, e.g., `risk_percent = 0.05` (5% Equity).
                 * **Medium Confidence (Score: 3/4, minor conflicts, F&G neutral):** Use a lower risk, e.g., `risk_percent = 0.025` (2.5% Equity).
@@ -64,16 +62,16 @@ class AlphaTrader:
             4.  **Check Minimum Margin (CRITICAL):**
                 -   IF `calculated_desired_margin` < 6.0: **Abort the trade.** Your risk calculation (${{calculated_desired_margin:.2f}}) is below the 6.0 USDT minimum margin. The trade is too small to be valid.
                 -   IF `calculated_desired_margin` >= 6.0: `final_desired_margin = calculated_desired_margin`. (Proceed)
-            5.  `size = (final_desired_margin * leverage) / current_price`.
+            5.  `size = (final_desired_margin * leverage) / price`. (Use `limit_price` for limit orders, `current_price` for market orders).
             6.  **Check BTC Minimum Size (CRITICAL):**
                 -   IF `symbol` is "BTC/USDT:USDT":
                     -   IF `size` >= 0.001: **Proceed.** (Size is valid).
                     -   IF `size` < 0.001:
                         -   **Action:** Recalculate based on the minimum size.
                         -   `new_size = 0.001`
-                        -   `recalculated_margin = (0.001 * current_price) / leverage`
+                        -   `recalculated_margin = (0.001 * price) / leverage`
                         -   **Check Cash Again:** Is `recalculated_margin` <= `Available Cash`?
-                            -   IF NO: **Abort the trade.** (Cash is insufficient for the minimum BTC size: ${{recalculated_margin:.2f}} > ${{Available Cash:.2f}}).
+                            -   IF NO: **Abort the trade.** (Cash is insufficient for the minimum BTC size).
                             -   IF YES: **Proceed.** (Use the adjusted values: `final_desired_margin = recalculated_margin`, `size = new_size`).
         -   **Total Exposure:** The sum of all margins for all open positions should generally not exceed 50-60% of your total equity.
         -   **Correlation Control (Hard Cap):** You MUST limit total risk exposure to highly correlated assets.
@@ -81,7 +79,7 @@ class AlphaTrader:
             -   Define 'Altcoin Group' as [SOL, BNB, DOGE, XRP]. Total margin for this group MUST NOT exceed 40% of Total Equity.
             -   If opening a new position (e.g., SOL) would breach its group cap, you MUST ABORT the trade.
 
-    4.  **Complete Trade Plans (Open/Add):** Every new `BUY` or `SELL` order is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
+    4.  **Complete Trade Plans (Open/Add):** Every new `BUY`/`SELL`/`LIMIT_BUY`/`LIMIT_SELL` order is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
         -   **Smarter Invalidation:** Your `invalidation_condition` MUST be based on a clear technical breakdown of the *original trade thesis*.
             -   *Trend Trade Example:* `Invalidation='1h Close below the EMA 50'` (if thesis was a 1h uptrend).
             -   *Trend Trade Example:* `Invalidation='4h ADX drops below 20'` (if thesis was a 4h trend).
@@ -93,11 +91,13 @@ class AlphaTrader:
         -   **1. Strong Trend (Trending Bullish/Bearish):**
             -   **Condition:** 1h or 4h **ADX_14 > 25**.
             -   **Strategy:** In this regime, **EMA crossovers** and **MACD** signals are your primary tools. You MUST trade WITH the trend.
-            -   **RSI:** In strong trends, RSI can stay "overbought"/"oversold" for a long time. DO NOT use RSI for counter-trend entries.
+            -   **Primary Strategy (LIMIT):** Your best strategy is to trade **pullbacks**. Identify key S/R levels (e.g., 1h EMA 20, 4h BB_Mid). Your job is to place a **`LIMIT_BUY` (in uptrend) or `LIMIT_SELL` (in downtrend)** at that calculated level.
+            -   **Secondary Strategy (MARKET):** Only use a MARKET order (`BUY`/`SELL`) for very high-confidence *breakouts* (e.g., 15m/1h MACD cross + high volume_ratio + F&G confirmation).
+            -   **RSI:** In strong trends, RSI can stay "overbought"/"oversold". DO NOT use RSI for counter-trend entries.
         -   **2. Ranging (No Trend):**
             -   **Condition:** 1h and 4h **ADX_14 < 20**.
-            -   **Strategy:** In this regime, **RSI** (overbought/oversold) and **Bollinger Bands (BB_Upper/BB_Lower)** are your primary tools. You should look for mean-reversion trades.
-            -   **INVALIDATION:** In a ranging market, you MUST **IGNORE** all EMA and MACD crossover signals, as they will be false.
+            -   **Strategy (LIMIT ONLY):** In this regime, your **only** strategy is **mean-reversion**. Your task is to identify the `BB_Upper` and `BB_Lower` levels. You MUST issue **`LIMIT_SELL` at (or near) the upper band** or **`LIMIT_BUY` at (or near) the lower band**.
+            -   **INVALIDATION:** You MUST **NOT** use MARKET orders (`BUY`/`SELL`) or MACD/EMA signals in this regime. Your analysis delay makes market orders unprofitable.
         -   **3. Chop (Uncertain):**
             -   **Condition:** 1h or 4h **ADX_14 is between 20 and 25**.
             -   **Strategy:** This is an uncertain market. **WAIT** for a clear signal (ADX > 25 or ADX < 20).
@@ -158,7 +158,7 @@ class AlphaTrader:
            Pyramiding Check (Adding to a Winner):
            - [Is UPL Percent > +2.5% AND is the original trend (ADX > 25) still strong?]
            - [AND has price pulled back to a key support (for Long) / resistance (for Short) (e.g., 1h EMA 20)?]
-           - [IF YES: Consider an `ADD` order. This new entry is treated as a separate trade and MUST follow the full Rule 3 (Sizing) / Rule 4 (SL/TP) logic.]
+           - [IF YES: Consider an `ADD` order (Market) or `LIMIT_BUY`/`LIMIT_SELL` (Limit) order. This new entry is treated as a separate trade and MUST follow the full Rule 3 (Sizing) / Rule 4 (SL/TP) logic.]
            - [CRITICAL: You MUST NEVER add to a losing position (UPL < 0). Averaging down is forbidden.]
            
            SL/TP Target Update Check (NEW):
@@ -181,15 +181,21 @@ class AlphaTrader:
 
         Specific Multi-Timeframe Opportunity Analysis:
         [For each symbol, analyze BOTH long and short scenarios based on the detected Market State (Trend vs Range)]
-        [EXAMPLE - TRENDING MARKET:]
+        
+        [EXAMPLE - TRENDING MARKET (Pullback):]
         BTC Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
-        - 4h Trend: Bullish (EMA 20 > 50) | 1h Momentum: Strong (MACD > 0) | 15min Setup: Pullback to EMA 20 | 5min Trigger: Confirmed
-        - Signal Confluence Score: 4/4 | Final Confidence: High - CONSIDER LONG
+        - 4h Trend: Bullish (EMA 20 > 50) | 1h Momentum: Strong (MACD > 0) | 15min Setup: Price is *approaching* pullback support (1h EMA 20 @ 65000.0).
+        - Signal Confluence Score: 4/4 | Final Confidence: High - **PREPARE LIMIT_BUY at 65000.0**
 
-        [EXAMPLE - RANGING MARKET:]
+        [EXAMPLE - RANGING MARKET (Mean Reversion):]
         ETH Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
-        - 4h Trend: N/A (ADX < 20) | 1h Setup: Price approaching BB_Upper | 15min RSI: 72 (Overbought) | 5min Trigger: Weak bearish div
-        - Signal Confluence Score: 3/4 (RSI/BBands align) | Final Confidence: Medium - CONSIDER SHORT (Mean Reversion)
+        - 4h Trend: N/A (ADX < 20) | 1h Setup: Price is *approaching* 1h BB_Upper (@ 3900.0) | 15min RSI: 68.5 (Approaching Overbought)
+        - Signal Confluence Score: 3/4 (RSI/BBands align) | Final Confidence: High (for Ranging) - **PREPARE LIMIT_SELL at 3900.0**
+
+        [EXAMPLE - TRENDING MARKET (Breakout):]
+        SOL Multi-Timeframe Assessment (Market State: Trending Bullish, 1h ADX=30):
+        - 4h Trend: Bullish | 1h Momentum: Strong | 15min Setup: Just had a MACD Golden Cross. | 5min Trigger: Confirmed, volume_ratio=1.5
+        - Signal Confluence Score: 4/4 | Final Confidence: High - **CONSIDER BUY (Market)**
 
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
         ```
@@ -197,8 +203,10 @@ class AlphaTrader:
     2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding all.
 
     **Order Object Rules:**
-    -   **To Open or Add (LONG):**`{{"action": "BUY", "symbol": "...", "size": [CALCULATED_SIZE], "leverage": [CHOSEN_LEVERAGE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Leverage chosen: [Why 10x? or Why 5x?]. Calculation: Based on Total Equity. final_margin={{final_margin_usd:.2f}} (must be >= 6.0). size=(Final Margin)*lev/price=... Multi-TF confirm: [...]. Market State: [...]"}}`
-    -   **To Open or Add (SHORT):**`{{"action": "SELL", "symbol": "...", "size": [CALCULATED_SIZE], "leverage": [CHOSEN_LEVERAGE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Leverage chosen: [Why 10x? or Why 5x?]. Calculation: Based on Total Equity. final_margin={{final_margin_usd:.2f}} (must be >= 6.0). size=(Final Margin)*lev/price=... Multi-TF confirm: [...]. Market State: [...]"}}`
+    -   **To Open Market (LONG):**`{{"action": "BUY", "symbol": "...", "size": [CALCULATED_SIZE], "leverage": [CHOSEN_LEVERAGE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Market Order. Leverage chosen: [...]. Calculation: [...]. Multi-TF confirm: [...]. Market State: [Trending Breakout]"}}`
+    -   **To Open Market (SHORT):**`{{"action": "SELL", "symbol": "...", "size": [CALCULATED_SIZE], "leverage": [CHOSEN_LEVERAGE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Market Order. Leverage chosen: [...]. Calculation: [...]. Multi-TF confirm: [...]. Market State: [Trending Breakout]"}}`
+    -   **To Open Limit (LONG):** `{{"action": "LIMIT_BUY", "symbol": "...", "size": [CALCULATED_SIZE], "leverage": [CHOSEN_LEVERAGE], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order. Leverage chosen: [...]. Calculation: [...]. Market State: [Trending Pullback or Ranging Support]"}}`
+    -   **To Open Limit (SHORT):** `{{"action": "LIMIT_SELL", "symbol": "...", "size": [CALCULATED_SIZE], "leverage": [CHOSEN_LEVERAGE], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order. Leverage chosen: [...]. Calculation: [...]. Market State: [Trending Pullback or Ranging Resistance]"}}`
     -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
     -   **To Close Partially (Take Profit):** `{{"action": "PARTIAL_CLOSE", "symbol": "...", "size_percent": 0.5, "reasoning": "Taking 50% profit near resistance per Rule 4..."}}` (or `size_absolute`)
     -   **To Update Stop Loss:** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Actively moving SL to new 15m support level..."}}`
@@ -235,9 +243,6 @@ class AlphaTrader:
         
         # --- [V45.34 新增] ---
         # 止盈计数器，用于多阶段止盈。
-        # 结构: {'BTC/USDT:USDT': {'stage1': 0, 'stage2': 0}}
-        # 0 = 未触发, 1 = 已触发
-        # 注意：这将在机器人重启时重置。更健壮的方案是将其存储在 AlphaPositionManager 中。
         self.tp_counters: Dict[str, Dict[str, int]] = {}
         # --- [新增结束] ---
 
@@ -297,11 +302,7 @@ class AlphaTrader:
                         for col in cols_to_numeric:
                             df[col] = pd.to_numeric(df[col], errors='coerce')
                         
-                        # --- [V45.24 核心修复] ---
-                        # df.fillna(method='ffill', inplace=True) # 旧的、产生警告的代码
-                        df.ffill(inplace=True) # 新的、建议的代码
-                        # --- [修复结束] ---
-                        
+                        df.ffill(inplace=True)
                         df.dropna(inplace=True)
                         
                         df['ts'] = pd.to_datetime(df['ts'], unit='ms'); df.set_index('ts', inplace=True)
@@ -312,9 +313,7 @@ class AlphaTrader:
                             
                         prefix = f"{timeframe.replace('m', 'min').replace('h', 'hour')}_"
 
-                        # --- [V45.23 核心修复：移植 futures_trader.py 的手动计算逻辑] ---
-                        
-                        # 1. 手动计算 ADX (移植自 get_adx_data)
+                        # 1. 手动计算 ADX
                         if len(df) >= 28: # (14*2)
                             try:
                                 high = df['h']; low = df['l']; close = df['c']; period = 14
@@ -335,7 +334,7 @@ class AlphaTrader:
                             except Exception as e:
                                 self.logger.warning(f"Manual ADX calc failed for {symbol} {timeframe}: {e}", exc_info=False)
 
-                        # 2. 手动计算 BBands (移植自 get_bollinger_bands_data)
+                        # 2. 手动计算 BBands
                         if len(df) >= 20:
                             try:
                                 period = 20; std_dev = 2.0; closes = df['c']
@@ -350,7 +349,7 @@ class AlphaTrader:
                             except Exception as e:
                                 self.logger.warning(f"Manual BBands calc failed for {symbol} {timeframe}: {e}", exc_info=False)
 
-                        # 3. 手动计算 RSI (移植自 get_rsi_data)
+                        # 3. 手动计算 RSI
                         if len(df) >= 15: # (14+1)
                             try:
                                 period = 14; delta = df['c'].diff()
@@ -363,7 +362,7 @@ class AlphaTrader:
                             except Exception as e:
                                 self.logger.warning(f"Manual RSI calc failed for {symbol} {timeframe}: {e}", exc_info=False)
 
-                        # 4. 保留 ta.macd (之前未报错, 包裹 try-except)
+                        # 4. ta.macd
                         if len(df) >= 26:
                             try:
                                 macd = ta.macd(df['c'], 12, 26, 9)
@@ -374,7 +373,7 @@ class AlphaTrader:
                             except Exception as e:
                                 self.logger.warning(f"ta.macd calc failed for {symbol} {timeframe}: {e}", exc_info=False)
                                 
-                        # 5. 保留 ta.ema (之前未报错, 包裹 try-except)
+                        # 5. ta.ema
                         if len(df) >= 50:
                             try:
                                 ema20 = ta.ema(df['c'], 20)
@@ -385,9 +384,8 @@ class AlphaTrader:
                                     market_indicators_data[symbol][f'{prefix}ema_50'] = ema50.iloc[-1]
                             except Exception as e:
                                 self.logger.warning(f"ta.ema calc failed for {symbol} {timeframe}: {e}", exc_info=False)
-                        # --- [V45.23 修复结束] ---
 
-                        # (非 ta-strategy 计算的指标)
+                        # 6. 其他指标
                         if len(df)>=2: 
                             cur_v=df['v'].iloc[-1]; avg_v=df['v'].tail(20).mean() if len(df)>=20 else df['v'].mean();
                             if avg_v>0: market_indicators_data[symbol][f'{prefix}volume_ratio']=cur_v/avg_v
@@ -409,7 +407,7 @@ class AlphaTrader:
 
 
     def _build_prompt(self, market_data: Dict[str, Dict[str, Any]], portfolio_state: Dict, tickers: Dict) -> str:
-        """[V45.17] 构建 User Prompt, 增加 ADX/BBands"""
+        """构建 User Prompt"""
         prompt = f"It has been {(time.time() - self.start_time)/60:.0f} minutes since start.\n"
         prompt += "\n--- Multi-Timeframe Market Data Overview (5m, 15m, 1h, 4h) ---\n"
         def safe_format(value, precision, is_rsi=False):
@@ -428,30 +426,30 @@ class AlphaTrader:
             for tf in timeframes:
                 prompt += f"\n[{tf.upper()}]\n"
                 prompt += f" RSI:{safe_format(d.get(f'{tf}_rsi_14'), 0, is_rsi=True)}|"
-                prompt += f" ADX:{safe_format(d.get(f'{tf}_adx_14'), 0, is_rsi=True)}|" # [V45.17 新增]
+                prompt += f" ADX:{safe_format(d.get(f'{tf}_adx_14'), 0, is_rsi=True)}|" 
                 prompt += f"MACD:{safe_format(d.get(f'{tf}_macd'), 4)}|"
                 prompt += f"Sig:{safe_format(d.get(f'{tf}_macd_signal'), 4)}|"
                 prompt += f"Hist:{safe_format(d.get(f'{tf}_macd_hist'), 4)}\n"
                 prompt += f" EMA20:{safe_format(d.get(f'{tf}_ema_20'), 3)}|"
                 prompt += f"EMA50:{safe_format(d.get(f'{tf}_ema_50'), 3)}|"
                 prompt += f"VolR:{safe_format(d.get(f'{tf}_volume_ratio'), 1)}x\n"
-                prompt += f" BB_Up:{safe_format(d.get(f'{tf}_bb_upper'), 3)}|"   # [V45.17 新增]
-                prompt += f"BB_Mid:{safe_format(d.get(f'{tf}_bb_middle'), 3)}|" # [V45.17 新增]
-                prompt += f"BB_Low:{safe_format(d.get(f'{tf}_bb_lower'), 3)}\n" # [V45.17 新增]
+                prompt += f" BB_Up:{safe_format(d.get(f'{tf}_bb_upper'), 3)}|"   
+                prompt += f"BB_Mid:{safe_format(d.get(f'{tf}_bb_middle'), 3)}|" 
+                prompt += f"BB_Low:{safe_format(d.get(f'{tf}_bb_lower'), 3)}\n" 
                 prompt += f" Hi:{safe_format(d.get(f'{tf}_recent_high'), 2)}|"
                 prompt += f"Lo:{safe_format(d.get(f'{tf}_recent_low'), 2)}|"
                 prompt += f"Chg:{safe_format(d.get(f'{tf}_price_change_pct'), 1)}%\n"
             prompt += "-----\n"
-        # --- [修改] 在账户信息之前插入市场情绪上下文 ---
+        
         prompt += "\n--- Market Context ---\n"
         fng_val = self.fng_data.get('value', 50)
         fng_class = self.fng_data.get('value_classification', 'Neutral').title() # e.g. "Extreme Fear"
         prompt += f"Fear & Greed Index: {fng_val} ({fng_class})\n"
-        # --- [修改结束] ---    
+        
         prompt += "\n--- Account Info ---\n"
         prompt += f"Return%: {portfolio_state.get('performance_percent', 'N/A')}\n"
-        prompt += f"Total Equity: {portfolio_state.get('account_value_usd', 'N/A')}\n" # [V4S.17 核心] AI 现在需要 Equity
-        prompt += f"Available Cash: {portfolio_state.get('cash_usd', 'N/A')}\n" # [V45.17 核心] AI 同时需要 Cash
+        prompt += f"Total Equity: {portfolio_state.get('account_value_usd', 'N/A')}\n" 
+        prompt += f"Available Cash: {portfolio_state.get('cash_usd', 'N/A')}\n" 
         prompt += "Positions:\n"
         prompt += portfolio_state.get('open_positions', "No open positions.")
         return prompt
@@ -462,7 +460,7 @@ class AlphaTrader:
         return await self.ai_analyzer.get_ai_response(system_prompt, user_prompt)
 
     async def _execute_decisions(self, decisions: list, market_data: Dict[str, Dict[str, Any]]):
-        """[V4R.34 优化] 增加 UPDATE_TAKEPROFIT 逻辑"""
+        """[V45.35 升级] 增加 LIMIT_BUY / LIMIT_SELL 动作"""
         
         MIN_MARGIN_USDT = 6.0
         MIN_SIZE_BTC = 0.001 
@@ -470,39 +468,57 @@ class AlphaTrader:
         for order in decisions:
             try:
                 action = order.get('action'); symbol = order.get('symbol')
-                if not action or not symbol or symbol not in self.symbols: self.logger.warning(f"跳过无效指令: {order}"); continue
-                reason = order.get('reasoning', 'N/A'); current_price = market_data.get(symbol, {}).get('current_price')
+                if not action or not symbol or symbol not in self.symbols: 
+                    self.logger.warning(f"跳过无效指令: {order}"); continue
                 
-                # [V45.17 修复] 允许 UPDATE_STOPLOSS/TAKEPROFIT 在没有价格时也能执行
-                if action not in ["UPDATE_STOPLOSS", "UPDATE_TAKEPROFIT"] and (not current_price or current_price <= 0):
-                    self.logger.error(f"无价格 {symbol}，跳过: {order}"); continue
+                reason = order.get('reasoning', 'N/A')
+                
+                # --- [V45.35 价格获取逻辑] ---
+                # 市价单需要 "current_price"
+                # 限价单需要 "limit_price" (从AI获取)
+                # 更新单不需要价格
+                current_price = market_data.get(symbol, {}).get('current_price')
+                limit_price = order.get('limit_price') # 仅用于限价单
+                
+                price_for_market_order = (action in ["BUY", "SELL", "CLOSE", "PARTIAL_CLOSE"])
+                price_for_limit_order = (action in ["LIMIT_BUY", "LIMIT_SELL"])
+
+                if price_for_market_order and (not current_price or current_price <= 0):
+                    self.logger.error(f"无当前价格 {symbol}，跳过 Market Action: {order}"); continue
+                
+                if price_for_limit_order and (not limit_price or float(limit_price) <= 0):
+                    self.logger.error(f"无效限价 {limit_price} {symbol}，跳过 Limit Action: {order}"); continue
+                # --- [V45.35 逻辑结束] ---
+
                 
                 if action == "CLOSE":
                     if self.is_live_trading: await self.portfolio.live_close(symbol, reason=reason)
                     else: await self.portfolio.paper_close(symbol, current_price, reason=reason)
                 
+                # --- [V45.35 市价单] ---
                 elif action in ["BUY", "SELL"]:
                     side = 'long' if action == 'BUY' else 'short'; final_size = 0.0
+                    price_to_calc = current_price # 市价单使用当前价格计算
                     try:
                         original_size = float(order.get('size')); leverage = int(order.get('leverage'))
                         stop_loss = float(order.get('stop_loss')); take_profit = float(order.get('take_profit'))
                         if original_size <= 0 or leverage <= 0: raise ValueError("Size/Lev无效")
                         
-                        intended_margin = (original_size * current_price) / leverage if leverage > 0 else 0.0
+                        intended_margin = (original_size * price_to_calc) / leverage if leverage > 0 else 0.0
                         final_size = original_size; final_margin = intended_margin
                         
                         if intended_margin < MIN_MARGIN_USDT:
                             self.logger.warning(f"!!! 硬控触发 (保证金) !!! AI订单 {symbol} 保证金 {intended_margin:.4f} < {MIN_MARGIN_USDT} USDT.")
                             final_margin = MIN_MARGIN_USDT
-                            if leverage > 0 and current_price > 0:
-                                final_size = (final_margin * leverage) / current_price
+                            if leverage > 0 and price_to_calc > 0:
+                                final_size = (final_margin * leverage) / price_to_calc
                                 self.logger.warning(f"已修正保证金为 {MIN_MARGIN_USDT} USDT。新Size: {final_size:.8f}")
                             else: raise ValueError("无法重新计算 size (杠杆/价格无效)")
                         
                         if symbol == "BTC/USDT:USDT" and final_size > 0 and final_size < MIN_SIZE_BTC:
                             self.logger.warning(f"!!! 硬控触发 (BTC最小数量) !!! 计算出的 Size {final_size:.8f} < {MIN_SIZE_BTC}.")
                             final_size = MIN_SIZE_BTC
-                            final_margin = (final_size * current_price) / leverage if leverage > 0 else 0.0
+                            final_margin = (final_size * price_to_calc) / leverage if leverage > 0 else 0.0
                             self.logger.warning(f"已修正 Size 为 {MIN_SIZE_BTC}。实际保证金变为: {final_margin:.4f} USDT。")
 
                         if final_size <= 0: raise ValueError("最终 size <= 0")
@@ -514,6 +530,64 @@ class AlphaTrader:
                     if self.is_live_trading: await self.portfolio.live_open(symbol, side, final_size, leverage, reason=reason, stop_loss=stop_loss, take_profit=take_profit, invalidation_condition=invalidation_condition)
                     else: await self.portfolio.paper_open(symbol, side, final_size, price=current_price, leverage=leverage, reason=reason, stop_loss=stop_loss, take_profit=take_profit, invalidation_condition=invalidation_condition)
                 
+                # --- [V45.35 限价单] ---
+                elif action in ["LIMIT_BUY", "LIMIT_SELL"]:
+                    side = 'long' if action == 'LIMIT_BUY' else 'short'; final_size = 0.0
+                    price_to_calc = float(limit_price) # 限价单使用限价计算
+                    try:
+                        original_size = float(order.get('size')); leverage = int(order.get('leverage'))
+                        stop_loss = float(order.get('stop_loss')); take_profit = float(order.get('take_profit'))
+                        if original_size <= 0 or leverage <= 0: raise ValueError("Size/Lev无效")
+                        
+                        intended_margin = (original_size * price_to_calc) / leverage if leverage > 0 else 0.0
+                        final_size = original_size; final_margin = intended_margin
+                        
+                        if intended_margin < MIN_MARGIN_USDT:
+                            self.logger.warning(f"!!! 硬控触发 (保证金) !!! AI限价单 {symbol} 保证金 {intended_margin:.4f} < {MIN_MARGIN_USDT} USDT.")
+                            final_margin = MIN_MARGIN_USDT
+                            if leverage > 0 and price_to_calc > 0:
+                                final_size = (final_margin * leverage) / price_to_calc
+                                self.logger.warning(f"已修正保证金为 {MIN_MARGIN_USDT} USDT。新Size: {final_size:.8f}")
+                            else: raise ValueError("无法重新计算 size (杠杆/价格无效)")
+                        
+                        if symbol == "BTC/USDT:USDT" and final_size > 0 and final_size < MIN_SIZE_BTC:
+                            self.logger.warning(f"!!! 硬控触发 (BTC最小数量) !!! 计算出的 Size {final_size:.8f} < {MIN_SIZE_BTC}.")
+                            final_size = MIN_SIZE_BTC
+                            final_margin = (final_size * price_to_calc) / leverage if leverage > 0 else 0.0
+                            self.logger.warning(f"已修正 Size 为 {MIN_SIZE_BTC}。实际保证金变为: {final_margin:.4f} USDT。")
+
+                        if final_size <= 0: raise ValueError("最终 size <= 0")
+                        
+                    except (ValueError, TypeError, KeyError) as e: 
+                        self.logger.error(f"跳过LIMIT_BUY/SELL参数/计算错误: {order}. Err: {e}"); continue
+                    
+                    invalidation_condition = order.get('invalidation_condition')
+                    
+                    if self.is_live_trading:
+                        if hasattr(self.portfolio, 'live_open_limit'): 
+                            await self.portfolio.live_open_limit(
+                                symbol, 
+                                side, 
+                                final_size, 
+                                leverage, 
+                                price_to_calc, # limit_price
+                                reason=reason, 
+                                stop_loss=stop_loss, 
+                                take_profit=take_profit, 
+                                invalidation_condition=invalidation_condition
+                            )
+                        else:
+                             self.logger.error(f"AI 请求 LIMIT_BUY/SELL 但 portfolio 不支持 live_open_limit！")
+                    else:
+                        # 模拟盘不支持限价单，转为市价单 (如果价格有利)
+                        self.logger.warning(f"模拟盘不支持限价单，正在检查是否转为市价单...")
+                        if (side == 'long' and current_price <= price_to_calc) or (side == 'short' and current_price >= price_to_calc):
+                            self.logger.warning(f"模拟盘：价格 {current_price} 有利，转为市价单。")
+                            await self.portfolio.paper_open(symbol, side, final_size, price=current_price, leverage=leverage, reason=reason, stop_loss=stop_loss, take_profit=take_profit, invalidation_condition=invalidation_condition)
+                        else:
+                            self.logger.info(f"模拟盘：价格 {current_price} 不利，跳过限价单。")
+                
+                # --- [V45.35 其他指令] ---
                 elif action == "PARTIAL_CLOSE":
                     size_to_close_percent=None; size_to_close_absolute=None
                     try:
@@ -542,7 +616,6 @@ class AlphaTrader:
                     else: 
                         self.logger.error(f"AI 尝试 UPDATE_STOPLOSS 但 portfolio 无 update_position_rules 方法。")
                 
-                # --- [V45.34 新增] ---
                 elif action == "UPDATE_TAKEPROFIT":
                     new_take_profit = 0.0
                     try:
@@ -557,7 +630,6 @@ class AlphaTrader:
                         await self.portfolio.update_position_rules(symbol, take_profit=new_take_profit, reason=reason)
                     else: 
                         self.logger.error(f"AI 尝试 UPDATE_TAKEPROFIT 但 portfolio 无 update_position_rules 方法。")
-                # --- [新增结束] ---
 
                 else: 
                     self.logger.warning(f"收到未知 AI 指令 action: {action} in {order}")
@@ -565,7 +637,7 @@ class AlphaTrader:
                 self.logger.error(f"处理 AI 指令时意外错误: {order}. Err: {e}", exc_info=True)
 
     async def _check_significant_indicator_change(self, ohlcv_15m: list) -> Tuple[bool, str]:
-        """检查 15m MACD 交叉"""
+        """检查 15m MACD 交叉 (用于市价突破单)"""
         try:
             if len(ohlcv_15m) < 30: return False, ""
             df = pd.DataFrame(ohlcv_15m, columns=['ts','o','h','l','c','v']); df.rename(columns={'timestamp':'ts', 'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}, inplace=True, errors='ignore');
@@ -581,34 +653,24 @@ class AlphaTrader:
     async def _check_market_volatility_spike(self, ohlcv_1h: list) -> Tuple[bool, str]:
         """
         [V45.29 修复] 检查 1h 价格大幅波动 (边缘触发)。
-        仅在 "上一根K线" 出现波动，而 "上上一根K线" 没有波动时，才触发一次。
         """
         try:
-            # 我们现在需要比较 [-2] 和 [-3]，所以至少需要 3 根K线
             if len(ohlcv_1h) < 3: 
                 return False, ""
             
-            # --- V45.29 修复逻辑 ---
-            
-            # 1. 定义波动阈值
             threshold_pct = settings.AI_VOLATILITY_TRIGGER_PERCENT / 100.0
             
-            # 2. 检查 "上一根K线" ([-2])
             o_curr, c_curr = ohlcv_1h[-2][1], ohlcv_1h[-2][4]
             chg_curr = abs(c_curr - o_curr) / o_curr if o_curr > 0 else 0.0
             is_spiked_curr = chg_curr >= threshold_pct
 
-            # 3. 检查 "上上一根K线" ([-3])
             o_prev, c_prev = ohlcv_1h[-3][1], ohlcv_1h[-3][4]
             chg_prev = abs(c_prev - o_prev) / o_prev if o_prev > 0 else 0.0
             is_spiked_prev = chg_prev >= threshold_pct
             
-            # 4. 边缘触发：仅在当前K线有波动，且前一根K线没有波动时触发
             if is_spiked_curr and not is_spiked_prev:
                 direction = 'up' if c_curr > o_curr else 'down'
                 return True, f"Event: 1h price spike {chg_curr:.1%} ({direction})"
-            
-            # --- 修复结束 ---
                 
             return False, ""
         except Exception as e: 
@@ -639,31 +701,29 @@ class AlphaTrader:
 
     async def _check_rsi_threshold_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
-        [新增 V45.29] 检查 15m RSI 是否穿越了超买/超卖阈值。
-        这对于 AI 的 'Ranging' 策略至关重要。
+        [V45.35 策略A 升级] 检查 15m RSI 是否 *接近* 超买/超卖 (预测性触发)。
         """
         try:
-            if len(ohlcv_15m) < 16: # 需要 14 + 2 根 K线
+            if len(ohlcv_15m) < 16: 
                 return False, ""
             
             df = pd.DataFrame(ohlcv_15m, columns=['ts','o','h','l','c','v'])
             df.rename(columns={'timestamp':'ts', 'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}, inplace=True, errors='ignore')
             
-            # 计算 RSI
             rsi_df = df.ta.rsi(close=df['c'], length=14)
             if rsi_df is None or rsi_df.empty or len(rsi_df) < 2:
                 return False, ""
             
-            rsi_prev = rsi_df.iloc[-2] # 上一根 K 线的 RSI
-            rsi_curr = rsi_df.iloc[-1] # 当前 K 线的 RSI
+            rsi_prev = rsi_df.iloc[-2] 
+            rsi_curr = rsi_df.iloc[-1] 
             
-            # 检查超买 (从下往上穿过 70)
-            if rsi_prev < 70 and rsi_curr >= 70:
-                return True, "Event: 15m RSI Breach Overbought (70)"
+            # 检查接近超买 (从下往上接近 70, 阈值设为 68)
+            if rsi_prev < 68 and rsi_curr >= 68:
+                return True, "Event: 15m RSI *Approaching* Overbought (68)"
                 
-            # 检查超卖 (从上往下穿过 30)
-            if rsi_prev > 30 and rsi_curr <= 30:
-                return True, "Event: 15m RSI Breach Oversold (30)"
+            # 检查接近超卖 (从上往下接近 30, 阈值设为 32)
+            if rsi_prev > 32 and rsi_curr <= 32:
+                return True, "Event: 15m RSI *Approaching* Oversold (32)"
                 
             return False, ""
         except Exception as e:
@@ -672,72 +732,56 @@ class AlphaTrader:
 
     async def _check_bollinger_band_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
-        [新增 V45.29] 检查 15m K线是否穿越了布林带上轨或下轨。
-        [V45.30 修复] 改为使用与 _gather_all_market_data 一致的手动计算逻辑，不再依赖 ta.bbands。
+        [V45.35 策略A 升级] 检查 15m K线是否 *接近* 布林带 (预测性触发)。
         """
         try:
-            # 需要 20 (period) + 2 (for compare) = 22 根 K线
             if len(ohlcv_15m) < 22: 
                 return False, ""
             
             df = pd.DataFrame(ohlcv_15m, columns=['ts','o','h','l','c','v'])
             df.rename(columns={'timestamp':'ts', 'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}, inplace=True, errors='ignore')
             
-            # --- [V45.30 修复] ---
-            # 1. 使用与 _gather_all_market_data 相同的手动计算逻辑
-            period = 20
-            std_dev = 2.0
-            closes = df['c'] # 这是 pd.Series
-            
-            if len(closes) < period: # 再次检查
-                return False, ""
+            period = 20; std_dev = 2.0; closes = df['c']
+            if len(closes) < period: return False, ""
 
             middle_band = closes.rolling(window=period).mean()
             rolling_std = closes.rolling(window=period).std()
-            upper_band = middle_band + (rolling_std * std_dev) # 这是 pd.Series
-            lower_band = middle_band - (rolling_std * std_dev) # 这是 pd.Series
-            # --- [修复结束] ---
+            upper_band = middle_band + (rolling_std * std_dev)
+            lower_band = middle_band - (rolling_std * std_dev)
 
-            # 2. 检查 Series 是否有效 (确保有足够的数据计算)
             if upper_band.isnull().all() or lower_band.isnull().all():
-                self.logger.warning("BBand check: Calculated bands contain only NaNs.")
                 return False, ""
             
-            # 3. 获取上一根 K 线和当前 K 线的数据
-            # 确保索引 -2 和 -1 存在且非 NaN (iloc[-1] 是最新数据, iloc[-2] 是上一根)
-            if pd.isna(upper_band.iloc[-2]) or pd.isna(upper_band.iloc[-1]) or \
-               pd.isna(lower_band.iloc[-2]) or pd.isna(lower_band.iloc[-1]):
-                self.logger.debug("BBand check: Skipping, not enough data for prev/curr comparison (NaN).")
+            if pd.isna(upper_band.iloc[-1]) or pd.isna(lower_band.iloc[-1]):
                 return False, ""
 
-            close_prev = closes.iloc[-2]
             close_curr = closes.iloc[-1]
-            upper_prev = upper_band.iloc[-2]
             upper_curr = upper_band.iloc[-1]
-            lower_prev = lower_band.iloc[-2]
             lower_curr = lower_band.iloc[-1]
 
-            # 4. 检查是否上穿上轨 (之前在带内，现在在带外)
-            if close_prev <= upper_prev and close_curr > upper_curr:
-                return True, "Event: 15m Price Crossed BB_Upper"
+            # --- [V45.35 逻辑] ---
+            # 定义 "接近" 为 0.2% (可调)
+            APPROACH_PERCENT = 0.002 
+            
+            # 检查是否接近上轨 (价格在上轨的 99.8% 和 101% 之间)
+            if (upper_curr * (1.0 - APPROACH_PERCENT)) < close_curr < (upper_curr * (1.0 + APPROACH_PERCENT)):
+                return True, "Event: 15m Price *Approaching* BB_Upper"
                 
-            # 5. 检查是否下穿下轨 (之前在带内，现在在带外)
-            if close_prev >= lower_prev and close_curr < lower_curr:
-                return True, "Event: 15m Price Crossed BB_Lower"
+            # 检查是否接近下轨 (价格在下轨的 99% 和 100.2% 之间)
+            if (lower_curr * (1.0 - APPROACH_PERCENT)) < close_curr < (lower_curr * (1.0 + APPROACH_PERCENT)):
+                return True, "Event: 15m Price *Approaching* BB_Lower"
+            # --- [V45.35 逻辑结束] ---
                 
             return False, ""
         except Exception as e:
-            # 增加 exc_info=True 来记录完整的错误堆栈
             self.logger.error(f"Err check BBand breach: {e}", exc_info=True) 
             return False, ""
 
     async def _update_fear_and_greed_index(self):
         """
         [新增] 异步获取并缓存 Fear & Greed Index。
-        使用1小时缓存避免频繁调用 API。
         """
         now = time.time()
-        # 1. 检查缓存是否有效
         if now - self.last_fng_fetch_time < self.FNG_CACHE_DURATION_SECONDS:
             self.logger.info(f"Using cached F&G Index: {self.fng_data['value_classification']} ({self.fng_data['value']})")
             return
@@ -746,13 +790,11 @@ class AlphaTrader:
         url = "https://api.alternative.me/fng/?limit=1"
         
         try:
-            # 2. 使用 httpx 进行异步请求
             async with httpx.AsyncClient() as client:
                 response = await client.get(url, timeout=10.0)
             
             if response.status_code == 200:
                 data = response.json()
-                # 3. 解析和更新数据
                 if data and 'data' in data and len(data['data']) > 0:
                     fng_info = data['data'][0]
                     self.fng_data = {
@@ -770,30 +812,21 @@ class AlphaTrader:
             self.logger.error(f"Error fetching F&G Index (httpx): {e}")
         except Exception as e:
             self.logger.error(f"Unexpected error updating F&G Index: {e}", exc_info=True)
-        # 即使失败，也会保留旧的(或默认的)缓存数据
-    # --- [V45.16 移除] 不再需要 _should_translate 和 _extract_keywords ---
-    # ...
-    # --- [移除结束] ---
 
 
     async def run_cycle(self):
-        """[V45.17] AI 决策主循环。集成新规则。"""
+        """[V45.35] AI 决策主循环 (AI 现在会发出 LIMIT_BUY/SELL)"""
         self.logger.info("="*20 + " Starting AI Cycle " + "="*20)
         self.invocation_count += 1
         if not self.is_live_trading: await self._check_and_execute_hard_stops()
 
-        # 1. 获取数据 & 构建 Prompt (已更新 V45.17, 包含 ADX/BBands)
+        # 1. 获取数据 & 构建 Prompt
         market_data, tickers = await self._gather_all_market_data()
-        
-        # [V45.17 修复] 传入 tickers 以便 portfolio 计算实盘 UPL
-        # (这是我们在上一个回复中修复
         portfolio_state = self.portfolio.get_state_for_prompt(tickers)
-        
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
-        # 2. 格式化 System Prompt (已更新 V45.17)
+        # 2. 格式化 System Prompt (已更新 V45.35)
         try:
-            # [V45.34] 提示词已更新，不再包含 Rule 2
             system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
                 symbol_list=self.formatted_symbols,
                 specific_rules_or_notes=""
@@ -808,15 +841,15 @@ class AlphaTrader:
         orders = ai_decision.get("orders", [])
         self.logger.warning("--- AI CoT ---"); self.logger.warning(original_chain_of_thought)
 
-        # --- [V45.16 核心修改] 简化的摘要提取 (无需翻译) ---
-        summary_for_ui = "AI 未提供摘要。" # 默认值
+        # 4. 提取摘要
+        summary_for_ui = "AI 未提供摘要。" 
         summary_keyword_pattern = re.compile(r"In summary,", re.IGNORECASE)
         parts = summary_keyword_pattern.split(original_chain_of_thought, maxsplit=1)
 
         if len(parts) > 1:
             extracted_summary = parts[1].strip().lstrip(' :').rstrip('`')
             if extracted_summary:
-                summary_for_ui = extracted_summary # 提取到的摘要直接就是中文
+                summary_for_ui = extracted_summary 
                 self.logger.info(f"Extracted Chinese summary: '{summary_for_ui[:50]}...'")
             else:
                 summary_for_ui = "AI 摘要为空。"
@@ -824,11 +857,9 @@ class AlphaTrader:
         else:
             self.logger.warning("AI CoT 未找到 'In summary,' 关键字。")
         
-        # 无论如何都更新
         self.last_strategy_summary = summary_for_ui
-        # --- [修改结束] ---
 
-        # 5. 执行决策 (已更新 V45.34, 增加 UPDATE_TAKEPROFIT)
+        # 5. 执行决策 (已更新 V45.35, 支持 LIMIT_BUY/SELL)
         if orders:
             self.logger.info(f"AI proposed {len(orders)} order(s), executing...")
             await self._execute_decisions(orders, market_data)
@@ -837,12 +868,10 @@ class AlphaTrader:
 
         self.logger.info("="*20 + " AI Cycle Finished " + "="*20 + "\n")
 
-
-
     async def start(self):
-        """[V45.34 重构] 启动 AlphaTrader 主循环。
-        将所有硬性风控逻辑 (SL, TP, MaxLoss, Dust, Multi-Stage TP) 移至此循环，
-        使其每10秒执行一次，独立于AI。
+        """[V45.38 修复] 启动 AlphaTrader 主循环。
+        1. [硬风控] (步骤 5) 执行所有高频风控 (SL/TP/MaxLoss/Dust/Multi-TP)
+        2. [V45.38 修复] (步骤 2) 确保缺少 timestamp 的 "孤儿" 限价单也被取消。
         """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
@@ -853,14 +882,12 @@ class AlphaTrader:
             except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
         
         # --- [V45.34 定义风控阈值] ---
-        # 多阶段止盈阈值
         MULTI_TP_STAGE_1_PERCENT = 0.04  # 4.0%
         MULTI_TP_STAGE_2_PERCENT = 0.10  # 10.0%
-        # 最大亏损 (从 config 读取, 默认 -20%)
         MAX_LOSS_PERCENT = getattr(futures_settings, 'MAX_LOSS_CUTOFF_PERCENT', 20.0) / 100.0
-        # 粉尘仓位阈值
         DUST_MARGIN_USDT = 1.0
-        # --- [定义结束] ---
+        # --- [V45.36 新增超时阈值] ---
+        LIMIT_ORDER_TIMEOUT_MS = getattr(futures_settings, 'AI_LIMIT_ORDER_TIMEOUT_SECONDS', 3600) * 1000
         
         while True:
             try:
@@ -870,10 +897,52 @@ class AlphaTrader:
                     self.logger.info("Portfolio state sync successful.")
                 except Exception as e_sync:
                     self.logger.critical(f"Main loop sync_state failed: {e_sync}. Skipping AI cycle, will retry...", exc_info=True)
-                    await asyncio.sleep(30) # 等待 30 秒后重试同步
-                    continue # 跳过本轮循环，直接进入下一次循环尝试 sync_state
+                    await asyncio.sleep(30) 
+                    continue
                 
-                # 步骤 2: 获取 Tickers (用于高频风控检查)
+                # --- [ V45.38 核心: 限价单超时清理 (已修复孤儿单) ] ---
+                if self.is_live_trading and self.portfolio.pending_limit_orders:
+                    now_ms = time.time() * 1000
+                    orders_to_cancel = []
+                    
+                    try:
+                        # 迭代副本以安全删除
+                        for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
+                            order_id = plan.get('order_id')
+                            timestamp = plan.get('timestamp')
+                            
+                            # --- [ V45.38 修复 ] ---
+                            if not order_id:
+                                # 计划中没有 order_id, 无法取消。只能从本地清理。
+                                self.logger.warning(f"Pending order {symbol} 缺少 order_id，正在从本地清理...")
+                                self.portfolio.pending_limit_orders.pop(symbol, None)
+                                continue
+
+                            if not timestamp:
+                                # 有 order_id 但没有 timestamp (旧版留下的孤儿单)
+                                # 立即取消，不检查时间
+                                self.logger.warning(f"!!! ORPHAN TIMEOUT !!! {symbol} (ID: {order_id}) 缺少 timestamp。立即取消...")
+                                orders_to_cancel.append((order_id, symbol))
+                                self.portfolio.pending_limit_orders.pop(symbol, None) # 立即从本地移除
+                                continue # 继续检查下一个
+                            # --- [ V45.38 修复结束 ] ---
+                            
+                            # (原有的时间检查逻辑)
+                            if (now_ms - timestamp) > LIMIT_ORDER_TIMEOUT_MS:
+                                self.logger.warning(f"!!! LIMIT ORDER TIMEOUT !!! {symbol} (ID: {order_id}) 已超时 {LIMIT_ORDER_TIMEOUT_MS / 1000}s。正在取消...")
+                                orders_to_cancel.append((order_id, symbol))
+                                self.portfolio.pending_limit_orders.pop(symbol, None) # 立即从本地移除
+
+                        if orders_to_cancel:
+                            cancel_tasks = [self.client.cancel_order(oid, sym) for oid, sym in orders_to_cancel]
+                            await asyncio.gather(*cancel_tasks, return_exceptions=True) # 忽略错误 (例如 OrderNotFound)
+                            self.logger.info(f"成功取消 {len(orders_to_cancel)} 个超时/孤儿订单。")
+                            
+                    except Exception as e_timeout:
+                        self.logger.error(f"限价单超时清理时发生错误: {e_timeout}", exc_info=True)
+                # --- [ V45.38 核心结束 ] ---
+
+                # 步骤 3: 获取 Tickers (用于高频风控检查)
                 tickers = {}
                 try:
                     if not hasattr(self, 'client'): self.client = self.portfolio.client
@@ -881,24 +950,21 @@ class AlphaTrader:
                 except Exception as e_tick:
                     self.logger.error(f"Main loop fetch_tickers (for risk check) failed: {e_tick}", exc_info=False)
                 
-                # 步骤 3: 记录状态 (可选, 可注释掉以减少日志)
+                # 步骤 4: 记录状态 (可选)
                 # await self._log_portfolio_status()
                 
-                # --- [ V45.34 核心: 高频硬性风控检查 (每10秒) ] ---
+                # 步骤 5: [V45.34 核心] 高频硬性风控检查 (每10秒)
                 if self.is_live_trading and tickers:
                     
-                    # 待执行的动作
-                    positions_to_close = {} # 使用字典防止重复: {symbol: reason}
-                    positions_to_partial_close = [] # [(symbol, size_pct, reason)]
+                    positions_to_close = {} 
+                    positions_to_partial_close = [] 
                     
-                    # 1. 清理已平仓的计数器
                     open_symbols = set(self.portfolio.position_manager.get_all_open_positions().keys())
                     for symbol in list(self.tp_counters.keys()):
                         if symbol not in open_symbols:
                             self.logger.info(f"Removing TP counter for closed position: {symbol}")
                             del self.tp_counters[symbol]
 
-                    # 2. 迭代所有持仓，应用风控规则
                     try:
                         open_positions = self.portfolio.position_manager.get_all_open_positions()
                         
@@ -910,25 +976,22 @@ class AlphaTrader:
                             size = state.get('total_size')
                             side = state.get('side')
                             lev = state.get('leverage')
-                            margin = state.get('margin') # 从 position_manager 获取
+                            margin = state.get('margin') 
                             
                             if not all([entry, size, side, lev, margin]) or lev <= 0 or entry <= 0 or margin <= 0:
                                 self.logger.warning(f"Risk Check: Skipping {symbol}, invalid state data.")
                                 continue
 
-                            # 计算利润率 (UPL / Margin)
                             upl = (price - entry) * size if side == 'long' else (entry - price) * size
-                            rate = upl / margin # 使用 PM 管理器计算的保证金
+                            rate = upl / margin 
 
-                            # --- 风控规则应用 (优先级顺序) ---
-                            
                             # 规则 1: 最大亏损 (Max Loss)
                             if rate <= -MAX_LOSS_PERCENT:
                                 reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
                                 if symbol not in positions_to_close:
                                     self.logger.warning(f"!!! HARD STOP: MAX LOSS !!! {symbol} | R {rate:.2%} <= {-MAX_LOSS_PERCENT:.0%}")
                                     positions_to_close[symbol] = reason
-                                continue # 强制平仓，跳过后续检查
+                                continue 
 
                             # 规则 2: 粉尘仓位 (Dust)
                             if margin < DUST_MARGIN_USDT:
@@ -936,7 +999,7 @@ class AlphaTrader:
                                 if symbol not in positions_to_close:
                                     self.logger.warning(f"!!! HARD STOP: DUST !!! {symbol} | Margin {margin:.2f} < {DUST_MARGIN_USDT:.1f}U")
                                     positions_to_close[symbol] = reason
-                                continue # 强制平仓，跳过后续检查
+                                continue 
 
                             # 规则 3: AI 设置的止损 (AI SL)
                             ai_sl = state.get('ai_suggested_stop_loss')
@@ -946,7 +1009,7 @@ class AlphaTrader:
                                     if symbol not in positions_to_close:
                                         self.logger.warning(f"!!! HARD STOP: AI SL !!! {symbol} | Price {price:.4f} hit SL {ai_sl:.4f}")
                                         positions_to_close[symbol] = reason
-                                    continue # 强制平仓，跳过后续检查
+                                    continue 
 
                             # 规则 4: AI 设置的止盈 (AI TP)
                             ai_tp = state.get('ai_suggested_take_profit')
@@ -956,47 +1019,39 @@ class AlphaTrader:
                                     if symbol not in positions_to_close:
                                         self.logger.warning(f"!!! HARD STOP: AI TP !!! {symbol} | Price {price:.4f} hit TP {ai_tp:.4f}")
                                         positions_to_close[symbol] = reason
-                                    continue # 强制平仓，跳过后续检查
+                                    continue 
 
                             # 规则 5: 多阶段止盈 (Multi-Stage TP)
-                            # (确保计数器存在)
                             self.tp_counters.setdefault(symbol, {'stage1': 0, 'stage2': 0})
                             counters = self.tp_counters[symbol]
 
                             if rate < 0:
-                                # 收益率为负，重置计数器
                                 if counters['stage1'] == 1 or counters['stage2'] == 1:
                                     self.logger.info(f"Resetting TP counters for {symbol} (UPL negative).")
                                     counters['stage1'] = 0
                                     counters['stage2'] = 0
                             
                             elif rate >= MULTI_TP_STAGE_2_PERCENT and counters['stage2'] == 0:
-                                # 触发阶段 2 (+10%)
                                 self.logger.warning(f"!!! HARD TP (Stage 2) !!! {symbol} | R {rate:.2%} >= {MULTI_TP_STAGE_2_PERCENT:.0%}")
                                 positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 2 (>{MULTI_TP_STAGE_2_PERCENT:.0%})"))
-                                counters['stage2'] = 1 # 标记为已触发
-                                # (我们假设阶段1也自动触发)
+                                counters['stage2'] = 1 
                                 counters['stage1'] = 1 
                             
                             elif rate >= MULTI_TP_STAGE_1_PERCENT and counters['stage1'] == 0:
-                                # 触发阶段 1 (+4%)
                                 self.logger.warning(f"!!! HARD TP (Stage 1) !!! {symbol} | R {rate:.2%} >= {MULTI_TP_STAGE_1_PERCENT:.0%}")
                                 positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 1 (>{MULTI_TP_STAGE_1_PERCENT:.0%})"))
-                                counters['stage1'] = 1 # 标记为已触发
+                                counters['stage1'] = 1 
 
                     except Exception as e_risk:
                         self.logger.error(f"High-frequency risk check error: {e_risk}", exc_info=True)
 
                     # 3. 执行风控动作
-                    # (我们不需要在这里 re-sync，因为下一次循环会在开头 sync)
-                    
                     if positions_to_close:
                          tasks_close = [self.portfolio.live_close(symbol, reason=reason) for symbol, reason in positions_to_close.items()]
                          await asyncio.gather(*tasks_close)
                          self.logger.info(f"Hard Close actions executed for: {list(positions_to_close.keys())}")
                     
                     if positions_to_partial_close:
-                        # 确保我们不会部分平仓一个刚刚被全平的仓位
                         final_partial_tasks = []
                         for symbol, size_pct, reason in positions_to_partial_close:
                             if symbol not in positions_to_close:
@@ -1008,8 +1063,7 @@ class AlphaTrader:
                 
                 # --- [ V45.34 风控结束 ] ---
 
-
-                # 步骤 5: 决定是否触发 AI (低频)
+                # 步骤 6: 决定是否触发 AI (低频)
                 trigger_ai, reason, now = False, "", time.time(); interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS;
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
@@ -1025,13 +1079,13 @@ class AlphaTrader:
                     cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES * 60
                     
                     if now - self.last_event_trigger_ai_time > cooldown:
-                        event, ev_reason = await self._check_significant_indicator_change(ohlcv_15m) # 1. 15m MACD
-                        if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m) # 2. 15m RSI
-                        if not event: event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m) # 3. 15m BBands
-                        if not event: event, ev_reason = await self._check_market_volatility_spike(ohlcv_1h) # 4. 1h Volatility
+                        event, ev_reason = await self._check_significant_indicator_change(ohlcv_15m) # 1. 15m MACD (突破)
+                        if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m) # 2. 15m RSI (接近)
+                        if not event: event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m) # 3. 15m BBands (接近)
+                        if not event: event, ev_reason = await self._check_market_volatility_spike(ohlcv_1h) # 4. 1h 波动
                         if event: trigger_ai, reason = True, ev_reason
                 
-                # 步骤 6: (安全地) 运行 AI 循环
+                # 步骤 7: (安全地) 运行 AI 循环
                 if trigger_ai:
                     self.logger.warning(f"🔥 AI triggered! Reason: {reason} (Sync was successful)")
                     if reason != "Scheduled": self.last_event_trigger_ai_time = now
