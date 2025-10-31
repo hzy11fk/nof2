@@ -1,9 +1,12 @@
-# 文件: alpha_trader.py (GEMINI V3 完整版 - 修复“入场即反转” + 高级触发器)
-# 1. Prompt 重写：移除市价开仓、移除计算、增加否决权。
-# 2. _execute_decisions 重写：在 Python 端执行仓位计算。
-# 3. 移除滞后的触发器函数 (_check_significant_indicator_change, _check_market_volatility_spike)。
-# 4. [新功能] 新增 _check_divergence (背离) 和 _check_ema_squeeze (挤压) 触发器。
-# 5. start() 循环已更新，以调用所有新的和现有的预测性触发器。
+# 文件: alpha_trader.py 
+# 1. Prompt 重写：
+#    - [默认] 规则 1/6: 默认禁止市价单，使用 1h/4h 慢周期。
+#    - [例外] 规则 8: 新增“突破策略”，允许在 Squeeze+Volume 确认时使用市价单。
+#    - [安全] 规则 4: 无论何种订单，AI 均提供 risk_percent，Python 计算。
+# 2. _execute_decisions 重写：
+#    - 重新添加 "BUY"/"SELL" 市价开仓逻辑。
+#    - 将 V3 的安全计算逻辑 (risk_percent -> size) 应用于 LIMIT, BUY, 和 SELL 所有开仓动作。
+# 3. 触发器: 保留所有高级触发器 (Divergence, Squeeze, RSI, BBands)。
 
 import logging
 import asyncio
@@ -29,24 +32,25 @@ except ImportError:
 class AlphaTrader:
     
     # --- [ V45.35 PROMPT 核心升级: 引入限价单策略 ] ---
+    # (保留原始中文注释)
     # 1. [Rule 5] 重写：趋势市首选 "LIMIT" (回调)，盘整市 *必须* "LIMIT" (均值回归)。
     # 2. [Rule 5] 市价单 (MARKET) 仅用于 "高置信度趋势突破"。
     # 3. [Order Rules] 增加 "LIMIT_BUY" 和 "LIMIT_SELL" 动作模板。
     # 4. [CoT] 示例已更新，以反映 "PREPARE LIMIT_BUY" 思维。
     
-    # --- [ 纯英文改进版 (基于 V45.35 结构) ] ---
+
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
-    **You ONLY execute a trade (BUY, SELL, PARTIAL_CLOSE) if you have a high-confidence assessment that the action will lead to profit.** A medium or low-confidence signal means you WAIT.
+    **You ONLY execute a trade if you have a high-confidence assessment that the action will lead to profit.** A medium or low-confidence signal means you WAIT.
 
     Your discipline is demonstrated by strict adherence to the risk management rules below, which are your foundation for sustained profitability.
 
     **Core Mandates & Rules:**
-    1.  **Strict Prohibition on Market Orders (CRITICAL):**
-        -   To prevent "chasing price" and "buy high, sell low" errors, you are **strictly forbidden** from using `BUY` or `SELL` (Market Orders) to open any new position or add to an existing one.
-        -   All opening or adding to positions **must and only** use `LIMIT_BUY` or `LIMIT_SELL`.
-        -   Market orders (`CLOSE`, `PARTIAL_CLOSE`) are permitted **only** for exiting positions.
+    1.  **Default Strategy: Limit Orders Only (CRITICAL):**
+        -   To prevent "chasing price," your **default** behavior is to be patient.
+        -   You are **forbidden** from using `BUY` or `SELL` (Market Orders) UNLESS the strict conditions in Rule 8 are met.
+        -   All default strategies (Trend Pullbacks, Mean Reversion) **must and only** use `LIMIT_BUY` or `LIMIT_SELL`.
 
     2.  **Rule-Based Position Management:** (Was Rule 1)
         For every open position, you MUST check its `InvalidATION_CONDITION`. If this condition is met, you MUST issue a `CLOSE` order. This is your top priority for existing positions.
@@ -60,7 +64,7 @@ class AlphaTrader:
     4.  **Risk Management Foundation (CRITICAL):** (Was Rule 3 - Content Replaced)
         Profit is the goal, but capital preservation is the foundation.
         -   **AI's Task (Strategy):** Your job is to select the *risk parameters* based on your confidence, not to perform the final math. The Python system will perform all final calculations and safety checks.
-        -   **AI Must Provide (for each LIMIT order):**
+        -   **AI Must Provide (for ALL new orders: BUY, SELL, LIMIT_BUY, LIMIT_SELL):**
             1.  `"leverage": [e.g., 8]` (Choose appropriate leverage based on asset volatility, e.g., 5x-8x for SOL/DOGE, 10x-15x for BTC/ETH).
             2.  `"risk_percent": [e.g., 0.025]` (Dynamically choose a risk percentage of Total Equity. Example: Medium Confidence = 0.025 (2.5% Equity), High Confidence = 0.05 (5.0% Equity)).
         -   **System's Task (Calculation):** The Python system will automatically use your `risk_percent` and `Total Equity` to calculate the `final_desired_margin`, check it against `Available Cash`, and perform all hard checks (Min Margin 6 USDT, Min BTC Size 0.001). The order will be aborted by the system if any check fails.
@@ -71,48 +75,61 @@ class AlphaTrader:
             -   If opening a new position (e.g., SOL) would breach its group cap, you MUST ABORT the trade.
 
     5.  **Complete Trade Plans (Open/Add):** (Was Rule 4)
-        Every new `LIMIT_BUY`/`LIMIT_SELL` order is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
+        Every new order (BUY/SELL/LIMIT) is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
         -   **Smarter Invalidation:** Your `invalidation_condition` MUST be based on a clear technical breakdown of the *original trade thesis*.
             -   *Trend Trade Example:* `Invalidation='1h Close below the EMA 50'`
             -   *Ranging Trade Example:* `InvalidATION='15m RSI breaks above 60'`
         -   **Profit-Taking Strategy:** You SHOULD consider using multiple take-profit levels (by using `PARTIAL_CLOSE` later) rather than a single `take_profit`.
 
-    6.  **Market State Recognition (Using ADX & BBands):** (Was Rule 5 - Content Replaced)
-        You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes.
+    6.  **Market State Recognition (Default Strategy):** (Was Rule 5 - Content Replaced)
+        You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes. This is your **Default Strategy**.
         -   **1. Strong Trend (Trending Bullish/Bearish):**
             -   **Condition:** 1h or 4h **ADX_14 > 25**.
-            -   **Strategy:** In this regime, **EMA crossovers** and **MACD** signals are your primary tools. You MUST trade WITH the trend.
             -   **Strategy (LIMIT ONLY):** Your **only** strategy is to trade **pullbacks**. Identify key S/R levels (e.g., 1h EMA 20, 4h BB_Mid). Your job is to place a **`LIMIT_BUY` (in uptrend) or `LIMIT_SELL` (in downtrend)** at that calculated level.
-            -   **FORBIDDEN:** Market orders (`BUY`/`SELL`) are forbidden.
         -   **2. Ranging (No Trend):**
             -   **Condition:** 1h and 4h **ADX_14 < 20**.
             -   **Strategy (LIMIT ONLY):** In this regime, your **only** strategy is **mean-reversion**. Your task is to identify the `BB_Upper` and `BB_Lower` levels. You MUST issue **`LIMIT_SELL` at (or near) the upper band** or **`LIMIT_BUY` at (or near) the lower band**.
-            -   **FORBIDDEN:** Market orders (`BUY`/`SELL`) are forbidden.
         -   **3. Chop (Uncertain):**
             -   **Condition:** 1h or 4h **ADX_14 is between 20 and 25**.
-            -   **Strategy:** This is an uncertain market. **WAIT** for a clear signal (ADX > 25 or ADX < 20).
+            -   **Strategy:** This is an uncertain market. **WAIT** for a clear signal OR look for a "Breakout Mutation" (see Rule 8).
 
     7.  **Market Sentiment Filter (Fear & Greed Index):** (Was Rule 6)
+        (This rule remains unchanged)
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter for your decisions.
-        -   **Extreme Fear (Index < 25):** The market is panicking.
-            -   **Action:** Be EXTREMELY cautious with new LONG signals (high risk of failure). Prioritize capital preservation. SHORT signals (breakdowns) are higher confidence.
-        -   **Fear (Index 25-45):** Market is fearful.
-            -   **Action:** Be cautious with LONGs. Seek strong (4/4) confluence.
-        -   **Neutral (Index 45-55):** No strong sentiment bias.
-            -   **Action:** Rely primarily on technical (ADX/BBands/RSI) analysis.
-        -   **Greed (Index 55-75):** Market is optimistic.
-            -   **Action:** LONG signals (pullbacks) are higher confidence. Be cautious with new SHORTs.
-        -   **Extreme Greed (Index > 75):** The market is euphoric (high risk of reversal).
-            -   **Action:** Be EXTREMELY cautious opening new LONGs (risk of "buying the top"). Actively look for `PARTIAL_CLOSE` opportunities on existing LONG positions.
+        -   **Extreme Fear (Index < 25):** ...
+        -   **Fear (Index 25-45):** ...
+        -   **Neutral (Index 45-55):** ...
+        -   **Greed (Index 55-75):** ...
+        -   **Extreme Greed (Index > 75):** ...
+
+    8.  **Exception Rule: The "Breakout Mutation" Strategy (Market Order Allowed):**
+        You are authorized to use a Market Order (`BUY` or `SELL`) for an entry ONLY IF all the following 4 conditions are met simultaneously. This is a high-risk, high-reward "mutation" strategy and overrides Rule 1.
+        
+        a. **PRE-CONDITION (The Squeeze):** The market must be in a confirmed low-volatility state. This is defined as:
+           - The 1h ADX must be < 25 (i.e., in a "Ranging" or "Chop" market per Rule 6).
+           - OR, an `_check_ema_squeeze` event has just been triggered.
+        
+        b. **THE SIGNAL (The Break):** A fast, immediate price breakout must occur. e.g.:
+           - `5min_price` just crossed *above* the `15min_bb_upper`.
+           - `5min_price` just crossed *below* the `15min_bb_lower`.
+        
+        c. **THE CONFIRMATION (CRITICAL):** The breakout MUST be confirmed by a massive, simultaneous volume spike.
+           - `5min_volume_ratio` > 2.5 
+           - OR `15min_volume_ratio` > 2.0
+        
+        d. **THE VETO (The Filter):** The breakout must NOT be trading directly against the major long-term trend.
+           - (e.g., Do not `BUY` if the 4h EMA 50 is strongly trending down).
+
+        If all a, b, c, and d are true, you may issue a `BUY` or `SELL` market order, but you MUST still use the Python-calculated sizing (`risk_percent`).
 
     **Multi-Timeframe Confirmation Requirement (CRITICAL):**
     - You MUST analyze and confirm signals across available timeframes: **5min, 15min, 1hour, and 4hour**.
-    - **High-Confidence Signal Definition:** A signal is only high-confidence when it aligns with the **Market State** (see Rule 6) and shows alignment across **at least 3** timeframes.
+    - **High-Confidence Signal Definition:** A signal is only high-confidence when it aligns with the **Market State** (see Rule 6 or 8) and shows alignment across **at least 3** timeframes.
     - **Timeframe Hierarchy:** Use longer timeframes (**4h, 1h**) to determine the **Market State** and **Overall Trend**. Use shorter timeframes (**15min, 5min**) for precise entry timing.
-    - **Volume Confirmation:** Significant price moves MUST be confirmed by above-average volume (volume_ratio > 1.2).
+    - **Volume Confirmation:** (See Rule 8.c for Breakouts).
     -   **Signal Veto Rule (CRITICAL):**
-        -   Even if 4h/1h trend signals (e.g., ADX > 25) are strong, if the 15min timeframe shows a **strong opposing signal** (e.g., a bearish RSI divergence, a 15m MACD Dead Cross, or 15m EMA 20 has crossed below EMA 50), you **MUST ABORT** the trade.
-        -   **Never** trade against 15m momentum.
+        -   Even if 4h/1h trend signals (e.g., ADX > 25) are strong, if the 15min timeframe shows a **strong opposing signal** (e.g., a bearish RSI divergence, a 15m MACD Dead Cross, or 15m EMA 20 has crossed below EMA 50), you **MUST ABORT** the trade (this applies to Rule 6).
+        -   **Never** trade against 15m momentum when trying to enter on a pullback.
 
     **Psychological Safeguards:**
     - Confirmation Bias Protection: Seek counter-evidence.
@@ -128,9 +145,9 @@ class AlphaTrader:
 
         Market State Analysis:
         - 1h ADX: [Value] | 4h ADX: [Value]
-        - Regime: [Trending Bullish (ADX>25) / Trending Bearish (ADX>25) / Ranging (ADX<20) / Chop (ADX 20-25)]
+        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Applying Rule 6: Ranging (ADX<20) / Applying Rule 8: Breakout Mutation Watch (ADX<25 + Squeeze)]
         - Key Support/Resistance Levels: [Identify major S/R levels, including BB_Upper/Lower and recent_high/low for relevant symbols]
-        - Volume Analysis: [Assess volume confirmation]
+        - Volume Analysis: [Assess volume confirmation, especially for Rule 8]
         - Market Sentiment: [MUST state the F&G Index value and its implication, e.g., "Extreme Greed (80)"]
 
         Portfolio Overview:
@@ -166,29 +183,25 @@ class AlphaTrader:
         Available Margin for New Trades: [Calculate based on Total Equity and risk rules]
         Correlation Check: [Ensure new trades don't breach Rule 4 Correlation Control hard caps]
 
-        Multi-Timeframe Signal Requirements (Must meet 3+ factors on 5m, 15m, 1h, 4h):
-        - Trend alignment (or Ranging setup) confirmed by Market State (ADX/BBands)
-        - Signal confirmed by appropriate indicators (MACD/EMA for Trend, RSI/BBands for Range)
-        - Volume confirmation (volume_ratio > 1.2)
-        - Absence of strong counter-evidence across timeframes (See Veto Rule)
-
-        Specific Multi-Timeframe Opportunity Analysis:
-        [For each symbol, analyze BOTH long and short scenarios based on the detected Market State (Trend vs Range)]
+        [Analyze opportunities based on BOTH Rule 6 (Default, Limit) and Rule 8 (Exception, Market)]
         
-        [EXAMPLE - TRENDING MARKET (Pullback):]
+        [EXAMPLE - RULE 6 (TRENDING PULLBACK):]
         BTC Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
         - 4h Trend: Bullish (EMA 20 > 50) | 1h Momentum: Strong (MACD > 0) | 15min Setup: Price is *approaching* pullback support (1h EMA 20 @ 65000.0).
-        - Signal Confluence Score: 4/4 | Final Confidence: High - **PREPARE LIMIT_BUY at 65000.0**
+        - Signal Confluence Score: 4/4 | Final Confidence: High - **PREPARE LIMIT_BUY at 65000.0 (Rule 6)**
 
-        [EXAMPLE - RANGING MARKET (Mean Reversion):]
+        [EXAMPLE - RULE 6 (RANGING):]
         ETH Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
         - 4h Trend: N/A (ADX < 20) | 1h Setup: Price is *approaching* 1h BB_Upper (@ 3900.0) | 15min RSI: 68.5 (Approaching Overbought)
-        - Signal Confluence Score: 3/4 (RSI/BBands align) | Final Confidence: High (for Ranging) - **PREPARE LIMIT_SELL at 3900.0**
+        - Signal Confluence Score: 3/4 (RSI/BBands align) | Final Confidence: High (for Ranging) - **PREPARE LIMIT_SELL at 3900.0 (Rule 6)**
 
-        [EXAMPLE - FORBIDDEN MARKET (Breakout):]
-        SOL Multi-Timeframe Assessment (Market State: Trending Bullish, 1h ADX=30):
-        - 4h Trend: Bullish | 1h Momentum: Strong | 15min Setup: Just had a MACD Golden Cross. | 5min Trigger: Confirmed, volume_ratio=1.5
-        - Signal Confluence Score: 4/4 | Final Confidence: High - **ACTION: ABORT. Wait for pullback. Market orders are forbidden.**
+        [EXAMPLE - RULE 8 (BREAKOUT MUTATION):]
+        SOL Multi-Timeframe Assessment (Market State: Chop, 1h ADX=22):
+        - 8.a (Squeeze): TRUE. 1h ADX is 22 (< 25).
+        - 8.b (Signal): TRUE. 5min price just broke above 15min BB_Upper.
+        - 8.c (Volume): TRUE. 5min_volume_ratio is 2.8 (> 2.5).
+        - 8.d (Veto): TRUE. 4h trend is neutral, not opposing.
+        - Signal Confluence Score: 4/4 | Final Confidence: High - **EXECUTE BUY (Market) (Rule 8)**
 
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
         ```
@@ -196,10 +209,10 @@ class AlphaTrader:
     2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding all.
 
     **Order Object Rules:**
-    -   **To Open Market (LONG):** (This template is intentionally removed)
-    -   **To Open Market (SHORT):** (This template is intentionally removed)
-    -   **To Open Limit (LONG):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order. Leverage chosen: [...]. Risk Percent: [...]. Market State: [Trending Pullback or Ranging Support]"}}`
-    -   **To Open Limit (SHORT):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order. Leverage chosen: [...]. Risk Percent: [...]. Market State: [Trending Pullback or Ranging Resistance]"}}`
+    -   **To Open Market (LONG - Rule 8 Only):**`{{"action": "BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Market Order (Rule 8). Leverage: [...]. Risk: [...]. Squeeze+Volume Confirmed."}}`
+    -   **To Open Market (SHORT - Rule 8 Only):**`{{"action": "SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Market Order (Rule 8). Leverage: [...]. Risk: [...]. Squeeze+Volume Confirmed."}}`
+    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Support]"}}`
+    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Resistance]"}}`
     -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
     -   **To Close Partially (Take Profit):** `{{"action": "PARTIAL_CLOSE", "symbol": "...", "size_percent": 0.5, "reasoning": "Taking 50% profit near resistance per Rule 5..."}}` (or `size_absolute`)
     -   **To Update Stop Loss:** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Actively moving SL to new 15m support level..."}}`
@@ -263,7 +276,7 @@ class AlphaTrader:
 
     
     async def _gather_all_market_data(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-        """[VS45.24] 修复：将 df.fillna(method='ffill') 更新为 df.ffill()，消除 FutureWarning。"""
+        """[V45.24] 修复：将 df.fillna(method='ffill') 更新为 df.ffill()，消除 FutureWarning。"""
         self.logger.info("Gathering multi-TF market data (5m, 15m, 1h, 4h) + ADX/BBands (Manual Calc)...")
         market_indicators_data: Dict[str, Dict[str, Any]] = {}
         fetched_tickers: Dict[str, Any] = {}
@@ -415,7 +428,7 @@ class AlphaTrader:
             symbol_short = symbol.split('/')[0]
             prompt += f"\n# {symbol_short} Multi-TF Analysis\n"
             prompt += f"Price: {safe_format(d.get('current_price'), 2)}\n"
-            timeframes = ['5min', '15min', '1hour', '4hour'] # 1m 移除
+            timeframes = ['5m', '15m', '1hour', '4hour'] # 1m 移除
             for tf in timeframes:
                 prompt += f"\n[{tf.upper()}]\n"
                 prompt += f" RSI:{safe_format(d.get(f'{tf}_rsi_14'), 0, is_rsi=True)}|"
@@ -452,17 +465,15 @@ class AlphaTrader:
         if not self.ai_analyzer: return {}
         return await self.ai_analyzer.get_ai_response(system_prompt, user_prompt)
 
-    # --- [GEMINI V2 - 建议 1 & 4] 完整的 _execute_decisions 替换 ---
-    # 1. (建议 1) "BUY"/"SELL" 市价开仓逻辑被完全移除。
-    # 2. (建议 4) "LIMIT_BUY"/"LIMIT_SELL" 逻辑被重写：
-    #    - 它现在从 AI 接收 "risk_percent"。
-    #    - 它在 Python 中执行所有6个步骤的计算（总权益、现金检查、最小保证金、计算 size、BTC最小 size、再次现金检查）。
-    #    - 它计算出 "final_size" 并将其传递给 portfolio。
+
+    # 1. (建议 1) "BUY"/"SELL" 市价开仓逻辑被重新添加，用于 Rule 8。
+    # 2. (建议 4) "LIMIT_BUY"/"LIMIT_SELL" 逻辑保留。
+    # 3. (安全) 统一的安全计算逻辑 (risk_percent -> size) 被应用于 BUY, SELL, 和 LIMIT_BUY/SELL。
     async def _execute_decisions(self, decisions: list, market_data: Dict[str, Dict[str, Any]]):
         """
-        [GEMINI 改进版 V2 (基于建议 1 和 4)] 
-        1. (建议 1) 移除了 "BUY"/"SELL" (市价开仓) 逻辑。
-        2. (建议 4) 从 AI 接收 "risk_percent"，并在 Python 中执行所有规模/保证金/现金的计算。
+
+        1. 重新添加 "BUY"/"SELL" (市价开仓) 逻辑，以支持 Rule 8 突破。
+        2. 将 Python 端的安全计算 (risk_percent -> size) 应用于所有开仓类型。
         """
         
         # 这些是硬性风控规则，之前在 Prompt 中
@@ -487,10 +498,79 @@ class AlphaTrader:
                     if self.is_live_trading: await self.portfolio.live_close(symbol, reason=reason)
                     else: await self.portfolio.paper_close(symbol, current_price, reason=reason)
                 
-                # --- [GEMINI V2 - 建议 1: 市价开仓 "BUY"/"SELL" 逻辑已完全移除] ---
+         
+                elif action in ["BUY", "SELL"]:
+                    if not self.is_live_trading:
+                        self.logger.warning(f"模拟盘：跳过 {action} 市价单 (模拟盘仅支持限价单转换)。"); continue
+                    
+                    if (not current_price or current_price <= 0):
+                        self.logger.error(f"无当前价格 {symbol}，跳过 Market Action: {order}"); continue
+                        
+                    side = 'long' if action == 'BUY' else 'short'; final_size = 0.0
+                    price_to_calc = current_price # 市价单使用当前价格计算
+
+                    try:
+                        # 1. 从 AI 获取参数
+                        leverage = int(order.get('leverage'))
+                        risk_percent = float(order.get('risk_percent'))
+                        stop_loss = float(order.get('stop_loss'))
+                        take_profit = float(order.get('take_profit'))
+                        
+                        if risk_percent <= 0 or risk_percent > 0.5: raise ValueError(f"无效的 risk_percent: {risk_percent}")
+                        if leverage <= 0 or leverage > 100: raise ValueError(f"无效的 leverage: {leverage}")
+                        
+                        # 2. 从 Portfolio 获取账户状态
+                        total_equity = float(self.portfolio.equity)
+                        available_cash = float(self.portfolio.cash)
+                        if total_equity <= 0: raise ValueError(f"无效账户状态 (Equity <= 0)")
+                        
+                        # 3. 执行 Prompt Rule 4 的计算
+                        calculated_desired_margin = total_equity * risk_percent
+                        
+                        if calculated_desired_margin > available_cash:
+                            self.logger.error(f"!!! {action} Aborted (Cash Insufficient) !!! AI 期望保证金 {calculated_desired_margin:.2f} > 可用 {available_cash:.2f}")
+                            continue
+                        
+                        if calculated_desired_margin < MIN_MARGIN_USDT:
+                            self.logger.warning(f"!!! {action} Margin Adjusted !!! AI 期望保证金 {calculated_desired_margin:.2f} < 最小 {MIN_MARGIN_USDT} USDT. 正在上调。")
+                            final_desired_margin = MIN_MARGIN_USDT
+                        else:
+                            final_desired_margin = calculated_desired_margin
+                        
+                        final_size = (final_desired_margin * leverage) / price_to_calc
+
+                        if symbol == "BTC/USDT:USDT":
+                            if final_size < MIN_SIZE_BTC:
+                                self.logger.warning(f"!!! {action} BTC Size Adjusted !!! 计算后 size {final_size} < 最小 {MIN_SIZE_BTC}. 正在上调。")
+                                final_size = MIN_SIZE_BTC
+                                recalculated_margin = (final_size * price_to_calc) / leverage
+                                if recalculated_margin > available_cash:
+                                    self.logger.error(f"!!! {action} Aborted (Cash Insufficient for Min BTC Size) !!! 最小 BTC size 需要 {recalculated_margin:.2f} 保证金 > 可用 {available_cash:.2f}")
+                                    continue
+                        
+                        if final_size <= 0: raise ValueError("最终计算 size 为 0")
+
+                    except (ValueError, TypeError, KeyError) as e: 
+                        self.logger.error(f"跳过 {action} (Python 计算/参数错误): {order}. Err: {e}"); continue
+                    
+                    # 执行实盘市价单
+                    invalidation_condition = order.get('invalidation_condition')
+                    await self.portfolio.live_open(
+                        symbol, 
+                        side, 
+                        final_size, # <-- 经 Python 计算后的
+                        leverage, 
+                        reason=reason, 
+                        stop_loss=stop_loss, 
+                        take_profit=take_profit, 
+                        invalidation_condition=invalidation_condition
+                    )
 
                 # --- 限价开仓 (LIMIT_BUY / LIMIT_SELL) ---
                 elif action in ["LIMIT_BUY", "LIMIT_SELL"]:
+                    
+                    if not limit_price_from_ai or float(limit_price_from_ai) <= 0:
+                        self.logger.error(f"无效限价 {limit_price_from_ai} {symbol}，跳过 Limit Action: {order}"); continue
                     
                     if not self.is_live_trading:
                         # 模拟盘不支持限价单，转为市价单 (如果价格有利)
@@ -521,7 +601,7 @@ class AlphaTrader:
                              self.logger.error(f"模拟盘限价单转换失败: {e_paper}, Order: {order}"); continue
                         continue # 模拟盘逻辑结束
 
-                    # --- [GEMINI V2 - 建议 4: 实盘的 Python 计算逻辑] ---
+     
                     if self.is_live_trading:
                         side = 'long' if action == 'LIMIT_BUY' else 'short'; final_size = 0.0
                         
@@ -533,55 +613,40 @@ class AlphaTrader:
                             stop_loss = float(order.get('stop_loss'))
                             take_profit = float(order.get('take_profit'))
                             
-                            if risk_percent <= 0 or risk_percent > 0.5: # (防止 50% 以上的风险)
-                                raise ValueError(f"无效的 risk_percent: {risk_percent}")
-                            if leverage <= 0 or leverage > 100:
-                                raise ValueError(f"无效的 leverage: {leverage}")
-                            if limit_price <= 0:
-                                raise ValueError(f"无效的 limit_price: {limit_price}")
+                            if risk_percent <= 0 or risk_percent > 0.5: raise ValueError(f"无效的 risk_percent: {risk_percent}")
+                            if leverage <= 0 or leverage > 100: raise ValueError(f"无效的 leverage: {leverage}")
+                            if limit_price <= 0: raise ValueError(f"无效的 limit_price: {limit_price}")
 
                             # 2. 从 Portfolio 获取账户状态
                             total_equity = float(self.portfolio.equity)
                             available_cash = float(self.portfolio.cash)
-                            if total_equity <= 0:
-                                raise ValueError(f"无效账户状态 (Equity <= 0)")
-                            # 允许 cash 为 0 (如果 equity > 0 意味着有仓位)
-
-                            # 3. 执行 Prompt Rule 3 的计算
-                            # 步骤 1 & 2: `calculated_desired_margin = Total Equity * risk_percent`
+                            if total_equity <= 0: raise ValueError(f"无效账户状态 (Equity <= 0)")
+                            
+                            # 3. 执行 Prompt Rule 4 的计算
                             calculated_desired_margin = total_equity * risk_percent
                             
-                            # 步骤 3: `Check Cash` (可用现金必须 > 期望保证金)
-                            # (注意: portfolio.live_open_limit 内部会做更精确的检查)
                             if calculated_desired_margin > available_cash:
                                 self.logger.error(f"!!! {action} Aborted (Cash Insufficient) !!! AI 期望保证金 {calculated_desired_margin:.2f} > 可用 {available_cash:.2f}")
                                 continue
                             
-                            # 步骤 4: `Check Minimum Margin`
                             if calculated_desired_margin < MIN_MARGIN_USDT:
                                 self.logger.warning(f"!!! {action} Margin Adjusted !!! AI 期望保证金 {calculated_desired_margin:.2f} < 最小 {MIN_MARGIN_USDT} USDT. 正在上调。")
                                 final_desired_margin = MIN_MARGIN_USDT
                             else:
                                 final_desired_margin = calculated_desired_margin
                             
-                            # 步骤 5: `size = (final_desired_margin * leverage) / price`
                             final_size = (final_desired_margin * leverage) / limit_price
 
-                            # 步骤 6: `Check BTC Minimum Size`
                             if symbol == "BTC/USDT:USDT":
                                 if final_size < MIN_SIZE_BTC:
                                     self.logger.warning(f"!!! {action} BTC Size Adjusted !!! 计算后 size {final_size} < 最小 {MIN_SIZE_BTC}. 正在上调。")
                                     final_size = MIN_SIZE_BTC
-                                    # 重新计算保证金以匹配最小 size
                                     recalculated_margin = (final_size * limit_price) / leverage
-                                    
-                                    # `Check Cash Again` (因为我们上调了 size)
                                     if recalculated_margin > available_cash:
                                         self.logger.error(f"!!! {action} Aborted (Cash Insufficient for Min BTC Size) !!! 最小 BTC size 需要 {recalculated_margin:.2f} 保证金 > 可用 {available_cash:.2f}")
                                         continue
                             
-                            if final_size <= 0:
-                                raise ValueError("最终计算 size 为 0")
+                            if final_size <= 0: raise ValueError("最终计算 size 为 0")
 
                         except (ValueError, TypeError, KeyError) as e: 
                             self.logger.error(f"跳过 {action} (Python 计算/参数错误): {order}. Err: {e}"); continue
@@ -655,11 +720,8 @@ class AlphaTrader:
             except Exception as e: 
                 self.logger.error(f"处理 AI 指令时意外错误: {order}. Err: {e}", exc_info=True)
 
-    # --- [GEMINI V2 - 建议 2] 移除滞后的触发器 (MACD 交叉) ---
-    # 函数 _check_significant_indicator_change 已被删除
-    # ---
-    
-    # --- [GEMINI V2 - 建议 2] 移除滞后的触发器 (波动率尖峰) ---
+
+
     # 函数 _check_market_volatility_spike 已被删除
     # ---
 
@@ -686,7 +748,7 @@ class AlphaTrader:
         return len(to_close) > 0
 
     
-    # --- [GEMINI V3 - 新功能] 新增 _check_divergence (RSI 背离) 触发器 ---
+
     async def _check_divergence(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m K线上的 RSI 背离 (预测性触发)。
@@ -749,9 +811,9 @@ class AlphaTrader:
         except Exception as e:
             self.logger.error(f"Err check divergence: {e}", exc_info=False)
             return False, ""
-    # --- [GEMINI V3 - 新功能结束] ---
 
-    # --- [GEMINI V3 - 新功能] 新增 _check_ema_squeeze (EMA 挤压) 触发器 ---
+
+
     async def _check_ema_squeeze(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m EMA(20) 和 EMA(50) 是否进入 "挤压" 状态 (预测性触发)。
@@ -793,7 +855,7 @@ class AlphaTrader:
         except Exception as e:
             self.logger.error(f"Err check EMA squeeze: {e}", exc_info=False)
             return False, ""
-    # --- [GEMINI V3 - 新功能结束] ---
+
 
 
     async def _check_rsi_threshold_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
@@ -926,13 +988,12 @@ class AlphaTrader:
         # 1. 获取数据 & 构建 Prompt
         market_data, tickers = await self._gather_all_market_data()
         portfolio_state = self.portfolio.get_state_for_prompt(tickers)
-        
-        # [GEMINI V2] 在构建 prompt 之前更新 F&G
+   
         await self._update_fear_and_greed_index()
         
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
-        # 2. 格式化 System Prompt (已更新 V45.35 / GEMINI V2)
+    
         try:
             system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
                 symbol_list=self.formatted_symbols,
@@ -966,7 +1027,7 @@ class AlphaTrader:
         
         self.last_strategy_summary = summary_for_ui
 
-        # 5. 执行决策 (已更新 V45.35 / GEMINI V2)
+
         if orders:
             self.logger.info(f"AI proposed {len(orders)} order(s), executing...")
             await self._execute_decisions(orders, market_data)
@@ -977,9 +1038,7 @@ class AlphaTrader:
 
     async def start(self):
         """[V45.38 修复] 启动 AlphaTrader 主循环。
-        1. [硬风控] (步骤 5) 执行所有高频风控 (SL/TP/MaxLoss/Dust/Multi-TP)
-        2. [V45.38 修复] (步骤 2) 确保缺少 timestamp 的 "孤儿" 限价单也被取消。
-        3. [GEMINI V3 - 建议 2] (步骤 6) 移除滞后的事件触发器调用, 增加高级触发器 (Divergence, Squeeze)。
+
         """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
@@ -995,7 +1054,7 @@ class AlphaTrader:
         MAX_LOSS_PERCENT = getattr(settings, 'MAX_LOSS_CUTOFF_PERCENT', 20.0) / 100.0
         DUST_MARGIN_USDT = 1.0
         # --- [V45.36 新增超时阈值] ---
-        # [GEMINI V2 修复] 从 settings (config.py) 而非 futures_settings 读取
+
         LIMIT_ORDER_TIMEOUT_MS = getattr(settings, 'AI_LIMIT_ORDER_TIMEOUT_SECONDS', 900) * 1000
         
         while True:
@@ -1176,7 +1235,7 @@ class AlphaTrader:
                 trigger_ai, reason, now = False, "", time.time(); interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS;
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
-                # --- [GEMINI V3 - 建议 2 (Advanced)] 触发器逻辑修改 ---
+       
                 if not trigger_ai:
                     sym=self.symbols[0]; ohlcv_15m = [] # 只需要 15m K线
                     try: 
@@ -1199,7 +1258,7 @@ class AlphaTrader:
                         
                         if event: 
                             trigger_ai, reason = True, ev_reason
-                # --- [GEMINI V3 修改结束] ---
+          
                 
                 # 步骤 7: (安全地) 运行 AI 循环
                 if trigger_ai:
