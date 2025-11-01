@@ -55,6 +55,11 @@ python run_alpha.py
 * **`alpha_web_server.py`**: (可选) 提供 Web 监控界面。
 * **`bark_notifier.py`** (可选) 发送 Bark 通知的工具函数。
 * **`requirements.txt`**: 项目所需的 Python 依赖库列表。
+* **`train_anomaly_detector.py`**: 趋势策略相关数据集训练脚本。
+* **`train_rule8_model.py`**: 突破策略相关数据集训练脚本。
+* **`fetch_binance_data.py`**: 训练集所需文件下载脚本。
+* **`/models`**: 训练完成的数据。
+
 
 ## 免责声明
 本项目仅供学习和研究目的，作者不对任何使用本项目代码造成的实际交易盈亏负责。请在充分了解风险的情况下使用。
