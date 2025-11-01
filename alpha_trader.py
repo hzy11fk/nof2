@@ -1,4 +1,4 @@
-# 文件: alpha_trader.py 
+# 文件: alpha_trader.py (GEMINI V4 完整版 - 混合策略)
 # 1. Prompt 重写：
 #    - [默认] 规则 1/6: 默认禁止市价单，使用 1h/4h 慢周期。
 #    - [例外] 规则 8: 新增“突破策略”，允许在 Squeeze+Volume 确认时使用市价单。
@@ -38,7 +38,7 @@ class AlphaTrader:
     # 3. [Order Rules] 增加 "LIMIT_BUY" 和 "LIMIT_SELL" 动作模板。
     # 4. [CoT] 示例已更新，以反映 "PREPARE LIMIT_BUY" 思维。
     
-
+    # --- [ GEMINI V4 混合策略版 (纯英文) ] ---
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -275,31 +275,73 @@ class AlphaTrader:
         self.logger.info(f"Overall Performance: {performance_percent:.2f}% (Initial: {initial_capital_for_calc:.2f})")
 
     
+# 文件: alpha_trader.py
+    # (替换此函数)
+    
     async def _gather_all_market_data(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-        """[V45.24] 修复：将 df.fillna(method='ffill') 更新为 df.ffill()，消除 FutureWarning。"""
+        """
+        [GEMINI V5 修复] 引入 asyncio.Semaphore 来限制并发请求，防止因 API 频率限制导致的数据缺失。
+        [GEMINI V4 修复] 确保 '1h' 变为 '1hour'，与 _build_prompt 严格一致。
+        """
         self.logger.info("Gathering multi-TF market data (5m, 15m, 1h, 4h) + ADX/BBands (Manual Calc)...")
         market_indicators_data: Dict[str, Dict[str, Any]] = {}
         fetched_tickers: Dict[str, Any] = {}
         
+        # --- [GEMINI V5 修复] ---
+        # 限制并发请求为 10 个，防止触发交易所的 DDos/Rate Limit
+        CONCURRENT_REQUEST_LIMIT = 10
+        semaphore = asyncio.Semaphore(CONCURRENT_REQUEST_LIMIT)
+
+        async def _safe_fetch_ohlcv(symbol, timeframe, limit):
+            async with semaphore:
+                try:
+                    return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                except Exception as e:
+                    self.logger.error(f"Safe Fetch OHLCV Error ({symbol} {timeframe}): {e}", exc_info=False)
+                    return e # 返回异常而不是抛出
+
+        async def _safe_fetch_ticker(symbol):
+            async with semaphore:
+                try:
+                    return await self.exchange.fetch_ticker(symbol)
+                except Exception as e:
+                    self.logger.error(f"Safe Fetch Ticker Error ({symbol}): {e}", exc_info=False)
+                    return e # 返回异常而不是抛出
+        # --- [GEMINI V5 修复结束] ---
+        
         try:
+            # 内部使用 '1h', '4h'
             timeframes = ['5m', '15m', '1h', '4h']
             tasks = []
             for symbol in self.symbols:
-                for timeframe in timeframes: tasks.append(self.exchange.fetch_ohlcv(symbol, timeframe, limit=100))
-                tasks.append(self.exchange.fetch_ticker(symbol))
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+                for timeframe in timeframes: 
+                    # 使用安全包装器
+                    tasks.append(_safe_fetch_ohlcv(symbol, timeframe, limit=100))
+                # 使用安全包装器
+                tasks.append(_safe_fetch_ticker(symbol))
+                
+            results = await asyncio.gather(*tasks) # 不再需要 return_exceptions=True
+            
             total_timeframes = len(timeframes); tasks_per_symbol = total_timeframes + 1
             
             for i, symbol in enumerate(self.symbols):
                 start_index = i * tasks_per_symbol; symbol_ohlcv_results = results[start_index:start_index + total_timeframes]
                 ticker_result = results[start_index + total_timeframes]
+                
+                # [GEMINI V5 修复] 检查返回的是否是异常
                 if not isinstance(ticker_result, Exception) and ticker_result and ticker_result.get('last') is not None:
                     fetched_tickers[symbol] = ticker_result; market_indicators_data[symbol] = {'current_price': ticker_result.get('last')}
-                else: market_indicators_data[symbol] = {'current_price': None}; self.logger.warning(f"Failed fetch ticker/price for {symbol}")
+                else: 
+                    market_indicators_data[symbol] = {'current_price': None}
+                    self.logger.warning(f"Failed fetch ticker/price for {symbol} (Result: {ticker_result})")
                 
                 for j, timeframe in enumerate(timeframes):
                     ohlcv_data = symbol_ohlcv_results[j]
-                    if isinstance(ohlcv_data, Exception) or not ohlcv_data: self.logger.warning(f"Failed fetch {timeframe} for {symbol}"); continue
+                    
+                    # [GEMINI V5 修复] 检查返回的是否是异常
+                    if isinstance(ohlcv_data, Exception) or not ohlcv_data: 
+                        self.logger.warning(f"Failed fetch {timeframe} for {symbol} (Result: {ohlcv_data})")
+                        continue
                     
                     try:
                         df = pd.DataFrame(ohlcv_data, columns=['ts', 'o', 'h', 'l', 'c', 'v']); df.rename(columns={'timestamp':'ts', 'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}, inplace=True, errors='ignore'); 
@@ -317,7 +359,11 @@ class AlphaTrader:
                             self.logger.warning(f"DataFrame empty for {symbol} {timeframe} after cleaning NaNs.")
                             continue
                             
+                        # [GEMINI V4 修复] 关键修复：确保 '1h' -> '1hour'
                         prefix = f"{timeframe.replace('m', 'min').replace('h', 'hour')}_"
+                        # '5m' -> '5min_'
+                        # '1h' -> '1hour_'
+                        # '4h' -> '4hour_'
 
                         # 1. 手动计算 ADX
                         if len(df) >= 28: # (14*2)
@@ -428,7 +474,7 @@ class AlphaTrader:
             symbol_short = symbol.split('/')[0]
             prompt += f"\n# {symbol_short} Multi-TF Analysis\n"
             prompt += f"Price: {safe_format(d.get('current_price'), 2)}\n"
-            timeframes = ['5m', '15m', '1hour', '4hour'] # 1m 移除
+            timeframes = ['5min', '15min', '1hour', '4hour'] # 1m 移除
             for tf in timeframes:
                 prompt += f"\n[{tf.upper()}]\n"
                 prompt += f" RSI:{safe_format(d.get(f'{tf}_rsi_14'), 0, is_rsi=True)}|"
@@ -465,13 +511,13 @@ class AlphaTrader:
         if not self.ai_analyzer: return {}
         return await self.ai_analyzer.get_ai_response(system_prompt, user_prompt)
 
-
+    # --- [GEMINI V4 - 混合策略] 完整的 _execute_decisions 替换 ---
     # 1. (建议 1) "BUY"/"SELL" 市价开仓逻辑被重新添加，用于 Rule 8。
     # 2. (建议 4) "LIMIT_BUY"/"LIMIT_SELL" 逻辑保留。
     # 3. (安全) 统一的安全计算逻辑 (risk_percent -> size) 被应用于 BUY, SELL, 和 LIMIT_BUY/SELL。
     async def _execute_decisions(self, decisions: list, market_data: Dict[str, Dict[str, Any]]):
         """
-
+        [GEMINI 改进版 V4 (混合策略)] 
         1. 重新添加 "BUY"/"SELL" (市价开仓) 逻辑，以支持 Rule 8 突破。
         2. 将 Python 端的安全计算 (risk_percent -> size) 应用于所有开仓类型。
         """
@@ -498,7 +544,7 @@ class AlphaTrader:
                     if self.is_live_trading: await self.portfolio.live_close(symbol, reason=reason)
                     else: await self.portfolio.paper_close(symbol, current_price, reason=reason)
                 
-         
+                # --- [GEMINI V4 - 市价开仓 (BUY / SELL) - 仅用于 Rule 8] ---
                 elif action in ["BUY", "SELL"]:
                     if not self.is_live_trading:
                         self.logger.warning(f"模拟盘：跳过 {action} 市价单 (模拟盘仅支持限价单转换)。"); continue
@@ -601,7 +647,7 @@ class AlphaTrader:
                              self.logger.error(f"模拟盘限价单转换失败: {e_paper}, Order: {order}"); continue
                         continue # 模拟盘逻辑结束
 
-     
+                    # --- [GEMINI V4 - 实盘的 Python 计算逻辑] ---
                     if self.is_live_trading:
                         side = 'long' if action == 'LIMIT_BUY' else 'short'; final_size = 0.0
                         
@@ -720,8 +766,11 @@ class AlphaTrader:
             except Exception as e: 
                 self.logger.error(f"处理 AI 指令时意外错误: {order}. Err: {e}", exc_info=True)
 
-
-
+    # --- [GEMINI V2 - 建议 2] 移除滞后的触发器 (MACD 交叉) ---
+    # 函数 _check_significant_indicator_change 已被删除
+    # ---
+    
+    # --- [GEMINI V2 - 建议 2] 移除滞后的触发器 (波动率尖峰) ---
     # 函数 _check_market_volatility_spike 已被删除
     # ---
 
@@ -748,7 +797,7 @@ class AlphaTrader:
         return len(to_close) > 0
 
     
-
+    # --- [GEMINI V3 - 新功能] 新增 _check_divergence (RSI 背离) 触发器 ---
     async def _check_divergence(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m K线上的 RSI 背离 (预测性触发)。
@@ -811,9 +860,9 @@ class AlphaTrader:
         except Exception as e:
             self.logger.error(f"Err check divergence: {e}", exc_info=False)
             return False, ""
+    # --- [GEMINI V3 - 新功能结束] ---
 
-
-
+    # --- [GEMINI V3 - 新功能] 新增 _check_ema_squeeze (EMA 挤压) 触发器 ---
     async def _check_ema_squeeze(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m EMA(20) 和 EMA(50) 是否进入 "挤压" 状态 (预测性触发)。
@@ -855,7 +904,7 @@ class AlphaTrader:
         except Exception as e:
             self.logger.error(f"Err check EMA squeeze: {e}", exc_info=False)
             return False, ""
-
+    # --- [GEMINI V3 - 新功能结束] ---
 
 
     async def _check_rsi_threshold_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
@@ -988,12 +1037,13 @@ class AlphaTrader:
         # 1. 获取数据 & 构建 Prompt
         market_data, tickers = await self._gather_all_market_data()
         portfolio_state = self.portfolio.get_state_for_prompt(tickers)
-   
+        
+        # [GEMINI V2] 在构建 prompt 之前更新 F&G
         await self._update_fear_and_greed_index()
         
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
-    
+        # 2. 格式化 System Prompt (已更新 V45.35 / GEMINI V4)
         try:
             system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
                 symbol_list=self.formatted_symbols,
@@ -1027,7 +1077,7 @@ class AlphaTrader:
         
         self.last_strategy_summary = summary_for_ui
 
-
+        # 5. 执行决策 (已更新 V45.35 / GEMINI V4)
         if orders:
             self.logger.info(f"AI proposed {len(orders)} order(s), executing...")
             await self._execute_decisions(orders, market_data)
@@ -1038,7 +1088,9 @@ class AlphaTrader:
 
     async def start(self):
         """[V45.38 修复] 启动 AlphaTrader 主循环。
-
+        1. [硬风控] (步骤 5) 执行所有高频风控 (SL/TP/MaxLoss/Dust/Multi-TP)
+        2. [V45.38 修复] (步骤 2) 确保缺少 timestamp 的 "孤儿" 限价单也被取消。
+        3. [GEMINI V4 - 建议 2] (步骤 6) 移除滞后的事件触发器调用, 增加高级触发器 (Divergence, Squeeze)。
         """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
@@ -1054,7 +1106,7 @@ class AlphaTrader:
         MAX_LOSS_PERCENT = getattr(settings, 'MAX_LOSS_CUTOFF_PERCENT', 20.0) / 100.0
         DUST_MARGIN_USDT = 1.0
         # --- [V45.36 新增超时阈值] ---
-
+        # [GEMINI V2 修复] 从 settings (config.py) 而非 futures_settings 读取
         LIMIT_ORDER_TIMEOUT_MS = getattr(settings, 'AI_LIMIT_ORDER_TIMEOUT_SECONDS', 900) * 1000
         
         while True:
@@ -1235,7 +1287,7 @@ class AlphaTrader:
                 trigger_ai, reason, now = False, "", time.time(); interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS;
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
-       
+                # --- [GEMINI V4 - 建议 2 (Advanced)] 触发器逻辑修改 ---
                 if not trigger_ai:
                     sym=self.symbols[0]; ohlcv_15m = [] # 只需要 15m K线
                     try: 
@@ -1258,7 +1310,7 @@ class AlphaTrader:
                         
                         if event: 
                             trigger_ai, reason = True, ev_reason
-          
+                # --- [GEMINI V4 修改结束] ---
                 
                 # 步骤 7: (安全地) 运行 AI 循环
                 if trigger_ai:
