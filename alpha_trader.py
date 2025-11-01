@@ -3,11 +3,12 @@
 #    - [AI - Rule 6] AI 负责低频、高上下文的限价单 (LIMIT) 策略。
 #    - [Python - Rule 8] Python 负责高频、低延迟的市价单 (MARKET) 突破策略。
 # 2. 通知:
-#    - [修复] 移除了 alpha_trader.py 中冗余的通知调用。
-#    - [说明] 所有通知 (开仓/挂单/平仓/成交) 现在均由 alpha_portfolio.py (Source 2) 正确处理。
+#    - 所有通知 (开仓/挂单/平仓/成交) 均由 alpha_portfolio.py (Source 2) 正确处理。
 # 3. Bug 修复:
 #    - [修复] 修复了 start() 循环中 'ohlcv_1sSsm' 的 NameError。
-#    - [修复] 修复了 'Settings' object has no attribute 'FUTURES_LEVERAGE' 的 AttributeError。
+#    - [修复] 修复了 'futures_settings' 的 AttributeError。
+#    - [修复] 修复了 'NoneType' is not iterable 的 TypeError。
+#    - [修复] [V45.38] start() 循环现在调用 portfolio.remove_pending_limit_order() 以确保持久化。
 
 import logging
 import asyncio
@@ -19,7 +20,7 @@ import pandas_ta as ta
 import re
 import httpx # 用于 F&G Index
 from collections import deque
-# [修复] 导入 settings 和 futures_settings
+# [修复] 导入 settings 和 futures_settings (适配您原始的 config.py)
 from config import settings, futures_settings
 from alpha_ai_analyzer import AlphaAIAnalyzer
 from alpha_portfolio import AlphaPortfolio # 假设 V23.4 或更高
@@ -207,7 +208,7 @@ class AlphaTrader:
         self.exchange = exchange
         # [修复] 从 settings 中读取 symbols
         self.symbols = settings.FUTURES_SYMBOLS_LIST
-        self.portfolio = AlphaPortfolio(exchange, self.symbols) # 假设 V23.4+ [cite: 2]
+        self.portfolio = AlphaPortfolio(exchange, self.symbols) # 假设 V23.4+
         self.ai_analyzer = AlphaAIAnalyzer(exchange, "ALPHA_TRADER")
         self.is_live_trading = settings.ALPHA_LIVE_TRADING
         self.start_time = time.time(); self.invocation_count = 0; self.last_run_time = 0; self.last_event_trigger_ai_time = 0
@@ -497,12 +498,12 @@ class AlphaTrader:
         - "BUY"/"SELL" (市价开仓) 由 Python Rule 8 调用。
         - "LIMIT_BUY"/"LIMIT_SELL" 由 AI Rule 6 调用。
         - 将 Python 端的安全计算 (risk_percent -> size) 应用于所有开仓类型。
-        - [修复] 移除所有通知调用， portfolio.py [cite: 2] 会处理。
+        - [修复] 移除所有通知调用， portfolio.py (Source 2) 会处理。
         """
         
-        # [修复] 从 futures_settings 中读取
+        # [修复] 从 futures_settings (Source 1) 中读取
         MIN_MARGIN_USDT = futures_settings.MIN_NOMINAL_VALUE_USDT
-        MIN_SIZE_BTC = 0.001 
+        MIN_SIZE_BTC = 0.001 # (这个目前是硬编码，可以移到 config)
 
         for order in decisions:
             try:
@@ -519,7 +520,7 @@ class AlphaTrader:
                 if action == "CLOSE":
                     if (not current_price or current_price <= 0) and not self.is_live_trading:
                         self.logger.error(f"模拟盘平仓失败: 无当前价格 {symbol}"); continue
-                    # portfolio.live_close / paper_close 会处理通知
+                    # [通知] portfolio.live_close / paper_close 会处理通知
                     if self.is_live_trading: await self.portfolio.live_close(symbol, reason=reason)
                     else: await self.portfolio.paper_close(symbol, current_price, reason=reason)
                 
@@ -1234,22 +1235,27 @@ class AlphaTrader:
                     now_ms = time.time() * 1000
                     orders_to_cancel = []
                     try:
+                        # [修复 V45.38] 迭代副本以安全删除
                         for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
                             order_id = plan.get('order_id')
                             timestamp = plan.get('timestamp')
                             if not order_id:
                                 self.logger.warning(f"Pending order {symbol} 缺少 order_id，正在从本地清理...")
-                                self.portfolio.pending_limit_orders.pop(symbol, None)
+                                # [修复 V45.38] 使用 "安全" 移除函数
+                                await self.portfolio.remove_pending_limit_order(symbol)
                                 continue
                             if not timestamp:
                                 self.logger.warning(f"!!! ORPHAN TIMEOUT !!! {symbol} (ID: {order_id}) 缺少 timestamp。立即取消...")
                                 orders_to_cancel.append((order_id, symbol))
-                                self.portfolio.pending_limit_orders.pop(symbol, None) 
+                                # [修复 V45.38] 使用 "安全" 移除函数
+                                await self.portfolio.remove_pending_limit_order(symbol)
                                 continue
                             if (now_ms - timestamp) > LIMIT_ORDER_TIMEOUT_MS:
                                 self.logger.warning(f"!!! LIMIT ORDER TIMEOUT !!! {symbol} (ID: {order_id}) 已超时 {LIMIT_ORDER_TIMEOUT_MS / 1000}s。正在取消...")
                                 orders_to_cancel.append((order_id, symbol))
-                                self.portfolio.pending_limit_orders.pop(symbol, None) 
+                                # [修复 V45.38] 使用 "安全" 移除函数
+                                await self.portfolio.remove_pending_limit_order(symbol)
+                        
                         if orders_to_cancel:
                             cancel_tasks = [self.client.cancel_order(oid, sym) for oid, sym in orders_to_cancel]
                             await asyncio.gather(*cancel_tasks, return_exceptions=True)
@@ -1305,7 +1311,8 @@ class AlphaTrader:
                             rate = upl / margin 
 
                             # --- [核心] 识别仓位类型 ---
-                            inval_cond = state.get('invalidation_condition', '')
+                            # [!!! Bug 修复 (NoneType) !!!] 确保 inval_cond 始终为字符串，防止 'NoneType' is not iterable
+                            inval_cond = state.get('invalidation_condition') or '' 
                             is_rule_8_trade = "Python Rule 8" in inval_cond
 
                             # --- 规则 A: Python Rule 8 动态追踪止损 ---
@@ -1375,7 +1382,7 @@ class AlphaTrader:
                         self.logger.error(f"High-frequency risk check error: {e_risk}", exc_info=True)
 
                     # 3. 执行风控动作
-                    # [通知] portfolio.py [cite: 2] 会自动处理这些动作的通知
+                    # [通知] portfolio.py (Source 2) 会自动处理这些动作的通知
                     if sl_update_tasks:
                         await asyncio.gather(*sl_update_tasks, return_exceptions=True) # 忽略错误 (例如仓位已不存在)
                     if positions_to_close:
@@ -1414,7 +1421,7 @@ class AlphaTrader:
                                 event, ev_reason = await self._check_divergence(ohlcv_15m)
                                 if not event: event, ev_reason = await self._check_ema_squeeze(ohlcv_15m)
                                 
-                                # [!!! Bug 修复 !!!]
+                                # [!!! Bug 修复 (NameError) !!!]
                                 # 将 'ohlcv_1sSsm' 修正为 'ohlcv_15m'
                                 if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m)
                                 
