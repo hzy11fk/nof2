@@ -438,6 +438,24 @@ class AlphaPortfolio:
                     position_details.append(pos_str)
         
         if not position_details: position_details.append("No open positions.")
+        # --- [新增逻辑开始] ---
+        pending_orders_details = []
+        if self.is_live and self.pending_limit_orders:
+            for symbol, plan in self.pending_limit_orders.items():
+                try:
+                    # [V45.38] 'plan' 结构
+                    # { 'order_id': ..., 'side': ..., 'leverage': ..., 'limit_price': ..., ... }
+                    plan_str = ( f"- {symbol.split(':')[0]}: Side={plan.get('side', 'N/A').upper()}, "
+                                 f"Price={plan.get('limit_price', 0.0):.4f}, "
+                                 f"Reason='{plan.get('reason', 'N/A')}'" )
+                    pending_orders_details.append(plan_str)
+                except Exception as e:
+                    self.logger.error(f"Error formatting pending order {symbol}: {e}")
+                    pending_orders_details.append(f"- {symbol.split(':')[0]}: Error formatting plan.")
+
+        if not pending_orders_details:
+            pending_orders_details.append("No pending limit orders.")
+        # --- [新增逻辑结束] ---
         
         initial_capital_for_calc = settings.ALPHA_LIVE_INITIAL_CAPITAL if self.is_live else settings.ALPHA_PAPER_CAPITAL
         performance_percent_str = "N/A (Invalid Initial)"
