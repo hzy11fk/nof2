@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     ALPHA_LIVE_INITIAL_CAPITAL: float = 1000.0
 
     # 机器人将交易的合约列表
-    FUTURES_SYMBOLS_LIST: List[str] = [
+    FUTURES_SYMBOLS_LIST: list = [
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", 
         "BNB/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"
     ]
