@@ -4,6 +4,7 @@
 # 3. (V45.36 修复 - 保留) 修复了限价单杠杆/本金错误和成交通知。
 # 4. (V45.33 修复 - 保留) live_close 包含 filled_size > 0 检查。
 # 5. [GEMINI V3 修复] live_open_limit 已升级，支持限价加仓。
+# 6. [GEMINI V4 修复] live_open_limit 现在存储 'limit_price' 以支持价格偏离取消。
 
 import logging
 import time
@@ -46,7 +47,7 @@ class AlphaPortfolio:
         self.state_file = os.path.join('data', 'alpha_portfolio_state_PAPER.json')
         if not self.is_live: self._load_paper_state()
 
-        # 结构: { "BTC/USDT:USDT": {"order_id": "123", "timestamp": ..., "leverage": 10, ...}, ... }
+        # 结构: { "BTC/USDT:USDT": {"order_id": "123", "timestamp": ..., "leverage": 10, "limit_price": 65000, ...}, ... }
         self.pending_limit_orders: Dict[str, Dict] = {}
 
 
@@ -81,11 +82,16 @@ class AlphaPortfolio:
         except TypeError as e: self.logger.error(f"保存模拟状态失败：类型错误 - {e}. State: {state}", exc_info=True)
         except Exception as e: self.logger.error(f"保存模拟状态失败: {e}", exc_info=True)
 
+
+# 文件: alpha_portfolio.py
+    # (替换此函数)
+
     async def sync_state(self):
         """
         [V45.37 策略A 重大修复]
         1. 不再调用高风险的 fetch_open_orders() (无参数)。
         2. 仅并行获取 self.pending_limit_orders 中品种的挂单。
+        [GEMINI V5 修复] 增加了 'elif pending_plan:' 逻辑块，以正确处理 "限价加仓" 订单的成交。
         """
         try:
             if self.is_live:
@@ -141,7 +147,7 @@ class AlphaPortfolio:
                             if abs(size) > 1e-9:
                                 exchange_open_symbols.add(symbol)
                                 
-                                # --- [GEMINI V3 修复] 检查限价单成交 ---
+                                # --- [GEMINI V5 修复] 检查限价单成交 ---
                                 # 检查此持仓是否由待处理的限价单触发
                                 pending_plan = self.pending_limit_orders.pop(symbol, None)
                                 
@@ -199,8 +205,9 @@ class AlphaPortfolio:
                                     )
                                     # --- [V45.36 步骤 2 结束] ---
                                     
+                                # --- [GEMINI V5 修复] 新增 'elif pending_plan:' 块来处理限价加仓 ---
                                 elif pending_plan:
-                                    # --- [GEMINI V3 修复] 这是一个 "限价加仓" ---
+                                    # 这是一个 "限价加仓"
                                     self.logger.warning(f"{self.mode_str} sync: 发现交易所持仓 {symbol} 变动，匹配到AI限价加仓计划。")
                                     
                                     # 我们需要从交易所获取 *最新* 的均价和总数
@@ -223,8 +230,14 @@ class AlphaPortfolio:
                                         # AddPrice = ((NewAvg * NewSize) - (OldAvg * OldSize)) / AddSize
                                         old_avg_price = old_state.get('avg_entry_price', 0.0) if old_state else 0.0
                                         
-                                        add_price = ((current_avg_price * current_total_size) - (old_avg_price * old_total_size)) / added_size
+                                        add_price = 0.0
+                                        if added_size > 0:
+                                            add_price = ((current_avg_price * current_total_size) - (old_avg_price * old_total_size)) / added_size
                                         
+                                        if add_price <= 0:
+                                             self.logger.warning(f"Sync: 无法反推加仓价格 (AddPrice: {add_price})。将使用交易所均价 {current_avg_price} 作为近似值。")
+                                             add_price = current_avg_price
+
                                         plan_sl = pending_plan.get('stop_loss')
                                         plan_tp = pending_plan.get('take_profit')
                                         plan_inval = pending_plan.get('invalidation_condition')
@@ -244,15 +257,21 @@ class AlphaPortfolio:
                                             invalidation_condition=plan_inval
                                         )
                                         
+                                        # 获取 *更新后* 的本地状态，以显示正确的均价
+                                        final_state = self.position_manager.get_position_state(symbol)
+                                        final_avg_price = final_state.get('avg_entry_price', current_avg_price)
+                                        final_total_size = final_state.get('total_size', current_total_size)
+                                        
                                         try:
                                             title = f"🔼 {self.mode_str} AI 限价加仓成交: {side.upper()} {symbol.split('/')[0]}"
-                                            body = f"成交价格: {add_price:.4f}\n数量: {added_size}\n杠杆: {plan_leverage}x\n新均价: {current_avg_price:.4f}\n新总量: {current_total_size}\nAI原因: {plan_reason}"
+                                            body = f"成交价格: {add_price:.4f}\n数量: {added_size}\n杠杆: {plan_leverage}x\n新均价: {final_avg_price:.4f}\n新总量: {final_total_size}\nAI原因: {plan_reason}"
                                             await send_bark_notification(title, body)
                                         except Exception as e_notify:
                                             self.logger.error(f"Sync: 发送加仓成交通知失败: {e_notify}")
                                             
                                     else:
-                                        self.logger.warning(f"Sync: 匹配到限价单 {symbol}，但计算出的 added_size 为 0 或负数。不同步加仓。")
+                                        self.logger.warning(f"Sync: 匹配到限价单 {symbol}，但计算出的 added_size 为 0 或负数 ({added_size})。不同步加仓。")
+                                # --- [GEMINI V5 修复结束] ---
                                 else:
                                     # 本地和交易所均存在，且没有匹配到限价单
                                     self.logger.debug(f"{self.mode_str} sync: {symbol} 本地和交易所均存在。")
@@ -303,6 +322,7 @@ class AlphaPortfolio:
                 else: self.logger.warning(f"{self.mode_str} sync: 跳过追加净值历史，Equity无效: {current_equity_to_append} (Type: {type(current_equity_to_append)})")
                 self._save_paper_state()
         except Exception as e: self.logger.critical(f"{self.mode_str} sync_state 顶层执行失败: {e}", exc_info=True)
+
 
     def get_state_for_prompt(self, tickers: dict = None):
         position_details = []
@@ -469,10 +489,11 @@ class AlphaPortfolio:
         except InsufficientFunds as e: self.logger.error(f"!!! {self.mode_str} {action_type} 失败 (资金不足): {e}", exc_info=False); await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n原因: 资金不足")
         except Exception as e: self.logger.error(f"!!! {self.mode_str} {action_type} 失败: {e}", exc_info=True); await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n错误: {e}")
 
-    # --- [GEMINI V3 修复] 升级此函数，使其支持 "限价加仓" (Pyramiding) ---
+    # --- [GEMINI V4 修复] 升级此函数，使其支持 "限价加仓" (Pyramiding) 并存储 "limit_price" ---
     async def live_open_limit(self, symbol, side, size, leverage, limit_price: float, reason: str = "N/A", stop_loss: float = None, take_profit: float = None, invalidation_condition: str = "N/A"):
         """[实盘] 挂一个限价开仓单，并将 SL/TP/Leverage 计划存储起来。
         [GEMINI V3 修复] 此函数现在支持对同向持仓进行限价加仓。
+        [GEMINI V4 修复] 此函数现在存储 'limit_price'。
         """
         action_type = "限价开仓" # 默认为开新仓
         self.logger.warning(f"!!! {self.mode_str} AI 请求 {action_type} (初步): {side.upper()} {size} {symbol} @ {limit_price} !!!")
@@ -575,11 +596,12 @@ class AlphaPortfolio:
             if not order_id:
                 raise ValueError(f"交易所未返回 order_id: {order_result}")
 
-            # --- [V45.36 修复：存储杠杆] ---
+            # --- [GEMINI V4 修复：存储 limit_price] ---
             pending_plan = {
                 'order_id': order_id,
                 'side': side,
                 'leverage': int(leverage), # <-- [GEMINI V3 修复] 存储最终使用的杠杆
+                'limit_price': limit_price, # <-- [GEMINI V4 修复] 存储挂单价格
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'invalidation_condition': invalidation_condition,
