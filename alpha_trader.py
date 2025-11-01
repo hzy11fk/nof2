@@ -1373,7 +1373,7 @@ class AlphaTrader:
                                     sl_update_tasks.append(
                                         self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Rule 8 Trail Stop")
                                     )
-                                continue 
+                            
 
                             if rate <= -MAX_LOSS_PERCENT:
                                 reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
