@@ -1,12 +1,11 @@
-# 文件: alpha_trader.py (GEMINI V4 完整版 - 混合策略)
-# 1. Prompt 重写：
-#    - [默认] 规则 1/6: 默认禁止市价单，使用 1h/4h 慢周期。
-#    - [例外] 规则 8: 新增“突破策略”，允许在 Squeeze+Volume 确认时使用市价单。
-#    - [安全] 规则 4: 无论何种订单，AI 均提供 risk_percent，Python 计算。
-# 2. _execute_decisions 重写：
-#    - 重新添加 "BUY"/"SELL" 市价开仓逻辑。
-#    - 将 V3 的安全计算逻辑 (risk_percent -> size) 应用于 LIMIT, BUY, 和 SELL 所有开仓动作。
-# 3. 触发器: 保留所有高级触发器 (Divergence, Squeeze, RSI, BBands)。
+# 文件: alpha_trader.py (完整优化版 - 混合策略)
+# 1. 策略:
+#    - [默认] 规则 6: 默认禁止市价单，使用 1h/4h 慢周期。
+#    - [优化] 规则 6.3: 激活 ADX 20-25 震荡区，使用 15m BBands + 低风险。
+#    - [例外] 规则 8: "突破策略"，允许在 Squeeze+Volume 确认时使用市价单。
+#    - [优化] 规则 8.d: 增加 F&G 宏观否决权，防止在极端情绪时追高/杀跌。
+# 2. 触发器:
+#    - [优化] start() 循环现在会检查 *所有* 资产的高级触发器 (Divergence, Squeeze)。
 
 import logging
 import asyncio
@@ -31,14 +30,6 @@ except ImportError:
 
 class AlphaTrader:
     
-    # --- [ V45.35 PROMPT 核心升级: 引入限价单策略 ] ---
-    # (保留原始中文注释)
-    # 1. [Rule 5] 重写：趋势市首选 "LIMIT" (回调)，盘整市 *必须* "LIMIT" (均值回归)。
-    # 2. [Rule 5] 市价单 (MARKET) 仅用于 "高置信度趋势突破"。
-    # 3. [Order Rules] 增加 "LIMIT_BUY" 和 "LIMIT_SELL" 动作模板。
-    # 4. [CoT] 示例已更新，以反映 "PREPARE LIMIT_BUY" 思维。
-    
-    # --- [ GEMINI V4 混合策略版 (纯英文) ] ---
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -52,16 +43,16 @@ class AlphaTrader:
         -   You are **forbidden** from using `BUY` or `SELL` (Market Orders) UNLESS the strict conditions in Rule 8 are met.
         -   All default strategies (Trend Pullbacks, Mean Reversion) **must and only** use `LIMIT_BUY` or `LIMIT_SELL`.
 
-    2.  **Rule-Based Position Management:** (Was Rule 1)
+    2.  **Rule-Based Position Management:**
         For every open position, you MUST check its `InvalidATION_CONDITION`. If this condition is met, you MUST issue a `CLOSE` order. This is your top priority for existing positions.
 
-    3.  **Active SL/TP Management (CRITICAL):** (Was Rule 2)
+    3.  **Active SL/TP Management (CRITICAL):**
         Your main task for existing positions is to actively manage risk.
         -   For *every* open position on *every* analysis cycle, you MUST assess if the existing `ai_suggested_stop_loss` or `ai_suggested_take_profit` targets are still optimal.
         -   The system executes these targets automatically, but your job is to UPDATE them.
         -   If the market structure changes (e.g., a new S/R level appears, volatility drops), you MUST issue `UPDATE_STOPLOSS` or `UPDATE_TAKEPROFIT` orders with new, improved targets and your reasoning.
 
-    4.  **Risk Management Foundation (CRITICAL):** (Was Rule 3 - Content Replaced)
+    4.  **Risk Management Foundation (CRITICAL):**
         Profit is the goal, but capital preservation is the foundation.
         -   **AI's Task (Strategy):** Your job is to select the *risk parameters* based on your confidence, not to perform the final math. The Python system will perform all final calculations and safety checks.
         -   **AI Must Provide (for ALL new orders: BUY, SELL, LIMIT_BUY, LIMIT_SELL):**
@@ -74,14 +65,14 @@ class AlphaTrader:
             -   Define 'Altcoin Group' as [SOL, BNB, DOGE, XRP]. Total margin for this group MUST NOT exceed 40% of Total Equity.
             -   If opening a new position (e.g., SOL) would breach its group cap, you MUST ABORT the trade.
 
-    5.  **Complete Trade Plans (Open/Add):** (Was Rule 4)
+    5.  **Complete Trade Plans (Open/Add):**
         Every new order (BUY/SELL/LIMIT) is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
         -   **Smarter Invalidation:** Your `invalidation_condition` MUST be based on a clear technical breakdown of the *original trade thesis*.
             -   *Trend Trade Example:* `Invalidation='1h Close below the EMA 50'`
             -   *Ranging Trade Example:* `InvalidATION='15m RSI breaks above 60'`
         -   **Profit-Taking Strategy:** You SHOULD consider using multiple take-profit levels (by using `PARTIAL_CLOSE` later) rather than a single `take_profit`.
 
-    6.  **Market State Recognition (Default Strategy):** (Was Rule 5 - Content Replaced)
+    6.  **Market State Recognition (Default Strategy):**
         You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes. This is your **Default Strategy**.
         -   **1. Strong Trend (Trending Bullish/Bearish):**
             -   **Condition:** 1h or 4h **ADX_14 > 25**.
@@ -89,11 +80,14 @@ class AlphaTrader:
         -   **2. Ranging (No Trend):**
             -   **Condition:** 1h and 4h **ADX_14 < 20**.
             -   **Strategy (LIMIT ONLY):** In this regime, your **only** strategy is **mean-reversion**. Your task is to identify the `BB_Upper` and `BB_Lower` levels. You MUST issue **`LIMIT_SELL` at (or near) the upper band** or **`LIMIT_BUY` at (or near) the lower band**.
-        -   **3. Chop (Uncertain):**
+        -   **3. Chop (Short-Term Ranging):**
             -   **Condition:** 1h or 4h **ADX_14 is between 20 and 25**.
-            -   **Strategy:** This is an uncertain market. **WAIT** for a clear signal OR look for a "Breakout Mutation" (see Rule 8).
+            -   **Strategy (LIMIT ONLY):** This is a low-conviction market. Shift focus to the **15min timeframe**.
+            -   Identify the `15min_bb_upper` and `15min_bb_lower` levels.
+            -   You MAY issue **`LIMIT_SELL` at the 15m upper band** or **`LIMIT_BUY` at the 15m lower band**.
+            -   **Risk:** This is a lower-confidence trade. You MUST use a reduced `risk_percent` (e.g., 0.01 or 0.015) and tighter stops.
 
-    7.  **Market Sentiment Filter (Fear & Greed Index):** (Was Rule 6)
+    7.  **Market Sentiment Filter (Fear & Greed Index):**
         (This rule remains unchanged)
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter for your decisions.
         -   **Extreme Fear (Index < 25):** ...
@@ -117,8 +111,11 @@ class AlphaTrader:
            - `5min_volume_ratio` > 2.5 
            - OR `15min_volume_ratio` > 2.0
         
-        d. **THE VETO (The Filter):** The breakout must NOT be trading directly against the major long-term trend.
+        d. **THE VETO (The Filter):** The breakout must NOT be trading directly against the major long-term trend OR extreme macro sentiment.
            - (e.g., Do not `BUY` if the 4h EMA 50 is strongly trending down).
+           - **Macro Veto (Rule 7):** The action MUST NOT contradict the Fear & Greed Index.
+             - Do NOT issue `BUY` (Long) if F&G is in "Extreme Greed" (> 75).
+             - Do NOT issue `SELL` (Short) if F&G is in "Extreme Fear" (< 25).
 
         If all a, b, c, and d are true, you may issue a `BUY` or `SELL` market order, but you MUST still use the Python-calculated sizing (`risk_percent`).
 
@@ -145,7 +142,7 @@ class AlphaTrader:
 
         Market State Analysis:
         - 1h ADX: [Value] | 4h ADX: [Value]
-        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Applying Rule 6: Ranging (ADX<20) / Applying Rule 8: Breakout Mutation Watch (ADX<25 + Squeeze)]
+        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Applying Rule 6: Ranging (ADX<20) / Applying Rule 6: Chop Zone (ADX 20-25) / Applying Rule 8: Breakout Mutation Watch (ADX<25 + Squeeze)]
         - Key Support/Resistance Levels: [Identify major S/R levels, including BB_Upper/Lower and recent_high/low for relevant symbols]
         - Volume Analysis: [Assess volume confirmation, especially for Rule 8]
         - Market Sentiment: [MUST state the F&G Index value and its implication, e.g., "Extreme Greed (80)"]
@@ -161,7 +158,7 @@ class AlphaTrader:
            
            Invalidation Check: [Check condition vs current data. If met, MUST issue CLOSE.]
            
-           Reversal & Profit Save Check (NEW):
+           Reversal & Profit Save Check:
            - [Is this profitable position (UPL > +1.0%) showing strong signs of reversal (e.g., 15m bearish divergence, 1h ADX weakening, F&G Extreme Greed)?]
            - [IF YES: The risk of giving back profits is high. Prioritize capital preservation. Decision: MUST issue a CLOSE order to secure profits.]
 
@@ -171,7 +168,7 @@ class AlphaTrader:
            - [IF YES: Consider a `LIMIT_BUY`/`LIMIT_SELL` (Limit) order. This new entry is treated as a separate trade and MUST follow the full Rule 4 (Sizing) / Rule 5 (SL/TP) logic.]
            - [CRITICAL: You MUST NEVER add to a losing position (UPL < 0). Averaging down is forbidden.]
            
-           SL/TP Target Update Check (NEW):
+           SL/TP Target Update Check:
            - [Are the current ai_suggested_stop_loss/take_profit targets still optimal based on new data (e.g., move SL up to new 15m BB_Mid, lower TP from 4h BB_Upper)?]
            - [IF NOT OPTIMAL: Issue UPDATE_STOPLOSS / UPDATE_TAKEPROFIT with new targets and reasoning.]
            
@@ -194,13 +191,19 @@ class AlphaTrader:
         ETH Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
         - 4h Trend: N/A (ADX < 20) | 1h Setup: Price is *approaching* 1h BB_Upper (@ 3900.0) | 15min RSI: 68.5 (Approaching Overbought)
         - Signal Confluence Score: 3/4 (RSI/BBands align) | Final Confidence: High (for Ranging) - **PREPARE LIMIT_SELL at 3900.0 (Rule 6)**
+        
+        [EXAMPLE - RULE 6.3 (CHOP ZONE):]
+        BNB Multi-Timeframe Assessment (Market State: Chop, 1h ADX=23):
+        - 4h/1h Trend: N/A (Chop). Shifting to 15m timeframe.
+        - 15m Setup: Price is *approaching* 15m BB_Upper (@ 305.0). 15m RSI: 65.
+        - Signal Confluence Score: 3/4 (15m RSI/BBands align) | Final Confidence: Low/Medium (Reduced Risk 1.5%) - **PREPARE LIMIT_SELL at 305.0 (Rule 6.3 Chop)**
 
         [EXAMPLE - RULE 8 (BREAKOUT MUTATION):]
         SOL Multi-Timeframe Assessment (Market State: Chop, 1h ADX=22):
         - 8.a (Squeeze): TRUE. 1h ADX is 22 (< 25).
         - 8.b (Signal): TRUE. 5min price just broke above 15min BB_Upper.
         - 8.c (Volume): TRUE. 5min_volume_ratio is 2.8 (> 2.5).
-        - 8.d (Veto): TRUE. 4h trend is neutral, not opposing.
+        - 8.d (Veto): TRUE. 4h trend is neutral, not opposing. Macro F&G is 50 (Neutral), no veto.
         - Signal Confluence Score: 4/4 | Final Confidence: High - **EXECUTE BUY (Market) (Rule 8)**
 
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
@@ -216,7 +219,7 @@ class AlphaTrader:
     -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
     -   **To Close Partially (Take Profit):** `{{"action": "PARTIAL_CLOSE", "symbol": "...", "size_percent": 0.5, "reasoning": "Taking 50% profit near resistance per Rule 5..."}}` (or `size_absolute`)
     -   **To Update Stop Loss:** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Actively moving SL to new 15m support level..."}}`
-    -   **To Update Take Profit (NEW):** `{{"action": "UPDATE_TAKEPROFIT", "symbol": "...", "new_take_profit": ..., "reasoning": "Actively moving TP to new 4h resistance level..."}}`
+    -   **To Update Take Profit:** `{{"action": "UPDATE_TAKEPROFIT", "symbol": "...", "new_take_profit": ..., "reasoning": "Actively moving TP to new 4h resistance level..."}}`
     -   **To Hold:** Do NOT include in `orders`.
     -   **Symbol Validity:** `symbol` MUST be one of {symbol_list}.
 
@@ -242,15 +245,12 @@ class AlphaTrader:
             if hasattr(self.portfolio, 'exchange') and isinstance(self.portfolio.exchange, object): self.client = self.portfolio.exchange; self.logger.warning("Portfolio missing 'client', falling back.")
             else: self.client = self.exchange; self.logger.warning("Portfolio missing 'client', using exchange directly.")
         
-        # V45.26 新增
         self.fng_data: Dict[str, Any] = {"value": 50, "value_classification": "Neutral"}
         self.last_fng_fetch_time: float = 0.0
         self.FNG_CACHE_DURATION_SECONDS = 3600 # 1小时缓存 (3600秒)
         
-        # --- [V45.34 新增] ---
         # 止盈计数器，用于多阶段止盈。
         self.tp_counters: Dict[str, Dict[str, int]] = {}
-        # --- [新增结束] ---
 
 
     def _setup_log_handler(self):
@@ -275,19 +275,15 @@ class AlphaTrader:
         self.logger.info(f"Overall Performance: {performance_percent:.2f}% (Initial: {initial_capital_for_calc:.2f})")
 
     
-# 文件: alpha_trader.py
-    # (替换此函数)
-    
     async def _gather_all_market_data(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         """
-        [GEMINI V5 修复] 引入 asyncio.Semaphore 来限制并发请求，防止因 API 频率限制导致的数据缺失。
-        [GEMINI V4 修复] 确保 '1h' 变为 '1hour'，与 _build_prompt 严格一致。
+        引入 asyncio.Semaphore 来限制并发请求，防止因 API 频率限制导致的数据缺失。
+        确保 '1h' 变为 '1hour'，'5m' 变为 '5min'，与 _build_prompt 严格一致。
         """
         self.logger.info("Gathering multi-TF market data (5m, 15m, 1h, 4h) + ADX/BBands (Manual Calc)...")
         market_indicators_data: Dict[str, Dict[str, Any]] = {}
         fetched_tickers: Dict[str, Any] = {}
         
-        # --- [GEMINI V5 修复] ---
         # 限制并发请求为 10 个，防止触发交易所的 DDos/Rate Limit
         CONCURRENT_REQUEST_LIMIT = 10
         semaphore = asyncio.Semaphore(CONCURRENT_REQUEST_LIMIT)
@@ -307,7 +303,6 @@ class AlphaTrader:
                 except Exception as e:
                     self.logger.error(f"Safe Fetch Ticker Error ({symbol}): {e}", exc_info=False)
                     return e # 返回异常而不是抛出
-        # --- [GEMINI V5 修复结束] ---
         
         try:
             # 内部使用 '1h', '4h'
@@ -328,7 +323,7 @@ class AlphaTrader:
                 start_index = i * tasks_per_symbol; symbol_ohlcv_results = results[start_index:start_index + total_timeframes]
                 ticker_result = results[start_index + total_timeframes]
                 
-                # [GEMINI V5 修复] 检查返回的是否是异常
+                # 检查返回的是否是异常
                 if not isinstance(ticker_result, Exception) and ticker_result and ticker_result.get('last') is not None:
                     fetched_tickers[symbol] = ticker_result; market_indicators_data[symbol] = {'current_price': ticker_result.get('last')}
                 else: 
@@ -338,7 +333,7 @@ class AlphaTrader:
                 for j, timeframe in enumerate(timeframes):
                     ohlcv_data = symbol_ohlcv_results[j]
                     
-                    # [GEMINI V5 修复] 检查返回的是否是异常
+                    # 检查返回的是否是异常
                     if isinstance(ohlcv_data, Exception) or not ohlcv_data: 
                         self.logger.warning(f"Failed fetch {timeframe} for {symbol} (Result: {ohlcv_data})")
                         continue
@@ -359,9 +354,10 @@ class AlphaTrader:
                             self.logger.warning(f"DataFrame empty for {symbol} {timeframe} after cleaning NaNs.")
                             continue
                             
-                        # [GEMINI V4 修复] 关键修复：确保 '1h' -> '1hour'
+                        # 关键修复：确保 '1h' -> '1hour', '5m' -> '5min'
                         prefix = f"{timeframe.replace('m', 'min').replace('h', 'hour')}_"
                         # '5m' -> '5min_'
+                        # '15m' -> '15min_'
                         # '1h' -> '1hour_'
                         # '4h' -> '4hour_'
 
@@ -474,7 +470,10 @@ class AlphaTrader:
             symbol_short = symbol.split('/')[0]
             prompt += f"\n# {symbol_short} Multi-TF Analysis\n"
             prompt += f"Price: {safe_format(d.get('current_price'), 2)}\n"
-            timeframes = ['5min', '15min', '1hour', '4hour'] # 1m 移除
+            
+            # [优化] 修复: 确保列表与 '...min' 和 '...hour' 键名匹配
+            timeframes = ['5min', '15min', '1hour', '4hour']
+            
             for tf in timeframes:
                 prompt += f"\n[{tf.upper()}]\n"
                 prompt += f" RSI:{safe_format(d.get(f'{tf}_rsi_14'), 0, is_rsi=True)}|"
@@ -511,18 +510,14 @@ class AlphaTrader:
         if not self.ai_analyzer: return {}
         return await self.ai_analyzer.get_ai_response(system_prompt, user_prompt)
 
-    # --- [GEMINI V4 - 混合策略] 完整的 _execute_decisions 替换 ---
-    # 1. (建议 1) "BUY"/"SELL" 市价开仓逻辑被重新添加，用于 Rule 8。
-    # 2. (建议 4) "LIMIT_BUY"/"LIMIT_SELL" 逻辑保留。
-    # 3. (安全) 统一的安全计算逻辑 (risk_percent -> size) 被应用于 BUY, SELL, 和 LIMIT_BUY/SELL。
     async def _execute_decisions(self, decisions: list, market_data: Dict[str, Dict[str, Any]]):
         """
-        [GEMINI 改进版 V4 (混合策略)] 
+        混合策略执行:
         1. 重新添加 "BUY"/"SELL" (市价开仓) 逻辑，以支持 Rule 8 突破。
         2. 将 Python 端的安全计算 (risk_percent -> size) 应用于所有开仓类型。
         """
         
-        # 这些是硬性风控规则，之前在 Prompt 中
+        # 这些是硬性风控规则
         MIN_MARGIN_USDT = 6.0
         MIN_SIZE_BTC = 0.001 
 
@@ -544,7 +539,7 @@ class AlphaTrader:
                     if self.is_live_trading: await self.portfolio.live_close(symbol, reason=reason)
                     else: await self.portfolio.paper_close(symbol, current_price, reason=reason)
                 
-                # --- [GEMINI V4 - 市价开仓 (BUY / SELL) - 仅用于 Rule 8] ---
+                # --- 市价开仓 (BUY / SELL) - 仅用于 Rule 8 ---
                 elif action in ["BUY", "SELL"]:
                     if not self.is_live_trading:
                         self.logger.warning(f"模拟盘：跳过 {action} 市价单 (模拟盘仅支持限价单转换)。"); continue
@@ -647,7 +642,7 @@ class AlphaTrader:
                              self.logger.error(f"模拟盘限价单转换失败: {e_paper}, Order: {order}"); continue
                         continue # 模拟盘逻辑结束
 
-                    # --- [GEMINI V4 - 实盘的 Python 计算逻辑] ---
+                    # --- 实盘的 Python 计算逻辑 ---
                     if self.is_live_trading:
                         side = 'long' if action == 'LIMIT_BUY' else 'short'; final_size = 0.0
                         
@@ -714,7 +709,7 @@ class AlphaTrader:
                         else:
                              self.logger.error(f"AI 请求 LIMIT_BUY/SELL 但 portfolio 不支持 live_open_limit！")
                 
-                # --- [V45.35 其他指令] ---
+                # --- 其他指令 ---
                 elif action == "PARTIAL_CLOSE":
                     if (not current_price or current_price <= 0) and not self.is_live_trading:
                         self.logger.error(f"模拟盘部分平仓失败: 无当前价格 {symbol}"); continue
@@ -766,13 +761,11 @@ class AlphaTrader:
             except Exception as e: 
                 self.logger.error(f"处理 AI 指令时意外错误: {order}. Err: {e}", exc_info=True)
 
-    # --- [GEMINI V2 - 建议 2] 移除滞后的触发器 (MACD 交叉) ---
+    # 移除滞后的触发器 (MACD 交叉)
     # 函数 _check_significant_indicator_change 已被删除
-    # ---
     
-    # --- [GEMINI V2 - 建议 2] 移除滞后的触发器 (波动率尖峰) ---
+    # 移除滞后的触发器 (波动率尖峰)
     # 函数 _check_market_volatility_spike 已被删除
-    # ---
 
 
     async def _check_and_execute_hard_stops(self):
@@ -797,7 +790,7 @@ class AlphaTrader:
         return len(to_close) > 0
 
     
-    # --- [GEMINI V3 - 新功能] 新增 _check_divergence (RSI 背离) 触发器 ---
+    # 新增 _check_divergence (RSI 背离) 触发器
     async def _check_divergence(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m K线上的 RSI 背离 (预测性触发)。
@@ -860,9 +853,9 @@ class AlphaTrader:
         except Exception as e:
             self.logger.error(f"Err check divergence: {e}", exc_info=False)
             return False, ""
-    # --- [GEMINI V3 - 新功能结束] ---
+    # --- 背离检查结束 ---
 
-    # --- [GEMINI V3 - 新功能] 新增 _check_ema_squeeze (EMA 挤压) 触发器 ---
+    # 新增 _check_ema_squeeze (EMA 挤压) 触发器
     async def _check_ema_squeeze(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m EMA(20) 和 EMA(50) 是否进入 "挤压" 状态 (预测性触发)。
@@ -904,12 +897,12 @@ class AlphaTrader:
         except Exception as e:
             self.logger.error(f"Err check EMA squeeze: {e}", exc_info=False)
             return False, ""
-    # --- [GEMINI V3 - 新功能结束] ---
+    # --- 挤压检查结束 ---
 
 
     async def _check_rsi_threshold_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
-        [V45.35 策略A 升级] 检查 15m RSI 是否 *接近* 超买/超卖 (预测性触发)。
+        检查 15m RSI 是否 *接近* 超买/超卖 (预测性触发)。
         (此函数被保留)
         """
         try:
@@ -943,7 +936,7 @@ class AlphaTrader:
 
     async def _check_bollinger_band_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
-        [V45.35 策略A 升级] 检查 15m K线是否 *接近* 布林带 (预测性触发)。
+        检查 15m K线是否 *接近* 布林带 (预测性触发)。
         (此函数被保留)
         """
         try:
@@ -973,7 +966,6 @@ class AlphaTrader:
             upper_curr = upper_band.iloc[-1]
             lower_curr = lower_band.iloc[-1]
 
-            # --- [V45.35 逻辑] ---
             # 定义 "接近" 为 0.2% (可调)
             APPROACH_PERCENT = 0.002 
             
@@ -984,7 +976,6 @@ class AlphaTrader:
             # 检查是否接近下轨 (价格在下轨的 99% 和 100.2% 之间)
             if (lower_curr * (1.0 - APPROACH_PERCENT)) < close_curr < (lower_curr * (1.0 + APPROACH_PERCENT)):
                 return True, "Event: 15m Price *Approaching* BB_Lower"
-            # --- [V45.35 逻辑结束] ---
                 
             return False, ""
         except Exception as e:
@@ -993,7 +984,7 @@ class AlphaTrader:
 
     async def _update_fear_and_greed_index(self):
         """
-        [新增] 异步获取并缓存 Fear & Greed Index。
+        异步获取并缓存 Fear & Greed Index。
         """
         now = time.time()
         if now - self.last_fng_fetch_time < self.FNG_CACHE_DURATION_SECONDS:
@@ -1029,7 +1020,7 @@ class AlphaTrader:
 
 
     async def run_cycle(self):
-        """[V45.35] AI 决策主循环 (AI 现在会发出 LIMIT_BUY/SELL)"""
+        """AI 决策主循环 (AI 现在会发出 LIMIT_BUY/SELL)"""
         self.logger.info("="*20 + " Starting AI Cycle " + "="*20)
         self.invocation_count += 1
         if not self.is_live_trading: await self._check_and_execute_hard_stops()
@@ -1038,12 +1029,12 @@ class AlphaTrader:
         market_data, tickers = await self._gather_all_market_data()
         portfolio_state = self.portfolio.get_state_for_prompt(tickers)
         
-        # [GEMINI V2] 在构建 prompt 之前更新 F&G
+        # 在构建 prompt 之前更新 F&G
         await self._update_fear_and_greed_index()
         
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
-        # 2. 格式化 System Prompt (已更新 V45.35 / GEMINI V4)
+        # 2. 格式化 System Prompt
         try:
             system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
                 symbol_list=self.formatted_symbols,
@@ -1077,7 +1068,7 @@ class AlphaTrader:
         
         self.last_strategy_summary = summary_for_ui
 
-        # 5. 执行决策 (已更新 V45.35 / GEMINI V4)
+        # 5. 执行决策
         if orders:
             self.logger.info(f"AI proposed {len(orders)} order(s), executing...")
             await self._execute_decisions(orders, market_data)
@@ -1087,10 +1078,10 @@ class AlphaTrader:
         self.logger.info("="*20 + " AI Cycle Finished " + "="*20 + "\n")
 
     async def start(self):
-        """[V45.38 修复] 启动 AlphaTrader 主循环。
-        1. [硬风控] (步骤 5) 执行所有高频风控 (SL/TP/MaxLoss/Dust/Multi-TP)
-        2. [V45.38 修复] (步骤 2) 确保缺少 timestamp 的 "孤儿" 限价单也被取消。
-        3. [GEMINI V4 - 建议 2] (步骤 6) 移除滞后的事件触发器调用, 增加高级触发器 (Divergence, Squeeze)。
+        """启动 AlphaTrader 主循环。
+        1. (硬风控) (步骤 5) 执行所有高频风控 (SL/TP/MaxLoss/Dust/Multi-TP)
+        2. (步骤 2) 确保缺少 timestamp 的 "孤儿" 限价单也被取消。
+        3. [优化] (步骤 6) 扩展高级触发器 (Divergence, Squeeze) 以检查 *所有* 资产。
         """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
@@ -1100,13 +1091,13 @@ class AlphaTrader:
                 await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
             except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
         
-        # --- [V45.34 定义风控阈值] ---
+        # --- 定义风控阈值 ---
         MULTI_TP_STAGE_1_PERCENT = 0.04  # 4.0%
         MULTI_TP_STAGE_2_PERCENT = 0.10  # 10.0%
         MAX_LOSS_PERCENT = getattr(settings, 'MAX_LOSS_CUTOFF_PERCENT', 20.0) / 100.0
         DUST_MARGIN_USDT = 1.0
-        # --- [V45.36 新增超时阈值] ---
-        # [GEMINI V2 修复] 从 settings (config.py) 而非 futures_settings 读取
+        # --- 新增超时阈值 ---
+        # 从 settings (config.py) 而非 futures_settings 读取
         LIMIT_ORDER_TIMEOUT_MS = getattr(settings, 'AI_LIMIT_ORDER_TIMEOUT_SECONDS', 900) * 1000
         
         while True:
@@ -1120,7 +1111,7 @@ class AlphaTrader:
                     await asyncio.sleep(30) 
                     continue
                 
-                # --- [ V45.38 核心: 限价单超时清理 (已修复孤儿单) ] ---
+                # --- 限价单超时清理 (已修复孤儿单) ---
                 if self.is_live_trading and self.portfolio.pending_limit_orders:
                     now_ms = time.time() * 1000
                     orders_to_cancel = []
@@ -1131,7 +1122,6 @@ class AlphaTrader:
                             order_id = plan.get('order_id')
                             timestamp = plan.get('timestamp')
                             
-                            # --- [ V45.38 修复 ] ---
                             if not order_id:
                                 # 计划中没有 order_id, 无法取消。只能从本地清理。
                                 self.logger.warning(f"Pending order {symbol} 缺少 order_id，正在从本地清理...")
@@ -1145,7 +1135,6 @@ class AlphaTrader:
                                 orders_to_cancel.append((order_id, symbol))
                                 self.portfolio.pending_limit_orders.pop(symbol, None) # 立即从本地移除
                                 continue # 继续检查下一个
-                            # --- [ V45.38 修复结束 ] ---
                             
                             # (原有的时间检查逻辑)
                             if (now_ms - timestamp) > LIMIT_ORDER_TIMEOUT_MS:
@@ -1160,7 +1149,7 @@ class AlphaTrader:
                             
                     except Exception as e_timeout:
                         self.logger.error(f"限价单超时清理时发生错误: {e_timeout}", exc_info=True)
-                # --- [ V45.38 核心结束 ] ---
+                # --- 清理结束 ---
 
                 # 步骤 3: 获取 Tickers (用于高频风控检查)
                 tickers = {}
@@ -1173,7 +1162,7 @@ class AlphaTrader:
                 # 步骤 4: 记录状态 (可选)
                 # await self._log_portfolio_status()
                 
-                # 步骤 5: [V45.34 核心] 高频硬性风控检查 (每10秒)
+                # 步骤 5: 高频硬性风控检查 (每10秒)
                 if self.is_live_trading and tickers:
                     
                     positions_to_close = {} 
@@ -1281,36 +1270,47 @@ class AlphaTrader:
                             await asyncio.gather(*final_partial_tasks)
                             self.logger.info("Hard Partial TP actions executed.")
                 
-                # --- [ V45.34 风控结束 ] ---
+                # --- 风控结束 ---
 
                 # 步骤 6: 决定是否触发 AI (低频)
                 trigger_ai, reason, now = False, "", time.time(); interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS;
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
-                # --- [GEMINI V4 - 建议 2 (Advanced)] 触发器逻辑修改 ---
+                # --- 触发器逻辑 (高级) ---
                 if not trigger_ai:
-                    sym=self.symbols[0]; ohlcv_15m = [] # 只需要 15m K线
-                    try: 
-                        # 仅获取 15m K线 (用于所有事件触发器)
-                        ohlcv_15m = await self.exchange.fetch_ohlcv(sym, '15m', limit=150)
-                    except Exception as e_fetch: self.logger.error(f"Event check: Fetch OHLCV fail: {e_fetch}")
-                    
                     cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES * 60
                     
                     if now - self.last_event_trigger_ai_time > cooldown:
-                        # 按照优先级检查：
-                        # 1. 背离 (最强信号)
-                        event, ev_reason = await self._check_divergence(ohlcv_15m)
-                        # 2. 挤压 (重要模式)
-                        if not event: event, ev_reason = await self._check_ema_squeeze(ohlcv_15m)
-                        # 3. RSI 接近 (均值回归)
-                        if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m)
-                        # 4. BBands 接近 (均值回归)
-                        if not event: event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m)
+                        self.logger.info("Checking for advanced triggers (Divergence, Squeeze, etc.) across all symbols...")
                         
-                        if event: 
-                            trigger_ai, reason = True, ev_reason
-                # --- [GEMINI V4 修改结束] ---
+                        # [优化] 遍历所有 symbols, 而不仅仅是 [0]
+                        for sym in self.symbols:
+                            ohlcv_15m = []
+                            try: 
+                                ohlcv_15m = await self.exchange.fetch_ohlcv(sym, '15m', limit=150)
+                                if not ohlcv_15m: continue
+
+                                # 按照优先级检查：
+                                # 1. 背离 (最强信号)
+                                event, ev_reason = await self._check_divergence(ohlcv_15m)
+                                # 2. 挤压 (重要模式)
+                                if not event: event, ev_reason = await self._check_ema_squeeze(ohlcv_15m)
+                                # 3. RSI 接近 (均值回归)
+                                if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m)
+                                # 4. BBands 接近 (均值回归)
+                                if not event: event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m)
+                                
+                                if event: 
+                                    trigger_ai, reason = True, f"{sym}: {ev_reason}"
+                                    self.logger.info(f"Advanced trigger found for {sym}: {ev_reason}")
+                                    break # 找到一个事件就足以触发AI
+
+                            except Exception as e_fetch:
+                                self.logger.error(f"Event check for {sym} fail: {e_fetch}")
+                        
+                        if not trigger_ai:
+                             self.logger.info("No advanced triggers found.")
+                # --- 触发器逻辑结束 ---
                 
                 # 步骤 7: (安全地) 运行 AI 循环
                 if trigger_ai:
