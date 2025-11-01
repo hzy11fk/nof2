@@ -1,11 +1,11 @@
-# 文件: alpha_trader.py (完整优化版 - 混合策略)
+# 文件: alpha_trader.py (完整优化版 - 混合模型)
 # 1. 策略:
-#    - [默认] 规则 6: 默认禁止市价单，使用 1h/4h 慢周期。
-#    - [优化] 规则 6.3: 激活 ADX 20-25 震荡区，使用 15m BBands + 低风险。
-#    - [例外] 规则 8: "突破策略"，允许在 Squeeze+Volume 确认时使用市价单。
-#    - [优化] 规则 8.d: 增加 F&G 宏观否决权，防止在极端情绪时追高/杀跌。
+#    - [AI - Rule 6] AI 负责低频、高上下文的限价单 (LIMIT) 策略。
+#    - [Python - Rule 8] Python 负责高频、低延迟的市价单 (MARKET) 突破策略。
 # 2. 触发器:
-#    - [优化] start() 循环现在会检查 *所有* 资产的高级触发器 (Divergence, Squeeze)。
+#    - Rule 8 由 10 秒主循环高频触发 (由 config.py 开启)。
+#    - Rule 8 离场逻辑使用动态追踪止损。
+#    - AI 由定时器或高级事件 (背离等) 低频触发。
 
 import logging
 import asyncio
@@ -30,6 +30,10 @@ except ImportError:
 
 class AlphaTrader:
     
+    # --- [AI (Rule 6) 专用 PROMPT] ---
+    # 1. Rule 8 (突破) 已被完全移除。
+    # 2. Rule 1 被修改，AI 现在只被允许使用 LIMIT_BUY / LIMIT_SELL。
+    # 3. 移除了所有 BUY/SELL (市价) 订单模板和示例。
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -38,10 +42,10 @@ class AlphaTrader:
     Your discipline is demonstrated by strict adherence to the risk management rules below, which are your foundation for sustained profitability.
 
     **Core Mandates & Rules:**
-    1.  **Default Strategy: Limit Orders Only (CRITICAL):**
-        -   To prevent "chasing price," your **default** behavior is to be patient.
-        -   You are **forbidden** from using `BUY` or `SELL` (Market Orders) UNLESS the strict conditions in Rule 8 are met.
-        -   All default strategies (Trend Pullbacks, Mean Reversion) **must and only** use `LIMIT_BUY` or `LIMIT_SELL`.
+    1.  **Strategy: Limit Orders Only (CRITICAL):**
+        -   To prevent "chasing price," your **only** strategy is to be patient and trade pullbacks (Rule 6.1), mean-reversion (Rule 6.2), or chop-zones (Rule 6.3).
+        -   You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL`.
+        -   All fast market-order trades (Rule 8) are handled by a separate, high-frequency Python algorithm.
 
     2.  **Rule-Based Position Management:**
         For every open position, you MUST check its `InvalidATION_CONDITION`. If this condition is met, you MUST issue a `CLOSE` order. This is your top priority for existing positions.
@@ -55,7 +59,7 @@ class AlphaTrader:
     4.  **Risk Management Foundation (CRITICAL):**
         Profit is the goal, but capital preservation is the foundation.
         -   **AI's Task (Strategy):** Your job is to select the *risk parameters* based on your confidence, not to perform the final math. The Python system will perform all final calculations and safety checks.
-        -   **AI Must Provide (for ALL new orders: BUY, SELL, LIMIT_BUY, LIMIT_SELL):**
+        -   **AI Must Provide (for LIMIT_BUY, LIMIT_SELL):**
             1.  `"leverage": [e.g., 8]` (Choose appropriate leverage based on asset volatility, e.g., 5x-8x for SOL/DOGE, 10x-15x for BTC/ETH).
             2.  `"risk_percent": [e.g., 0.025]` (Dynamically choose a risk percentage of Total Equity. Example: Medium Confidence = 0.025 (2.5% Equity), High Confidence = 0.05 (5.0% Equity)).
         -   **System's Task (Calculation):** The Python system will automatically use your `risk_percent` and `Total Equity` to calculate the `final_desired_margin`, check it against `Available Cash`, and perform all hard checks (Min Margin 6 USDT, Min BTC Size 0.001). The order will be aborted by the system if any check fails.
@@ -66,7 +70,7 @@ class AlphaTrader:
             -   If opening a new position (e.g., SOL) would breach its group cap, you MUST ABORT the trade.
 
     5.  **Complete Trade Plans (Open/Add):**
-        Every new order (BUY/SELL/LIMIT) is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
+        Every new order (LIMIT) is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
         -   **Smarter Invalidation:** Your `invalidation_condition` MUST be based on a clear technical breakdown of the *original trade thesis*.
             -   *Trend Trade Example:* `Invalidation='1h Close below the EMA 50'`
             -   *Ranging Trade Example:* `InvalidATION='15m RSI breaks above 60'`
@@ -96,34 +100,12 @@ class AlphaTrader:
         -   **Greed (Index 55-75):** ...
         -   **Extreme Greed (Index > 75):** ...
 
-    8.  **Exception Rule: The "Breakout Mutation" Strategy (Market Order Allowed):**
-        You are authorized to use a Market Order (`BUY` or `SELL`) for an entry ONLY IF all the following 4 conditions are met simultaneously. This is a high-risk, high-reward "mutation" strategy and overrides Rule 1.
-        
-        a. **PRE-CONDITION (The Squeeze):** The market must be in a confirmed low-volatility state. This is defined as:
-           - The 1h ADX must be < 25 (i.e., in a "Ranging" or "Chop" market per Rule 6).
-           - OR, an `_check_ema_squeeze` event has just been triggered.
-        
-        b. **THE SIGNAL (The Break):** A fast, immediate price breakout must occur. e.g.:
-           - `5min_price` just crossed *above* the `15min_bb_upper`.
-           - `5min_price` just crossed *below* the `15min_bb_lower`.
-        
-        c. **THE CONFIRMATION (CRITICAL):** The breakout MUST be confirmed by a massive, simultaneous volume spike.
-           - `5min_volume_ratio` > 2.5 
-           - OR `15min_volume_ratio` > 2.0
-        
-        d. **THE VETO (The Filter):** The breakout must NOT be trading directly against the major long-term trend OR extreme macro sentiment.
-           - (e.g., Do not `BUY` if the 4h EMA 50 is strongly trending down).
-           - **Macro Veto (Rule 7):** The action MUST NOT contradict the Fear & Greed Index.
-             - Do NOT issue `BUY` (Long) if F&G is in "Extreme Greed" (> 75).
-             - Do NOT issue `SELL` (Short) if F&G is in "Extreme Fear" (< 25).
-
-        If all a, b, c, and d are true, you may issue a `BUY` or `SELL` market order, but you MUST still use the Python-calculated sizing (`risk_percent`).
+    (Rule 8 Removed - Handled by Python)
 
     **Multi-Timeframe Confirmation Requirement (CRITICAL):**
     - You MUST analyze and confirm signals across available timeframes: **5min, 15min, 1hour, and 4hour**.
-    - **High-Confidence Signal Definition:** A signal is only high-confidence when it aligns with the **Market State** (see Rule 6 or 8) and shows alignment across **at least 3** timeframes.
+    - **High-Confidence Signal Definition:** A signal is only high-confidence when it aligns with the **Market State** (see Rule 6) and shows alignment across **at least 3** timeframes.
     - **Timeframe Hierarchy:** Use longer timeframes (**4h, 1h**) to determine the **Market State** and **Overall Trend**. Use shorter timeframes (**15min, 5min**) for precise entry timing.
-    - **Volume Confirmation:** (See Rule 8.c for Breakouts).
     -   **Signal Veto Rule (CRITICAL):**
         -   Even if 4h/1h trend signals (e.g., ADX > 25) are strong, if the 15min timeframe shows a **strong opposing signal** (e.g., a bearish RSI divergence, a 15m MACD Dead Cross, or 15m EMA 20 has crossed below EMA 50), you **MUST ABORT** the trade (this applies to Rule 6).
         -   **Never** trade against 15m momentum when trying to enter on a pullback.
@@ -138,13 +120,12 @@ class AlphaTrader:
 
     1.  `"chain_of_thought"` (string): A multi-line string containing your detailed analysis in English. It MUST follow this template precisely:
         ```
-        My Current Assessment & Actions
+        My Current Assessment & Actions (Rule 6 - Limit Orders)
 
         Market State Analysis:
         - 1h ADX: [Value] | 4h ADX: [Value]
-        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Applying Rule 6: Ranging (ADX<20) / Applying Rule 6: Chop Zone (ADX 20-25) / Applying Rule 8: Breakout Mutation Watch (ADX<25 + Squeeze)]
+        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Applying Rule 6: Ranging (ADX<20) / Applying Rule 6: Chop Zone (ADX 20-25)]
         - Key Support/Resistance Levels: [Identify major S/R levels, including BB_Upper/Lower and recent_high/low for relevant symbols]
-        - Volume Analysis: [Assess volume confirmation, especially for Rule 8]
         - Market Sentiment: [MUST state the F&G Index value and its implication, e.g., "Extreme Greed (80)"]
 
         Portfolio Overview:
@@ -157,6 +138,7 @@ class AlphaTrader:
            Multi-Timeframe Analysis: [Brief assessment across 5m, 15m, 1h, 4h, mentioning ADX/BBands]
            
            Invalidation Check: [Check condition vs current data. If met, MUST issue CLOSE.]
+           (Note: Python-based Rule 8 trades use their own trailing stop logic and are not managed by you)
            
            Reversal & Profit Save Check:
            - [Is this profitable position (UPL > +1.0%) showing strong signs of reversal (e.g., 15m bearish divergence, 1h ADX weakening, F&G Extreme Greed)?]
@@ -176,11 +158,11 @@ class AlphaTrader:
 
         ... [Repeat for each open position] ...
 
-        New Trade Opportunities Analysis:
+        New Trade Opportunities Analysis (Rule 6 - Limit Orders Only):
         Available Margin for New Trades: [Calculate based on Total Equity and risk rules]
         Correlation Check: [Ensure new trades don't breach Rule 4 Correlation Control hard caps]
 
-        [Analyze opportunities based on BOTH Rule 6 (Default, Limit) and Rule 8 (Exception, Market)]
+        [Analyze opportunities based ONLY on Rule 6]
         
         [EXAMPLE - RULE 6 (TRENDING PULLBACK):]
         BTC Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
@@ -198,22 +180,13 @@ class AlphaTrader:
         - 15m Setup: Price is *approaching* 15m BB_Upper (@ 305.0). 15m RSI: 65.
         - Signal Confluence Score: 3/4 (15m RSI/BBands align) | Final Confidence: Low/Medium (Reduced Risk 1.5%) - **PREPARE LIMIT_SELL at 305.0 (Rule 6.3 Chop)**
 
-        [EXAMPLE - RULE 8 (BREAKOUT MUTATION):]
-        SOL Multi-Timeframe Assessment (Market State: Chop, 1h ADX=22):
-        - 8.a (Squeeze): TRUE. 1h ADX is 22 (< 25).
-        - 8.b (Signal): TRUE. 5min price just broke above 15min BB_Upper.
-        - 8.c (Volume): TRUE. 5min_volume_ratio is 2.8 (> 2.5).
-        - 8.d (Veto): TRUE. 4h trend is neutral, not opposing. Macro F&G is 50 (Neutral), no veto.
-        - Signal Confluence Score: 4/4 | Final Confidence: High - **EXECUTE BUY (Market) (Rule 8)**
-
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
         ```
 
     2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding all.
 
     **Order Object Rules:**
-    -   **To Open Market (LONG - Rule 8 Only):**`{{"action": "BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Market Order (Rule 8). Leverage: [...]. Risk: [...]. Squeeze+Volume Confirmed."}}`
-    -   **To Open Market (SHORT - Rule 8 Only):**`{{"action": "SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Market Order (Rule 8). Leverage: [...]. Risk: [...]. Squeeze+Volume Confirmed."}}`
+    (Market Order Templates Removed)
     -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Support]"}}`
     -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Resistance]"}}`
     -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
@@ -279,8 +252,9 @@ class AlphaTrader:
         """
         引入 asyncio.Semaphore 来限制并发请求，防止因 API 频率限制导致的数据缺失。
         确保 '1h' 变为 '1hour'，'5m' 变为 '5min'，与 _build_prompt 严格一致。
+        [优化] 新增 ATR 计算，供 Rule 8 止损使用。
         """
-        self.logger.info("Gathering multi-TF market data (5m, 15m, 1h, 4h) + ADX/BBands (Manual Calc)...")
+        self.logger.info("Gathering multi-TF market data (5m, 15m, 1h, 4h) + Indicators (Manual Calc)...")
         market_indicators_data: Dict[str, Dict[str, Any]] = {}
         fetched_tickers: Dict[str, Any] = {}
         
@@ -356,10 +330,6 @@ class AlphaTrader:
                             
                         # 关键修复：确保 '1h' -> '1hour', '5m' -> '5min'
                         prefix = f"{timeframe.replace('m', 'min').replace('h', 'hour')}_"
-                        # '5m' -> '5min_'
-                        # '15m' -> '15min_'
-                        # '1h' -> '1hour_'
-                        # '4h' -> '4hour_'
 
                         # 1. 手动计算 ADX
                         if len(df) >= 28: # (14*2)
@@ -373,6 +343,11 @@ class AlphaTrader:
                                 tr3 = pd.DataFrame(abs(low - close.shift(1)))
                                 tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
                                 atr = tr.ewm(alpha=1/period, adjust=False).mean()
+                                
+                                # [优化] 存储 ATR
+                                if not atr.empty:
+                                    market_indicators_data[symbol][f'{prefix}atr_14'] = atr.iloc[-1]
+                                
                                 plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, 1e-9))
                                 minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, 1e-9))
                                 dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-9)
@@ -380,7 +355,7 @@ class AlphaTrader:
                                 if not adx.empty:
                                     market_indicators_data[symbol][f'{prefix}adx_14'] = adx.iloc[-1]
                             except Exception as e:
-                                self.logger.warning(f"Manual ADX calc failed for {symbol} {timeframe}: {e}", exc_info=False)
+                                self.logger.warning(f"Manual ADX/ATR calc failed for {symbol} {timeframe}: {e}", exc_info=False)
 
                         # 2. 手动计算 BBands
                         if len(df) >= 20:
@@ -471,13 +446,14 @@ class AlphaTrader:
             prompt += f"\n# {symbol_short} Multi-TF Analysis\n"
             prompt += f"Price: {safe_format(d.get('current_price'), 2)}\n"
             
-            # [优化] 修复: 确保列表与 '...min' 和 '...hour' 键名匹配
+            # [修复] 确保列表与 '...min' 和 '...hour' 键名匹配
             timeframes = ['5min', '15min', '1hour', '4hour']
             
             for tf in timeframes:
                 prompt += f"\n[{tf.upper()}]\n"
                 prompt += f" RSI:{safe_format(d.get(f'{tf}_rsi_14'), 0, is_rsi=True)}|"
                 prompt += f" ADX:{safe_format(d.get(f'{tf}_adx_14'), 0, is_rsi=True)}|" 
+                prompt += f" ATR:{safe_format(d.get(f'{tf}_atr_14'), 4)}|"
                 prompt += f"MACD:{safe_format(d.get(f'{tf}_macd'), 4)}|"
                 prompt += f"Sig:{safe_format(d.get(f'{tf}_macd_signal'), 4)}|"
                 prompt += f"Hist:{safe_format(d.get(f'{tf}_macd_hist'), 4)}\n"
@@ -513,8 +489,9 @@ class AlphaTrader:
     async def _execute_decisions(self, decisions: list, market_data: Dict[str, Dict[str, Any]]):
         """
         混合策略执行:
-        1. 重新添加 "BUY"/"SELL" (市价开仓) 逻辑，以支持 Rule 8 突破。
-        2. 将 Python 端的安全计算 (risk_percent -> size) 应用于所有开仓类型。
+        - "BUY"/"SELL" (市价开仓) 由 Python Rule 8 调用。
+        - "LIMIT_BUY"/"LIMIT_SELL" 由 AI Rule 6 调用。
+        - 将 Python 端的安全计算 (risk_percent -> size) 应用于所有开仓类型。
         """
         
         # 这些是硬性风控规则
@@ -539,7 +516,7 @@ class AlphaTrader:
                     if self.is_live_trading: await self.portfolio.live_close(symbol, reason=reason)
                     else: await self.portfolio.paper_close(symbol, current_price, reason=reason)
                 
-                # --- 市价开仓 (BUY / SELL) - 仅用于 Rule 8 ---
+                # --- 市价开仓 (BUY / SELL) - 仅由 Python Rule 8 使用 ---
                 elif action in ["BUY", "SELL"]:
                     if not self.is_live_trading:
                         self.logger.warning(f"模拟盘：跳过 {action} 市价单 (模拟盘仅支持限价单转换)。"); continue
@@ -551,11 +528,11 @@ class AlphaTrader:
                     price_to_calc = current_price # 市价单使用当前价格计算
 
                     try:
-                        # 1. 从 AI 获取参数
+                        # 1. 从 AI/Python 获取参数
                         leverage = int(order.get('leverage'))
                         risk_percent = float(order.get('risk_percent'))
                         stop_loss = float(order.get('stop_loss'))
-                        take_profit = float(order.get('take_profit'))
+                        take_profit = order.get('take_profit') # 可以为 None (用于追踪止损)
                         
                         if risk_percent <= 0 or risk_percent > 0.5: raise ValueError(f"无效的 risk_percent: {risk_percent}")
                         if leverage <= 0 or leverage > 100: raise ValueError(f"无效的 leverage: {leverage}")
@@ -603,11 +580,11 @@ class AlphaTrader:
                         leverage, 
                         reason=reason, 
                         stop_loss=stop_loss, 
-                        take_profit=take_profit, 
+                        take_profit=take_profit, # 传入 None 或具体数值
                         invalidation_condition=invalidation_condition
                     )
 
-                # --- 限价开仓 (LIMIT_BUY / LIMIT_SELL) ---
+                # --- 限价开仓 (LIMIT_BUY / LIMIT_SELL) - 仅由 AI Rule 6 使用 ---
                 elif action in ["LIMIT_BUY", "LIMIT_SELL"]:
                     
                     if not limit_price_from_ai or float(limit_price_from_ai) <= 0:
@@ -620,7 +597,6 @@ class AlphaTrader:
                             price_to_calc = float(limit_price_from_ai)
                             if (action == 'LIMIT_BUY' and current_price <= price_to_calc) or (action == 'LIMIT_SELL' and current_price >= price_to_calc):
                                 self.logger.warning(f"模拟盘：价格 {current_price} 有利，转为市价单。")
-                                # 注意：模拟盘我们仍然使用 AI 的 risk_percent
                                 leverage = int(order.get('leverage'))
                                 risk_percent = float(order.get('risk_percent'))
                                 stop_loss = float(order.get('stop_loss'))
@@ -761,12 +737,6 @@ class AlphaTrader:
             except Exception as e: 
                 self.logger.error(f"处理 AI 指令时意外错误: {order}. Err: {e}", exc_info=True)
 
-    # 移除滞后的触发器 (MACD 交叉)
-    # 函数 _check_significant_indicator_change 已被删除
-    
-    # 移除滞后的触发器 (波动率尖峰)
-    # 函数 _check_market_volatility_spike 已被删除
-
 
     async def _check_and_execute_hard_stops(self):
         """[仅模拟盘] 检查并执行硬止损/止盈"""
@@ -790,7 +760,161 @@ class AlphaTrader:
         return len(to_close) > 0
 
     
-    # 新增 _check_divergence (RSI 背离) 触发器
+    # [新增] Python Rule 8 检查器
+    async def _check_python_rule_8(self, market_data: Dict[str, Dict[str, Any]]) -> list:
+        """
+        在 Python 中高频执行 Rule 8 检查 (每 10 秒)。
+        这将绕过 AI 的 1 分钟延迟。
+        使用 config.py 中的设置。
+        """
+        # [配置] 检查 Rule 8 总开关
+        if not settings.ENABLE_BREAKOUT_MODIFIER: #
+            return []
+            
+        orders_to_execute = []
+        
+        # 从 portfolio 获取当前仓位，避免 HFT 和 AI 冲突
+        open_positions = self.portfolio.position_manager.get_all_open_positions()
+        pending_limits = self.portfolio.pending_limit_orders
+
+        # 定义 Rule 8 的定量规则 (来自原 Prompt)
+        R8_ADX_MAX = 25.0 # (原 Prompt: 1h ADX < 25)
+        R8_VOL_RATIO_5M = 2.5 # (原 Prompt: 5min_volume_ratio > 2.5)
+        R8_VOL_RATIO_15M = 2.0 # (原 Prompt: 15min_volume_ratio > 2.0)
+        
+        # [配置] 使用 config.py 中的风险和杠杆设置
+        leverage = futures_settings.FUTURES_LEVERAGE #
+        risk_percent = futures_settings.FUTURES_RISK_PER_TRADE_PERCENT / 100.0 #
+
+        for symbol in self.symbols:
+            # 状态管理：如果已有仓位，Rule 8 (Python) 不应干预
+            if symbol in open_positions:
+                continue
+            
+            # 状态管理：如果已有挂单，Rule 8 也不应干预 (防止与 Rule 6 冲突)
+            if symbol in pending_limits:
+                continue
+
+            data = market_data.get(symbol)
+            if not data: continue
+
+            try:
+                # 提取 Rule 8 所需的所有数据
+                price = data.get('current_price')
+                adx_1h = data.get('1hour_adx_14')
+                bb_upper_15m = data.get('15min_bb_upper')
+                bb_lower_15m = data.get('15min_bb_lower')
+                vol_ratio_5m = data.get('5min_volume_ratio')
+                vol_ratio_15m = data.get('15min_volume_ratio')
+                ema_50_4h = data.get('4hour_ema_50')
+                
+                # 检查数据是否完整
+                if not all([price, adx_1h, bb_upper_15m, bb_lower_15m, vol_ratio_5m, vol_ratio_15m, ema_50_4h]):
+                    self.logger.info(f"Rule 8 Skipping {symbol}: Missing key data.")
+                    continue
+
+                # --- 执行 Rule 8 逻辑 (a, b, c, d) ---
+                
+                # a. PRE-CONDITION (Squeeze)
+                if not (adx_1h < R8_ADX_MAX):
+                    continue # 不处于 Squeeze 状态
+
+                # c. CONFIRMATION (Volume)
+                volume_confirmed = (vol_ratio_5m > R8_VOL_RATIO_5M) or (vol_ratio_15m > R8_VOL_RATIO_15M)
+                if not volume_confirmed:
+                    continue # 成交量未确认
+
+                # d. VETO (Macro)
+                fng_value = self.fng_data.get('value', 50)
+                
+                # b. SIGNAL (Break) - 检查做多和做空
+                
+                action = None
+                
+                # --- 检查做多 (BUY) ---
+                if price > bb_upper_15m:
+                    # d. VETO (Trend & Macro)
+                    if price < ema_50_4h: # 趋势否决 (价格低于 4h EMA 50)
+                        self.logger.info(f"Rule 8 (Py) BUY Veto (Trend): {symbol}")
+                        continue
+                    if fng_value > 75: # 宏观否决 (极度贪婪)
+                        self.logger.info(f"Rule 8 (Py) BUY Veto (F&G): {symbol}")
+                        continue
+                    action = "BUY"
+
+                # --- 检查做空 (SELL) ---
+                elif price < bb_lower_15m:
+                    # d. VETO (Trend & Macro)
+                    if price > ema_50_4h: # 趋势否决 (价格高于 4h EMA 50)
+                        self.logger.info(f"Rule 8 (Py) SELL Veto (Trend): {symbol}")
+                        continue
+                    if fng_value < 25: # 宏观否决 (极度恐惧)
+                        self.logger.info(f"Rule 8 (Py) SELL Veto (F&G): {symbol}")
+                        continue
+                    action = "SELL"
+
+                # --- 构建订单 ---
+                if action:
+                    self.logger.warning(f"RULE 8 (Python): {action} Signal for {symbol}")
+                    order = self._build_python_order(
+                        symbol, 
+                        action, 
+                        risk_percent, 
+                        leverage, 
+                        price, 
+                        market_data.get(symbol, {})
+                    )
+                    if order:
+                        orders_to_execute.append(order)
+
+            except Exception as e:
+                self.logger.error(f"Rule 8 (Python) check failed for {symbol}: {e}")
+                
+        return orders_to_execute
+
+    # [新增] Python Rule 8 订单构建器
+    def _build_python_order(self, symbol: str, action: str, risk: float, lev: int, price: float, symbol_data: Dict) -> Optional[Dict]:
+        """
+        为 Python Rule 8 构建一个标准的订单对象。
+        使用 config.py 中的 ATR 设置 来计算止损。
+        止盈(TP) 为 None，以激活追踪止损逻辑。
+        """
+        
+        stop_loss = 0.0
+        
+        # [配置] 使用 ATR 设置止损
+        if settings.USE_ATR_FOR_INITIAL_STOP: #
+            # 我们使用 1h ATR 作为默认的止损基准
+            atr_1h = symbol_data.get('1hour_atr_14')
+            if not atr_1h or atr_1h <= 0:
+                self.logger.warning(f"Rule 8: Missing 1h ATR for {symbol}. Using 2% static SL.")
+                sl_pct = 0.02 # 备用静态止损
+                stop_loss = price * (1 - sl_pct) if action == "BUY" else price * (1 + sl_pct)
+            else:
+                multiplier = futures_settings.INITIAL_STOP_ATR_MULTIPLIER #
+                stop_loss = price - (atr_1h * multiplier) if action == "BUY" else price + (atr_1h * multiplier)
+        else:
+            # 备用静态止损
+            sl_pct = 0.02 
+            stop_loss = price * (1 - sl_pct) if action == "BUY" else price * (1 + sl_pct)
+
+        if stop_loss <= 0:
+            self.logger.error(f"Rule 8: Invalid SL calculated for {symbol} (SL={stop_loss}). Aborting order.")
+            return None
+
+        return {
+            "action": action,
+            "symbol": symbol,
+            "leverage": lev,
+            "risk_percent": risk,
+            "take_profit": None, # 关键: 设置为 None, 激活追踪止损
+            "stop_loss": stop_loss,
+            "invalidation_condition": "Python Rule 8", # "胶水" - 用于在风控循环中识别
+            "reasoning": f"Python Rule 8 ({action}). ATR SL @ {stop_loss:.4f}"
+        }
+
+
+    # [新增] RSI 背离
     async def _check_divergence(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m K线上的 RSI 背离 (预测性触发)。
@@ -820,32 +944,20 @@ class AlphaTrader:
             older_window = df.iloc[-30:-5] # 之前的 25 根 K 线 (-30 到 -5)
 
             # --- 1. 检查看跌背离 (Bearish Divergence) ---
-            # 价格：最近创了新高
             recent_high = recent_window['h'].max()
             recent_high_rsi = recent_window.loc[recent_window['h'].idxmax()]['rsi']
-            
-            # 价格：之前的高点
             older_high = older_window['h'].max()
             older_high_rsi = older_window.loc[older_window['h'].idxmax()]['rsi']
-
-            # 条件: 价格创新高 (Recent > Older) 且 RSI 创新低 (Recent < Older)
             if recent_high > older_high and recent_high_rsi < older_high_rsi:
-                # 检查是否刚发生 (避免重复触发)
                 if df['h'].iloc[-1] == recent_high or df['h'].iloc[-2] == recent_high:
                     return True, "Event: 15m Bearish RSI Divergence"
 
             # --- 2. 检查看涨背离 (Bullish Divergence) ---
-            # 价格：最近创了新低
             recent_low = recent_window['l'].min()
             recent_low_rsi = recent_window.loc[recent_window['l'].idxmin()]['rsi']
-            
-            # 价格：之前的低点
             older_low = older_window['l'].min()
             older_low_rsi = older_window.loc[older_window['l'].idxmin()]['rsi']
-
-            # 条件: 价格创新低 (Recent < Older) 且 RSI 创新高 (Recent > Older)
             if recent_low < older_low and recent_low_rsi > older_low_rsi:
-                # 检查是否刚发生 (避免重复触发)
                 if df['l'].iloc[-1] == recent_low or df['l'].iloc[-2] == recent_low:
                     return True, "Event: 15m Bullish RSI Divergence"
                 
@@ -853,15 +965,14 @@ class AlphaTrader:
         except Exception as e:
             self.logger.error(f"Err check divergence: {e}", exc_info=False)
             return False, ""
-    # --- 背离检查结束 ---
 
-    # 新增 _check_ema_squeeze (EMA 挤压) 触发器
+    # [新增] EMA 挤压
     async def _check_ema_squeeze(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m EMA(20) 和 EMA(50) 是否进入 "挤压" 状态 (预测性触发)。
         """
         try:
-            if len(ohlcv_15m) < 60: # 需要 EMA(50) 的完整数据 + 几根 K 线
+            if len(ohlcv_15m) < 60: 
                 return False, ""
                 
             df = pd.DataFrame(ohlcv_15m, columns=['ts','o','h','l','c','v'])
@@ -873,19 +984,13 @@ class AlphaTrader:
             df['ema50'] = ta.ema(df['c'], 50)
             df.dropna(inplace=True)
             
-            if len(df) < 5: # 需要几根 K 线来比较历史
+            if len(df) < 5: 
                 return False, ""
-
-            # 计算两条 EMA 之间的百分比差异
-            df['ema_diff_pct'] = abs(df['ema20'] - df['ema50']) / df['ema50']
-
-            # 挤压阈值：例如，两条均线相差小于 0.5%
-            SQUEEZE_THRESHOLD = 0.005 # 0.5%
             
+            df['ema_diff_pct'] = abs(df['ema20'] - df['ema50']) / df['ema50']
+            SQUEEZE_THRESHOLD = 0.005 # 0.5%
             diff_curr = df['ema_diff_pct'].iloc[-1]
             diff_prev = df['ema_diff_pct'].iloc[-2]
-
-            # 检查是否 *刚刚进入* 挤压状态 (边缘触发)
             is_squeezing_now = (diff_curr < SQUEEZE_THRESHOLD)
             was_squeezing_before = (diff_prev < SQUEEZE_THRESHOLD)
             
@@ -897,13 +1002,11 @@ class AlphaTrader:
         except Exception as e:
             self.logger.error(f"Err check EMA squeeze: {e}", exc_info=False)
             return False, ""
-    # --- 挤压检查结束 ---
 
-
+    # [新增] RSI 阈值
     async def _check_rsi_threshold_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m RSI 是否 *接近* 超买/超卖 (预测性触发)。
-        (此函数被保留)
         """
         try:
             if len(ohlcv_15m) < 16: 
@@ -921,11 +1024,9 @@ class AlphaTrader:
             rsi_prev = rsi_df.iloc[-2] 
             rsi_curr = rsi_df.iloc[-1] 
             
-            # 检查接近超买 (从下往上接近 70, 阈值设为 68)
             if rsi_prev < 68 and rsi_curr >= 68:
                 return True, "Event: 15m RSI *Approaching* Overbought (68)"
                 
-            # 检查接近超卖 (从上往下接近 30, 阈值设为 32)
             if rsi_prev > 32 and rsi_curr <= 32:
                 return True, "Event: 15m RSI *Approaching* Oversold (32)"
                 
@@ -934,10 +1035,10 @@ class AlphaTrader:
             self.logger.error(f"Err check RSI threshold: {e}", exc_info=False)
             return False, ""
 
+    # [新增] BBands 阈值
     async def _check_bollinger_band_breach(self, ohlcv_15m: list) -> Tuple[bool, str]:
         """
         检查 15m K线是否 *接近* 布林带 (预测性触发)。
-        (此函数被保留)
         """
         try:
             if len(ohlcv_15m) < 22: 
@@ -965,15 +1066,11 @@ class AlphaTrader:
             close_curr = closes.iloc[-1]
             upper_curr = upper_band.iloc[-1]
             lower_curr = lower_band.iloc[-1]
-
-            # 定义 "接近" 为 0.2% (可调)
             APPROACH_PERCENT = 0.002 
             
-            # 检查是否接近上轨 (价格在上轨的 99.8% 和 101% 之间)
             if (upper_curr * (1.0 - APPROACH_PERCENT)) < close_curr < (upper_curr * (1.0 + APPROACH_PERCENT)):
                 return True, "Event: 15m Price *Approaching* BB_Upper"
                 
-            # 检查是否接近下轨 (价格在下轨的 99% 和 100.2% 之间)
             if (lower_curr * (1.0 - APPROACH_PERCENT)) < close_curr < (lower_curr * (1.0 + APPROACH_PERCENT)):
                 return True, "Event: 15m Price *Approaching* BB_Lower"
                 
@@ -1008,8 +1105,6 @@ class AlphaTrader:
                     }
                     self.last_fng_fetch_time = now
                     self.logger.info(f"Fetched new F&G Index: {self.fng_data['value_classification']} ({self.fng_data['value']})")
-                else:
-                    self.logger.warning("F&G API response was successful but empty or malformed.")
             else:
                 self.logger.error(f"Failed to fetch F&G Index. Status code: {response.status_code}")
         
@@ -1019,22 +1114,20 @@ class AlphaTrader:
             self.logger.error(f"Unexpected error updating F&G Index: {e}", exc_info=True)
 
 
-    async def run_cycle(self):
-        """AI 决策主循环 (AI 现在会发出 LIMIT_BUY/SELL)"""
-        self.logger.info("="*20 + " Starting AI Cycle " + "="*20)
+    async def run_cycle(self, market_data: Dict[str, Dict[str, Any]], tickers: Dict):
+        """[AI 决策主循环 (Rule 6 - Limit Orders Only)]"""
+        self.logger.info("="*20 + " Starting AI Cycle (Rule 6 - Limit Orders) " + "="*20)
         self.invocation_count += 1
         if not self.is_live_trading: await self._check_and_execute_hard_stops()
 
         # 1. 获取数据 & 构建 Prompt
-        market_data, tickers = await self._gather_all_market_data()
+        # [修改] 数据已从 start() 循环传入
         portfolio_state = self.portfolio.get_state_for_prompt(tickers)
         
-        # 在构建 prompt 之前更新 F&G
-        await self._update_fear_and_greed_index()
-        
+        # [修改] F&G 已在 start() 循环中更新
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
-        # 2. 格式化 System Prompt
+        # 2. 格式化 System Prompt (已移除 Rule 8)
         try:
             system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
                 symbol_list=self.formatted_symbols,
@@ -1042,7 +1135,7 @@ class AlphaTrader:
             )
         except KeyError as e: self.logger.error(f"Format System Prompt failed: {e}"); return
 
-        self.logger.info("Getting AI decision...")
+        self.logger.info("Getting AI decision (Rule 6)...")
         # 3. 获取 AI 决策
         ai_decision = await self._get_ai_decision(system_prompt, user_prompt_string)
 
@@ -1062,13 +1155,12 @@ class AlphaTrader:
                 self.logger.info(f"Extracted Chinese summary: '{summary_for_ui[:50]}...'")
             else:
                 summary_for_ui = "AI 摘要为空。"
-                self.logger.warning("AI CoT 'In summary,' found but content is empty.")
         else:
             self.logger.warning("AI CoT 未找到 'In summary,' 关键字。")
         
         self.last_strategy_summary = summary_for_ui
 
-        # 5. 执行决策
+        # 5. 执行决策 (仅 Rule 6 LIMIT 订单)
         if orders:
             self.logger.info(f"AI proposed {len(orders)} order(s), executing...")
             await self._execute_decisions(orders, market_data)
@@ -1078,10 +1170,10 @@ class AlphaTrader:
         self.logger.info("="*20 + " AI Cycle Finished " + "="*20 + "\n")
 
     async def start(self):
-        """启动 AlphaTrader 主循环。
-        1. (硬风控) (步骤 5) 执行所有高频风控 (SL/TP/MaxLoss/Dust/Multi-TP)
-        2. (步骤 2) 确保缺少 timestamp 的 "孤儿" 限价单也被取消。
-        3. [优化] (步骤 6) 扩展高级触发器 (Divergence, Squeeze) 以检查 *所有* 资产。
+        """启动 AlphaTrader 主循环 (混合模型)。
+        1. [高频] Python Rule 8 (突破) 在 10 秒循环中运行。
+        2. [高频] 风控 (SL/TP/追踪) 在 10 秒循环中运行。
+        3. [低频] AI Rule 6 (限价) 在定时器或事件触发时运行。
         """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
@@ -1094,11 +1186,9 @@ class AlphaTrader:
         # --- 定义风控阈值 ---
         MULTI_TP_STAGE_1_PERCENT = 0.04  # 4.0%
         MULTI_TP_STAGE_2_PERCENT = 0.10  # 10.0%
-        MAX_LOSS_PERCENT = getattr(settings, 'MAX_LOSS_CUTOFF_PERCENT', 20.0) / 100.0
+        MAX_LOSS_PERCENT = getattr(settings, 'MAX_LOSS_CUTOFF_PERCENT', 20.0) / 100.0 #
         DUST_MARGIN_USDT = 1.0
-        # --- 新增超时阈值 ---
-        # 从 settings (config.py) 而非 futures_settings 读取
-        LIMIT_ORDER_TIMEOUT_MS = getattr(settings, 'AI_LIMIT_ORDER_TIMEOUT_SECONDS', 900) * 1000
+        LIMIT_ORDER_TIMEOUT_MS = getattr(settings, 'AI_LIMIT_ORDER_TIMEOUT_SECONDS', 900) * 1000 #
         
         while True:
             try:
@@ -1111,63 +1201,54 @@ class AlphaTrader:
                     await asyncio.sleep(30) 
                     continue
                 
-                # --- 限价单超时清理 (已修复孤儿单) ---
+                # 步骤 2: 限价单超时清理 (AI Rule 6)
                 if self.is_live_trading and self.portfolio.pending_limit_orders:
                     now_ms = time.time() * 1000
                     orders_to_cancel = []
-                    
                     try:
-                        # 迭代副本以安全删除
                         for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
                             order_id = plan.get('order_id')
                             timestamp = plan.get('timestamp')
-                            
                             if not order_id:
-                                # 计划中没有 order_id, 无法取消。只能从本地清理。
                                 self.logger.warning(f"Pending order {symbol} 缺少 order_id，正在从本地清理...")
                                 self.portfolio.pending_limit_orders.pop(symbol, None)
                                 continue
-
                             if not timestamp:
-                                # 有 order_id 但没有 timestamp (旧版留下的孤儿单)
-                                # 立即取消，不检查时间
                                 self.logger.warning(f"!!! ORPHAN TIMEOUT !!! {symbol} (ID: {order_id}) 缺少 timestamp。立即取消...")
                                 orders_to_cancel.append((order_id, symbol))
-                                self.portfolio.pending_limit_orders.pop(symbol, None) # 立即从本地移除
-                                continue # 继续检查下一个
-                            
-                            # (原有的时间检查逻辑)
+                                self.portfolio.pending_limit_orders.pop(symbol, None) 
+                                continue
                             if (now_ms - timestamp) > LIMIT_ORDER_TIMEOUT_MS:
                                 self.logger.warning(f"!!! LIMIT ORDER TIMEOUT !!! {symbol} (ID: {order_id}) 已超时 {LIMIT_ORDER_TIMEOUT_MS / 1000}s。正在取消...")
                                 orders_to_cancel.append((order_id, symbol))
-                                self.portfolio.pending_limit_orders.pop(symbol, None) # 立即从本地移除
-
+                                self.portfolio.pending_limit_orders.pop(symbol, None) 
                         if orders_to_cancel:
                             cancel_tasks = [self.client.cancel_order(oid, sym) for oid, sym in orders_to_cancel]
-                            await asyncio.gather(*cancel_tasks, return_exceptions=True) # 忽略错误 (例如 OrderNotFound)
+                            await asyncio.gather(*cancel_tasks, return_exceptions=True)
                             self.logger.info(f"成功取消 {len(orders_to_cancel)} 个超时/孤儿订单。")
-                            
                     except Exception as e_timeout:
                         self.logger.error(f"限价单超时清理时发生错误: {e_timeout}", exc_info=True)
-                # --- 清理结束 ---
 
-                # 步骤 3: 获取 Tickers (用于高频风控检查)
-                tickers = {}
-                try:
-                    if not hasattr(self, 'client'): self.client = self.portfolio.client
-                    tickers = await self.client.fetch_tickers(self.symbols)
-                except Exception as e_tick:
-                    self.logger.error(f"Main loop fetch_tickers (for risk check) failed: {e_tick}", exc_info=False)
+                # 步骤 3: [高频] 获取数据 (为 Rule 8 和风控)
+                await self._update_fear_and_greed_index()
+                market_data, tickers = await self._gather_all_market_data()
+
+                # 步骤 4: [高频] Python Rule 8 执行 (如果开启)
+                if settings.ENABLE_BREAKOUT_MODIFIER: #
+                    if self.is_live_trading:
+                        rule8_orders = await self._check_python_rule_8(market_data)
+                        if rule8_orders:
+                            self.logger.warning(f"🔥 Python Rule 8 TRIGGERED! Executing {len(rule8_orders)} orders.")
+                            await self._execute_decisions(rule8_orders, market_data)
+                    else:
+                        self.logger.info("Python Rule 8 is enabled but in PAPER mode, skipping execution.")
                 
-                # 步骤 4: 记录状态 (可选)
-                # await self._log_portfolio_status()
-                
-                # 步骤 5: 高频硬性风控检查 (每10秒)
+                # 步骤 5: [高频] 硬性风控检查 (每10秒)
                 if self.is_live_trading and tickers:
-                    
                     positions_to_close = {} 
-                    positions_to_partial_close = [] 
-                    
+                    positions_to_partial_close = []
+                    sl_update_tasks = [] # [新增] 用于 Rule 8 追踪止损
+
                     open_symbols = set(self.portfolio.position_manager.get_all_open_positions().keys())
                     for symbol in list(self.tp_counters.keys()):
                         if symbol not in open_symbols:
@@ -1185,7 +1266,7 @@ class AlphaTrader:
                             size = state.get('total_size')
                             side = state.get('side')
                             lev = state.get('leverage')
-                            margin = state.get('margin') 
+                            margin = state.get('margin')
                             
                             if not all([entry, size, side, lev, margin]) or lev <= 0 or entry <= 0 or margin <= 0:
                                 self.logger.warning(f"Risk Check: Skipping {symbol}, invalid state data.")
@@ -1194,60 +1275,67 @@ class AlphaTrader:
                             upl = (price - entry) * size if side == 'long' else (entry - price) * size
                             rate = upl / margin 
 
-                            # 规则 1: 最大亏损 (Max Loss)
+                            # --- [核心] 识别仓位类型 ---
+                            inval_cond = state.get('invalidation_condition', '')
+                            is_rule_8_trade = "Python Rule 8" in inval_cond
+
+                            # --- 规则 A: Python Rule 8 动态追踪止损 ---
+                            if is_rule_8_trade:
+                                trail_percent = settings.BREAKOUT_TRAIL_STOP_PERCENT #
+                                current_sl = state.get('ai_suggested_stop_loss', 0.0)
+                                new_sl = 0.0
+                                
+                                if side == 'long': new_sl = price * (1 - trail_percent)
+                                else: new_sl = price * (1 + trail_percent)
+                                
+                                # 止损只能前进，不能后退
+                                if (side == 'long' and new_sl > current_sl) or (side == 'short' and new_sl < current_sl and new_sl > 0):
+                                    self.logger.warning(f"!!! RULE 8 TRAIL STOP !!! {symbol} | Moving SL to {new_sl:.4f}")
+                                    sl_update_tasks.append(
+                                        self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Rule 8 Trail Stop")
+                                    )
+                                continue # Rule 8 仓位不参与下面的 AI 规则
+
+                            # --- 规则 B: AI (Rule 6) 仓位管理 ---
+
+                            # 规则 B.1: 最大亏损 (Max Loss)
                             if rate <= -MAX_LOSS_PERCENT:
                                 reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
-                                if symbol not in positions_to_close:
-                                    self.logger.warning(f"!!! HARD STOP: MAX LOSS !!! {symbol} | R {rate:.2%} <= {-MAX_LOSS_PERCENT:.0%}")
-                                    positions_to_close[symbol] = reason
+                                if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                 continue 
 
-                            # 规则 2: 粉尘仓位 (Dust)
+                            # 规则 B.2: 粉尘仓位 (Dust)
                             if margin < DUST_MARGIN_USDT:
                                 reason = f"Dust Close (<{DUST_MARGIN_USDT:.1f}U)"
-                                if symbol not in positions_to_close:
-                                    self.logger.warning(f"!!! HARD STOP: DUST !!! {symbol} | Margin {margin:.2f} < {DUST_MARGIN_USDT:.1f}U")
-                                    positions_to_close[symbol] = reason
+                                if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                 continue 
 
-                            # 规则 3: AI 设置的止损 (AI SL)
+                            # 规则 B.3: AI 设置的止损 (AI SL)
                             ai_sl = state.get('ai_suggested_stop_loss')
                             if ai_sl and ai_sl > 0:
                                 if (side == 'long' and price <= ai_sl) or (side == 'short' and price >= ai_sl):
                                     reason = f"AI SL Hit ({ai_sl:.4f})"
-                                    if symbol not in positions_to_close:
-                                        self.logger.warning(f"!!! HARD STOP: AI SL !!! {symbol} | Price {price:.4f} hit SL {ai_sl:.4f}")
-                                        positions_to_close[symbol] = reason
+                                    if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                     continue 
 
-                            # 规则 4: AI 设置的止盈 (AI TP)
+                            # 规则 B.4: AI 设置的止盈 (AI TP)
                             ai_tp = state.get('ai_suggested_take_profit')
                             if ai_tp and ai_tp > 0:
                                 if (side == 'long' and price >= ai_tp) or (side == 'short' and price <= ai_tp):
                                     reason = f"AI TP Hit ({ai_tp:.4f})"
-                                    if symbol not in positions_to_close:
-                                        self.logger.warning(f"!!! HARD STOP: AI TP !!! {symbol} | Price {price:.4f} hit TP {ai_tp:.4f}")
-                                        positions_to_close[symbol] = reason
+                                    if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                     continue 
 
-                            # 规则 5: 多阶段止盈 (Multi-Stage TP)
+                            # 规则 B.5: 多阶段止盈 (Multi-Stage TP)
                             self.tp_counters.setdefault(symbol, {'stage1': 0, 'stage2': 0})
                             counters = self.tp_counters[symbol]
-
                             if rate < 0:
                                 if counters['stage1'] == 1 or counters['stage2'] == 1:
-                                    self.logger.info(f"Resetting TP counters for {symbol} (UPL negative).")
-                                    counters['stage1'] = 0
-                                    counters['stage2'] = 0
-                            
+                                    counters['stage1'] = 0; counters['stage2'] = 0
                             elif rate >= MULTI_TP_STAGE_2_PERCENT and counters['stage2'] == 0:
-                                self.logger.warning(f"!!! HARD TP (Stage 2) !!! {symbol} | R {rate:.2%} >= {MULTI_TP_STAGE_2_PERCENT:.0%}")
                                 positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 2 (>{MULTI_TP_STAGE_2_PERCENT:.0%})"))
-                                counters['stage2'] = 1 
-                                counters['stage1'] = 1 
-                            
+                                counters['stage2'] = 1; counters['stage1'] = 1 
                             elif rate >= MULTI_TP_STAGE_1_PERCENT and counters['stage1'] == 0:
-                                self.logger.warning(f"!!! HARD TP (Stage 1) !!! {symbol} | R {rate:.2%} >= {MULTI_TP_STAGE_1_PERCENT:.0%}")
                                 positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 1 (>{MULTI_TP_STAGE_1_PERCENT:.0%})"))
                                 counters['stage1'] = 1 
 
@@ -1255,68 +1343,63 @@ class AlphaTrader:
                         self.logger.error(f"High-frequency risk check error: {e_risk}", exc_info=True)
 
                     # 3. 执行风控动作
+                    if sl_update_tasks:
+                        await asyncio.gather(*sl_update_tasks)
                     if positions_to_close:
                          tasks_close = [self.portfolio.live_close(symbol, reason=reason) for symbol, reason in positions_to_close.items()]
                          await asyncio.gather(*tasks_close)
                          self.logger.info(f"Hard Close actions executed for: {list(positions_to_close.keys())}")
-                    
                     if positions_to_partial_close:
                         final_partial_tasks = []
                         for symbol, size_pct, reason in positions_to_partial_close:
                             if symbol not in positions_to_close:
                                 final_partial_tasks.append(self.portfolio.live_partial_close(symbol, size_percent=size_pct, reason=reason))
-                        
                         if final_partial_tasks:
                             await asyncio.gather(*final_partial_tasks)
-                            self.logger.info("Hard Partial TP actions executed.")
                 
                 # --- 风控结束 ---
 
-                # 步骤 6: 决定是否触发 AI (低频)
-                trigger_ai, reason, now = False, "", time.time(); interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS;
+                # 步骤 6: [低频] 决定是否触发 AI (Rule 6)
+                trigger_ai, reason, now = False, "", time.time()
+                interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS #
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
-                # --- 触发器逻辑 (高级) ---
                 if not trigger_ai:
-                    cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES * 60
+                    cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES * 60 #
                     
                     if now - self.last_event_trigger_ai_time > cooldown:
                         self.logger.info("Checking for advanced triggers (Divergence, Squeeze, etc.) across all symbols...")
-                        
-                        # [优化] 遍历所有 symbols, 而不仅仅是 [0]
                         for sym in self.symbols:
                             ohlcv_15m = []
                             try: 
-                                ohlcv_15m = await self.exchange.fetch_ohlcv(sym, '15m', limit=150)
+                                # [优化] 复用已获取的数据
+                                ohlcv_15m = market_data.get(sym, {}).get('15min_ohlcv_data_list_for_triggers') # (假设 _gather... 已被修改)
+                                # [B计划] 如果没改 _gather...，就手动获取
+                                if not ohlcv_15m:
+                                    ohlcv_15m = await self.exchange.fetch_ohlcv(sym, '15m', limit=150)
                                 if not ohlcv_15m: continue
 
-                                # 按照优先级检查：
-                                # 1. 背离 (最强信号)
                                 event, ev_reason = await self._check_divergence(ohlcv_15m)
-                                # 2. 挤压 (重要模式)
                                 if not event: event, ev_reason = await self._check_ema_squeeze(ohlcv_15m)
-                                # 3. RSI 接近 (均值回归)
-                                if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m)
-                                # 4. BBands 接近 (均值回归)
+                                if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_1sSsm)
                                 if not event: event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m)
                                 
                                 if event: 
                                     trigger_ai, reason = True, f"{sym}: {ev_reason}"
                                     self.logger.info(f"Advanced trigger found for {sym}: {ev_reason}")
-                                    break # 找到一个事件就足以触发AI
-
+                                    break
                             except Exception as e_fetch:
                                 self.logger.error(f"Event check for {sym} fail: {e_fetch}")
-                        
                         if not trigger_ai:
                              self.logger.info("No advanced triggers found.")
-                # --- 触发器逻辑结束 ---
                 
                 # 步骤 7: (安全地) 运行 AI 循环
                 if trigger_ai:
                     self.logger.warning(f"🔥 AI triggered! Reason: {reason} (Sync was successful)")
                     if reason != "Scheduled": self.last_event_trigger_ai_time = now
-                    await self.run_cycle(); self.last_run_time = now
+                    # [修改] 传入已获取的数据
+                    await self.run_cycle(market_data, tickers); 
+                    self.last_run_time = now
                 
                 await asyncio.sleep(10) # 10秒主循环
             except asyncio.CancelledError: self.logger.warning("Task cancelled, shutting down..."); break
