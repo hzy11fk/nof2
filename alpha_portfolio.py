@@ -1,11 +1,9 @@
-# 文件: alpha_portfolio.py (V45.38 - 状态持久化修复)
-# 1. [V45.38 修复] 新增 _load/_save_pending_limits，使挂单计划持久化，解决重启后状态丢失问题。
-# 2. [V45.37 修复] sync_state 不再调用高风险的 fetch_open_orders() (无参数)。
+# 文件: alpha_portfolio.py (V45.39 - 杠杆同步修复)
+# 1. [V45.39 修复] 修复了 sync_state 中 V45.37 逻辑会过早删除"已成交"限价单计划的Bug。
+#    - V45.37 的 "open_order_ids" 检查现在只记录日志 (debug)，不再执行 remove_pending_limit_order。
+#    - 这确保了成交逻辑 (V45.38) 能够成功 'pop' 出计划并获取正确的杠杆。
+# 2. [V45.38 修复] 新增 _load/_save_pending_limits，使挂单计划持久化。
 # 3. [V45.37 优化] sync_state 现在只精确地、并行地获取 self.pending_limit_orders 中品种的挂单。
-# 4. (V45.36 修复 - 保留) 修复了限价单杠杆/本金错误和成交通知。
-# 5. (V45.33 修复 - 保留) live_close 包含 filled_size > 0 检查。
-# 6. [GEMINI V3 修复] live_open_limit 已升级，支持限价加仓。
-# 7. [GEMINI V4 修复] live_open_limit 现在存储 'limit_price' 以支持价格偏离取消。
 
 import logging
 import time
@@ -138,6 +136,7 @@ class AlphaPortfolio:
 
     async def sync_state(self):
         """
+        [V45.39 修复] 阻止 V45.37 逻辑过早删除"已成交"订单，确保 V45.38 逻辑能正确获取杠杆。
         [V45.38 修复] 修改 pop S' S' S' 
         [V45.37 策略A 重大修复]
         1. 不再调用高风险的 fetch_open_orders() (无参数)。
@@ -175,7 +174,7 @@ class AlphaPortfolio:
                         
                         open_order_ids = {o['id'] for o in all_open_orders}
                         
-                        # 迭代副本以安全删除
+                        # [V45.39 修复] 迭代副本，但不删除
                         for symbol, plan in list(self.pending_limit_orders.items()):
                             plan_order_id = plan.get('order_id')
                             if not plan_order_id:
@@ -186,9 +185,11 @@ class AlphaPortfolio:
 
                             if plan_order_id not in open_order_ids:
                                 # 这个订单不再是 "open" 状态，它可能已成交 (将在下面被同步) 或被取消/超时
-                                self.logger.warning(f"Sync: 待处理订单 {plan_order_id} ({symbol}) 不再 'open'。已从待处理列表移除。")
+                                # [V45.39 修复] 我们在这里只记录日志，不要删除它。
+                                # [V45.39 修复] 删除操作由下面的持仓同步逻辑 (pop) 处理。
+                                self.logger.debug(f"Sync: 待处理订单 {plan_order_id} ({symbol}) 不再 'open'。等待持仓同步...")
                                 # [V45.38 修复]
-                                await self.remove_pending_limit_order(symbol)
+                                # await self.remove_pending_limit_order(symbol) # <--- !!! [V45.39] 已修复：注释掉此行 !!!
                     # --- [V45.37 步骤 1 结束] ---
 
                     real_positions = await self.client.fetch_positions(self.symbols); exchange_open_symbols = set()
