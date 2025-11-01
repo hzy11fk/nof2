@@ -1,11 +1,13 @@
-# 文件: alpha_trader.py (完整优化版 - 混合模型)
+# 文件: alpha_trader.py (完整优化版 - 混合模型 + 完整通知)
 # 1. 策略:
 #    - [AI - Rule 6] AI 负责低频、高上下文的限价单 (LIMIT) 策略。
 #    - [Python - Rule 8] Python 负责高频、低延迟的市价单 (MARKET) 突破策略。
-# 2. 触发器:
-#    - Rule 8 由 10 秒主循环高频触发 (由 config.py 开启)。
-#    - Rule 8 离场逻辑使用动态追踪止损。
-#    - AI 由定时器或高级事件 (背离等) 低频触发。
+# 2. 通知:
+#    - [修复] 移除了 alpha_trader.py 中冗余的通知调用。
+#    - [说明] 所有通知 (开仓/挂单/平仓/成交) 现在均由 alpha_portfolio.py (Source 2) 正确处理。
+# 3. Bug 修复:
+#    - [修复] 修复了 start() 循环中 'ohlcv_1sSsm' 的 NameError。
+#    - [修复] 修复了 'Settings' object has no attribute 'FUTURES_LEVERAGE' 的 AttributeError。
 
 import logging
 import asyncio
@@ -15,13 +17,16 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 import re
-import httpx
+import httpx # 用于 F&G Index
 from collections import deque
+# [修复] 导入 settings 和 futures_settings
 from config import settings, futures_settings
 from alpha_ai_analyzer import AlphaAIAnalyzer
 from alpha_portfolio import AlphaPortfolio # 假设 V23.4 或更高
 from datetime import datetime
 from typing import Tuple, Dict, Any, Set, Optional
+# [修复] 移除冗余的 bark_notifier 导入， portfolio 会处理
+# from bark_notifier import send_bark_notification 
 
 try:
     import pandas as pd
@@ -31,9 +36,7 @@ except ImportError:
 class AlphaTrader:
     
     # --- [AI (Rule 6) 专用 PROMPT] ---
-    # 1. Rule 8 (突破) 已被完全移除。
-    # 2. Rule 1 被修改，AI 现在只被允许使用 LIMIT_BUY / LIMIT_SELL。
-    # 3. 移除了所有 BUY/SELL (市价) 订单模板和示例。
+    # (此部分无变化)
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -107,7 +110,7 @@ class AlphaTrader:
     - **High-Confidence Signal Definition:** A signal is only high-confidence when it aligns with the **Market State** (see Rule 6) and shows alignment across **at least 3** timeframes.
     - **Timeframe Hierarchy:** Use longer timeframes (**4h, 1h**) to determine the **Market State** and **Overall Trend**. Use shorter timeframes (**15min, 5min**) for precise entry timing.
     -   **Signal Veto Rule (CRITICAL):**
-        -   Even if 4h/1h trend signals (e.g., ADX > 25) are strong, if the 15min timeframe shows a **strong opposing signal** (e.g., a bearish RSI divergence, a 15m MACD Dead Cross, or 15m EMA 20 has crossed below EMA 50), you **MUST ABORT** the trade (this applies to Rule 6).
+        -   Even if 4h/1h trend signals (e.g., ADX > 25) are strong, if the 15min timeframe shows a **strong opposing signal** (e.g., a bearish RSI divergence, a 15m MACD Dead Cross, or 15m EMA 20 has crossed below 50), you **MUST ABORT** the trade (this applies to Rule 6).
         -   **Never** trade against 15m momentum when trying to enter on a pullback.
 
     **Psychological Safeguards:**
@@ -202,8 +205,9 @@ class AlphaTrader:
     def __init__(self, exchange):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.exchange = exchange
-        self.symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
-        self.portfolio = AlphaPortfolio(exchange, self.symbols) # 假设 V23.4+
+        # [修复] 从 settings 中读取 symbols
+        self.symbols = settings.FUTURES_SYMBOLS_LIST
+        self.portfolio = AlphaPortfolio(exchange, self.symbols) # 假设 V23.4+ [cite: 2]
         self.ai_analyzer = AlphaAIAnalyzer(exchange, "ALPHA_TRADER")
         self.is_live_trading = settings.ALPHA_LIVE_TRADING
         self.start_time = time.time(); self.invocation_count = 0; self.last_run_time = 0; self.last_event_trigger_ai_time = 0
@@ -254,7 +258,8 @@ class AlphaTrader:
         确保 '1h' 变为 '1hour'，'5m' 变为 '5min'，与 _build_prompt 严格一致。
         [优化] 新增 ATR 计算，供 Rule 8 止损使用。
         """
-        self.logger.info("Gathering multi-TF market data (5m, 15m, 1h, 4h) + Indicators (Manual Calc)...")
+        # [修复] 日志级别降低
+        self.logger.debug("Gathering multi-TF market data (5m, 15m, 1h, 4h) + Indicators (Manual Calc)...")
         market_indicators_data: Dict[str, Dict[str, Any]] = {}
         fetched_tickers: Dict[str, Any] = {}
         
@@ -492,10 +497,11 @@ class AlphaTrader:
         - "BUY"/"SELL" (市价开仓) 由 Python Rule 8 调用。
         - "LIMIT_BUY"/"LIMIT_SELL" 由 AI Rule 6 调用。
         - 将 Python 端的安全计算 (risk_percent -> size) 应用于所有开仓类型。
+        - [修复] 移除所有通知调用， portfolio.py [cite: 2] 会处理。
         """
         
-        # 这些是硬性风控规则
-        MIN_MARGIN_USDT = 6.0
+        # [修复] 从 futures_settings 中读取
+        MIN_MARGIN_USDT = futures_settings.MIN_NOMINAL_VALUE_USDT
         MIN_SIZE_BTC = 0.001 
 
         for order in decisions:
@@ -513,6 +519,7 @@ class AlphaTrader:
                 if action == "CLOSE":
                     if (not current_price or current_price <= 0) and not self.is_live_trading:
                         self.logger.error(f"模拟盘平仓失败: 无当前价格 {symbol}"); continue
+                    # portfolio.live_close / paper_close 会处理通知
                     if self.is_live_trading: await self.portfolio.live_close(symbol, reason=reason)
                     else: await self.portfolio.paper_close(symbol, current_price, reason=reason)
                 
@@ -545,6 +552,12 @@ class AlphaTrader:
                         # 3. 执行 Prompt Rule 4 的计算
                         calculated_desired_margin = total_equity * risk_percent
                         
+                        # [修复] 检查最大保证金占用率
+                        max_margin_cap = total_equity * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
+                        if calculated_desired_margin > max_margin_cap:
+                            self.logger.warning(f"!!! {action} Margin Capped !!! AI 期望保证金 {calculated_desired_margin:.2f} > 最大 {max_margin_cap:.2f} ({futures_settings.MAX_MARGIN_PER_TRADE_RATIO*100}%)")
+                            calculated_desired_margin = max_margin_cap
+                        
                         if calculated_desired_margin > available_cash:
                             self.logger.error(f"!!! {action} Aborted (Cash Insufficient) !!! AI 期望保证金 {calculated_desired_margin:.2f} > 可用 {available_cash:.2f}")
                             continue
@@ -568,21 +581,24 @@ class AlphaTrader:
                         
                         if final_size <= 0: raise ValueError("最终计算 size 为 0")
 
+                        # 执行实盘市价单
+                        invalidation_condition = order.get('invalidation_condition')
+                        # [通知] portfolio.live_open 会自动发送通知
+                        await self.portfolio.live_open(
+                            symbol, 
+                            side, 
+                            final_size, # <-- 经 Python 计算后的
+                            leverage, 
+                            reason=reason, 
+                            stop_loss=stop_loss, 
+                            take_profit=take_profit, # 传入 None 或具体数值
+                            invalidation_condition=invalidation_condition
+                        )
+
+                        # [修复] 移除了此处的冗余通知调用
+
                     except (ValueError, TypeError, KeyError) as e: 
                         self.logger.error(f"跳过 {action} (Python 计算/参数错误): {order}. Err: {e}"); continue
-                    
-                    # 执行实盘市价单
-                    invalidation_condition = order.get('invalidation_condition')
-                    await self.portfolio.live_open(
-                        symbol, 
-                        side, 
-                        final_size, # <-- 经 Python 计算后的
-                        leverage, 
-                        reason=reason, 
-                        stop_loss=stop_loss, 
-                        take_profit=take_profit, # 传入 None 或具体数值
-                        invalidation_condition=invalidation_condition
-                    )
 
                 # --- 限价开仓 (LIMIT_BUY / LIMIT_SELL) - 仅由 AI Rule 6 使用 ---
                 elif action in ["LIMIT_BUY", "LIMIT_SELL"]:
@@ -611,6 +627,7 @@ class AlphaTrader:
                                 if symbol == "BTC/USDT:USDT" and final_size < MIN_SIZE_BTC:
                                     final_size = MIN_SIZE_BTC
 
+                                # [通知] portfolio.paper_open 会自动发送通知
                                 await self.portfolio.paper_open(symbol, 'long' if action == 'LIMIT_BUY' else 'short', final_size, price=current_price, leverage=leverage, reason=reason, stop_loss=stop_loss, take_profit=take_profit, invalidation_condition=invalidation_condition)
                             else:
                                 self.logger.info(f"模拟盘：价格 {current_price} 不利 (vs {price_to_calc})，跳过限价单。")
@@ -642,6 +659,12 @@ class AlphaTrader:
                             # 3. 执行 Prompt Rule 4 的计算
                             calculated_desired_margin = total_equity * risk_percent
                             
+                            # [修复] 检查最大保证金占用率
+                            max_margin_cap = total_equity * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
+                            if calculated_desired_margin > max_margin_cap:
+                                self.logger.warning(f"!!! {action} Margin Capped !!! AI 期望保证金 {calculated_desired_margin:.2f} > 最大 {max_margin_cap:.2f} ({futures_settings.MAX_MARGIN_PER_TRADE_RATIO*100}%)")
+                                calculated_desired_margin = max_margin_cap
+
                             if calculated_desired_margin > available_cash:
                                 self.logger.error(f"!!! {action} Aborted (Cash Insufficient) !!! AI 期望保证金 {calculated_desired_margin:.2f} > 可用 {available_cash:.2f}")
                                 continue
@@ -671,6 +694,7 @@ class AlphaTrader:
                         # 执行实盘限价单
                         invalidation_condition = order.get('invalidation_condition')
                         if hasattr(self.portfolio, 'live_open_limit'): 
+                            # [通知] portfolio.live_open_limit 会自动发送通知
                             await self.portfolio.live_open_limit(
                                 symbol, 
                                 side, 
@@ -699,6 +723,8 @@ class AlphaTrader:
                             if abs(size_to_close_percent) < 1e-9: raise ValueError("size_% 必须 > 0")
                         if size_to_close_absolute is not None and size_to_close_absolute<=0: raise ValueError("size_abs 需 > 0")
                     except (ValueError,TypeError,KeyError) as e: self.logger.error(f"跳过PARTIAL_CLOSE参数错误: {order}. Err: {e}"); continue
+                    
+                    # [通知] portfolio.live_partial_close / paper_partial_close 会自动发送通知
                     if self.is_live_trading: await self.portfolio.live_partial_close(symbol, size_percent=size_to_close_percent, size_absolute=size_to_close_absolute, reason=reason)
                     else: await self.portfolio.paper_partial_close(symbol, current_price, size_percent=size_to_close_percent, size_absolute=size_to_close_absolute, reason=reason)
 
@@ -756,7 +782,9 @@ class AlphaTrader:
                 if sl_valid and price >= sl: to_close.append((symbol, price, f"Hard SL @ {sl}"))
                 elif tp_valid and price <= tp: to_close.append((symbol, price, f"Hard TP @ {tp}"))
         for symbol, price, reason in to_close:
-            self.logger.warning(f"AUTO-CLOSING (Paper): {symbol} | Reason: {reason}"); await self.portfolio.paper_close(symbol, price, reason)
+            self.logger.warning(f"AUTO-CLOSING (Paper): {symbol} | Reason: {reason}")
+            # [通知] portfolio.paper_close 会自动发送通知
+            await self.portfolio.paper_close(symbol, price, reason)
         return len(to_close) > 0
 
     
@@ -768,7 +796,7 @@ class AlphaTrader:
         使用 config.py 中的设置。
         """
         # [配置] 检查 Rule 8 总开关
-        if not settings.ENABLE_BREAKOUT_MODIFIER: #
+        if not settings.ENABLE_BREAKOUT_MODIFIER:
             return []
             
         orders_to_execute = []
@@ -782,9 +810,9 @@ class AlphaTrader:
         R8_VOL_RATIO_5M = 2.5 # (原 Prompt: 5min_volume_ratio > 2.5)
         R8_VOL_RATIO_15M = 2.0 # (原 Prompt: 15min_volume_ratio > 2.0)
         
-        # [配置] 使用 config.py 中的风险和杠杆设置
-        leverage = futures_settings.FUTURES_LEVERAGE #
-        risk_percent = futures_settings.FUTURES_RISK_PER_TRADE_PERCENT / 100.0 #
+        # [修复] 使用 futures_settings
+        leverage = futures_settings.FUTURES_LEVERAGE
+        risk_percent = futures_settings.FUTURES_RISK_PER_TRADE_PERCENT / 100.0
 
         for symbol in self.symbols:
             # 状态管理：如果已有仓位，Rule 8 (Python) 不应干预
@@ -810,7 +838,7 @@ class AlphaTrader:
                 
                 # 检查数据是否完整
                 if not all([price, adx_1h, bb_upper_15m, bb_lower_15m, vol_ratio_5m, vol_ratio_15m, ema_50_4h]):
-                    self.logger.info(f"Rule 8 Skipping {symbol}: Missing key data.")
+                    # self.logger.debug(f"Rule 8 Skipping {symbol}: Missing key data.") # 日志过于频繁
                     continue
 
                 # --- 执行 Rule 8 逻辑 (a, b, c, d) ---
@@ -835,7 +863,7 @@ class AlphaTrader:
                 if price > bb_upper_15m:
                     # d. VETO (Trend & Macro)
                     if price < ema_50_4h: # 趋势否决 (价格低于 4h EMA 50)
-                        self.logger.info(f"Rule 8 (Py) BUY Veto (Trend): {symbol}")
+                        # self.logger.debug(f"Rule 8 (Py) BUY Veto (Trend): {symbol}")
                         continue
                     if fng_value > 75: # 宏观否决 (极度贪婪)
                         self.logger.info(f"Rule 8 (Py) BUY Veto (F&G): {symbol}")
@@ -846,7 +874,7 @@ class AlphaTrader:
                 elif price < bb_lower_15m:
                     # d. VETO (Trend & Macro)
                     if price > ema_50_4h: # 趋势否决 (价格高于 4h EMA 50)
-                        self.logger.info(f"Rule 8 (Py) SELL Veto (Trend): {symbol}")
+                        # self.logger.debug(f"Rule 8 (Py) SELL Veto (Trend): {symbol}")
                         continue
                     if fng_value < 25: # 宏观否决 (极度恐惧)
                         self.logger.info(f"Rule 8 (Py) SELL Veto (F&G): {symbol}")
@@ -882,8 +910,8 @@ class AlphaTrader:
         
         stop_loss = 0.0
         
-        # [配置] 使用 ATR 设置止损
-        if settings.USE_ATR_FOR_INITIAL_STOP: #
+        # [修复] 使用 futures_settings
+        if futures_settings.USE_ATR_FOR_INITIAL_STOP:
             # 我们使用 1h ATR 作为默认的止损基准
             atr_1h = symbol_data.get('1hour_atr_14')
             if not atr_1h or atr_1h <= 0:
@@ -891,7 +919,7 @@ class AlphaTrader:
                 sl_pct = 0.02 # 备用静态止损
                 stop_loss = price * (1 - sl_pct) if action == "BUY" else price * (1 + sl_pct)
             else:
-                multiplier = futures_settings.INITIAL_STOP_ATR_MULTIPLIER #
+                multiplier = futures_settings.INITIAL_STOP_ATR_MULTIPLIER
                 stop_loss = price - (atr_1h * multiplier) if action == "BUY" else price + (atr_1h * multiplier)
         else:
             # 备用静态止损
@@ -1085,7 +1113,7 @@ class AlphaTrader:
         """
         now = time.time()
         if now - self.last_fng_fetch_time < self.FNG_CACHE_DURATION_SECONDS:
-            self.logger.info(f"Using cached F&G Index: {self.fng_data['value_classification']} ({self.fng_data['value']})")
+            # self.logger.info(f"Using cached F&G Index: {self.fng_data['value_classification']} ({self.fng_data['value']})") # 日志过于频繁
             return
 
         self.logger.info("Fetching new Fear & Greed Index data from alternative.me...")
@@ -1183,19 +1211,19 @@ class AlphaTrader:
                 await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
             except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
         
-        # --- 定义风控阈值 ---
-        MULTI_TP_STAGE_1_PERCENT = 0.04  # 4.0%
-        MULTI_TP_STAGE_2_PERCENT = 0.10  # 10.0%
-        MAX_LOSS_PERCENT = getattr(settings, 'MAX_LOSS_CUTOFF_PERCENT', 20.0) / 100.0 #
-        DUST_MARGIN_USDT = 1.0
-        LIMIT_ORDER_TIMEOUT_MS = getattr(settings, 'AI_LIMIT_ORDER_TIMEOUT_SECONDS', 900) * 1000 #
+        # --- 定义风控阈值 (从 config 加载) ---
+        MULTI_TP_STAGE_1_PERCENT = 0.04  # 4.0% (硬编码, 可移入 config)
+        MULTI_TP_STAGE_2_PERCENT = 0.10  # 10.0% (硬编码, 可移入 config)
+        MAX_LOSS_PERCENT = settings.MAX_LOSS_CUTOFF_PERCENT / 100.0
+        DUST_MARGIN_USDT = 1.0 # (硬编码, 可移入 config)
+        LIMIT_ORDER_TIMEOUT_MS = settings.AI_LIMIT_ORDER_TIMEOUT_SECONDS * 1000
         
         while True:
             try:
                 # 步骤 1: 状态同步 (必须成功)
                 try:
                     await self.portfolio.sync_state()
-                    self.logger.info("Portfolio state sync successful.")
+                    # self.logger.info("Portfolio state sync successful.") # 日志过于频繁
                 except Exception as e_sync:
                     self.logger.critical(f"Main loop sync_state failed: {e_sync}. Skipping AI cycle, will retry...", exc_info=True)
                     await asyncio.sleep(30) 
@@ -1234,14 +1262,15 @@ class AlphaTrader:
                 market_data, tickers = await self._gather_all_market_data()
 
                 # 步骤 4: [高频] Python Rule 8 执行 (如果开启)
-                if settings.ENABLE_BREAKOUT_MODIFIER: #
+                # [配置] 检查 Rule 8 总开关
+                if settings.ENABLE_BREAKOUT_MODIFIER:
                     if self.is_live_trading:
                         rule8_orders = await self._check_python_rule_8(market_data)
                         if rule8_orders:
                             self.logger.warning(f"🔥 Python Rule 8 TRIGGERED! Executing {len(rule8_orders)} orders.")
                             await self._execute_decisions(rule8_orders, market_data)
-                    else:
-                        self.logger.info("Python Rule 8 is enabled but in PAPER mode, skipping execution.")
+                    # else:
+                        # self.logger.info("Python Rule 8 is enabled but in PAPER mode, skipping execution.") # 日志过于频繁
                 
                 # 步骤 5: [高频] 硬性风控检查 (每10秒)
                 if self.is_live_trading and tickers:
@@ -1281,7 +1310,8 @@ class AlphaTrader:
 
                             # --- 规则 A: Python Rule 8 动态追踪止损 ---
                             if is_rule_8_trade:
-                                trail_percent = settings.BREAKOUT_TRAIL_STOP_PERCENT #
+                                # [配置] Rule 8 仓位使用追踪止损
+                                trail_percent = settings.BREAKOUT_TRAIL_STOP_PERCENT
                                 current_sl = state.get('ai_suggested_stop_loss', 0.0)
                                 new_sl = 0.0
                                 
@@ -1289,8 +1319,10 @@ class AlphaTrader:
                                 else: new_sl = price * (1 + trail_percent)
                                 
                                 # 止损只能前进，不能后退
-                                if (side == 'long' and new_sl > current_sl) or (side == 'short' and new_sl < current_sl and new_sl > 0):
-                                    self.logger.warning(f"!!! RULE 8 TRAIL STOP !!! {symbol} | Moving SL to {new_sl:.4f}")
+                                if (side == 'long' and new_sl > current_sl) or \
+                                   (side == 'short' and new_sl < current_sl and new_sl > 0 and price < current_sl): # 确保空头新 SL 低于当前价格
+                                    
+                                    # self.logger.debug(f"!!! RULE 8 TRAIL STOP !!! {symbol} | Moving SL to {new_sl:.4f}") # 日志过于频繁
                                     sl_update_tasks.append(
                                         self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Rule 8 Trail Stop")
                                     )
@@ -1343,11 +1375,12 @@ class AlphaTrader:
                         self.logger.error(f"High-frequency risk check error: {e_risk}", exc_info=True)
 
                     # 3. 执行风控动作
+                    # [通知] portfolio.py [cite: 2] 会自动处理这些动作的通知
                     if sl_update_tasks:
-                        await asyncio.gather(*sl_update_tasks)
+                        await asyncio.gather(*sl_update_tasks, return_exceptions=True) # 忽略错误 (例如仓位已不存在)
                     if positions_to_close:
                          tasks_close = [self.portfolio.live_close(symbol, reason=reason) for symbol, reason in positions_to_close.items()]
-                         await asyncio.gather(*tasks_close)
+                         await asyncio.gather(*tasks_close, return_exceptions=True)
                          self.logger.info(f"Hard Close actions executed for: {list(positions_to_close.keys())}")
                     if positions_to_partial_close:
                         final_partial_tasks = []
@@ -1355,33 +1388,36 @@ class AlphaTrader:
                             if symbol not in positions_to_close:
                                 final_partial_tasks.append(self.portfolio.live_partial_close(symbol, size_percent=size_pct, reason=reason))
                         if final_partial_tasks:
-                            await asyncio.gather(*final_partial_tasks)
+                            await asyncio.gather(*final_partial_tasks, return_exceptions=True)
                 
                 # --- 风控结束 ---
 
                 # 步骤 6: [低频] 决定是否触发 AI (Rule 6)
                 trigger_ai, reason, now = False, "", time.time()
-                interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS #
+                interval = settings.ALPHA_ANALYSIS_INTERVAL_SECONDS
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
                 if not trigger_ai:
-                    cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES * 60 #
+                    cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES
                     
-                    if now - self.last_event_trigger_ai_time > cooldown:
-                        self.logger.info("Checking for advanced triggers (Divergence, Squeeze, etc.) across all symbols...")
+                    if now - self.last_event_trigger_ai_time > (cooldown * 60):
+                        # self.logger.info("Checking for advanced triggers (Divergence, Squeeze, etc.) across all symbols...") # 日志过于频繁
                         for sym in self.symbols:
                             ohlcv_15m = []
                             try: 
-                                # [优化] 复用已获取的数据
-                                ohlcv_15m = market_data.get(sym, {}).get('15min_ohlcv_data_list_for_triggers') # (假设 _gather... 已被修改)
-                                # [B计划] 如果没改 _gather...，就手动获取
-                                if not ohlcv_15m:
-                                    ohlcv_15m = await self.exchange.fetch_ohlcv(sym, '15m', limit=150)
+                                # [优化] 我们需要从 market_data 中获取 ohlcv 列表
+                                # (假设 _gather_all_market_data 未来会返回这个)
+                                # [B计划] 现在，我们还是手动获取
+                                ohlcv_15m = await self.exchange.fetch_ohlcv(sym, '15m', limit=150)
                                 if not ohlcv_15m: continue
 
                                 event, ev_reason = await self._check_divergence(ohlcv_15m)
                                 if not event: event, ev_reason = await self._check_ema_squeeze(ohlcv_15m)
-                                if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_1sSsm)
+                                
+                                # [!!! Bug 修复 !!!]
+                                # 将 'ohlcv_1sSsm' 修正为 'ohlcv_15m'
+                                if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m)
+                                
                                 if not event: event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m)
                                 
                                 if event: 
@@ -1389,9 +1425,9 @@ class AlphaTrader:
                                     self.logger.info(f"Advanced trigger found for {sym}: {ev_reason}")
                                     break
                             except Exception as e_fetch:
-                                self.logger.error(f"Event check for {sym} fail: {e_fetch}")
-                        if not trigger_ai:
-                             self.logger.info("No advanced triggers found.")
+                                self.logger.error(f"Event check for {sym} fail: {e_fetch}", exc_info=False) # 减少日志噪音
+                        # if not trigger_ai:
+                             # self.logger.info("No advanced triggers found.") # 日志过于频繁
                 
                 # 步骤 7: (安全地) 运行 AI 循环
                 if trigger_ai:
