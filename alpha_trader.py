@@ -1,8 +1,8 @@
-# 文件: alpha_trader.py (完整优化版 - L2/L3 混合模型 + 高级回调)
+# 文件: alpha_trader.py (完整优化版 - L2/L3 混合模型 + RSI动能突破)
 # 描述: 
 # L3 (LLM): Rule 6 策略, 由 L2 辅助
 # L2 (ML): Rule 8 RF模型 + Anomaly模型, 作为“专家顾问”
-# L1 (Python): Rule 8 执行, 硬风控
+# L1 (Python): Rule 8 (RSI动能突破) 执行, 硬风控
 
 import logging
 import asyncio
@@ -30,7 +30,7 @@ except ImportError:
 class AlphaTrader:
     
     # --- [AI (Rule 6) 专用 PROMPT] ---
-    # (已修改 - 整合 Anomaly, ML Proba, 高级回调逻辑)
+    # (已修改 - 整合 Anomaly, ML Proba, 高级回调, 无对冲, 挂单修复)
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -179,7 +179,7 @@ class AlphaTrader:
         [CRITICAL STATE CHECK: Before analyzing any new symbol, you MUST check the 'Pending Limit Orders' list. If a pending order for a symbol already exists, you MUST SKIP analysis for that symbol to prevent duplicate orders.]
         
         [CRITICAL STATE CHECK (NO HEDGING): Before analyzing any new symbol, you MUST check the 'Open Positions (Live / Filled)' list. If a position for that [SYMBOL] already exists, you MUST SKIP analysis for that symbol. AI's role is to MANAGE existing positions (in the section above) or open new ones, NEVER to hold LONG and SHORT on the same symbol (No Hedging).]
-
+        
         [Analyze opportunities based ONLY on Rule 6, ensuring they pass Rule 1.5 (Anomaly) and Rule 6 (ML Confirmation)]
         
         [EXAMPLE - RULE 6.1 (OPTIMIZED PULLBACK):]
@@ -345,7 +345,8 @@ class AlphaTrader:
             tasks = []
             for symbol in self.symbols:
                 for timeframe in timeframes: 
-                    tasks.append(_safe_fetch_ohlcv(symbol, timeframe, limit=100))
+                    limit = 150 if timeframe == '15m' else 100
+                    tasks.append(_safe_fetch_ohlcv(symbol, timeframe, limit=limit))
                 tasks.append(_safe_fetch_ticker(symbol))
                 
             results = await asyncio.gather(*tasks)
@@ -369,6 +370,9 @@ class AlphaTrader:
                         self.logger.warning(f"Failed fetch {timeframe} for {symbol} (Result: {ohlcv_data})")
                         continue
                     
+                    if timeframe == '15m':
+                        market_indicators_data[symbol]['ohlcv_15m'] = ohlcv_data
+
                     try:
                         df = pd.DataFrame(ohlcv_data, columns=['ts', 'o', 'h', 'l', 'c', 'v']); df.rename(columns={'timestamp':'ts', 'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}, inplace=True, errors='ignore'); 
                         
@@ -381,8 +385,8 @@ class AlphaTrader:
                         
                         df['ts'] = pd.to_datetime(df['ts'], unit='ms'); df.set_index('ts', inplace=True)
                         
-                        if df.empty: 
-                            self.logger.warning(f"DataFrame empty for {symbol} {timeframe} after cleaning NaNs.")
+                        if df.empty or len(df) < 2:
+                            self.logger.warning(f"DataFrame empty or too short for {symbol} {timeframe}.")
                             continue
                             
                         prefix = f"{timeframe.replace('m', 'min').replace('h', 'hour')}_"
@@ -391,52 +395,45 @@ class AlphaTrader:
                         if len(df) >= 28:
                             try:
                                 high = df['h']; low = df['l']; close = df['c']; period = 14
-                                move_up = high.diff(); move_down = low.diff().mul(-1)
-                                plus_dm = pd.Series(np.where((move_up > move_down) & (move_up > 0), move_up, 0), index=df.index)
-                                minus_dm = pd.Series(np.where((move_down > move_up) & (move_down > 0), move_down, 0), index=df.index)
-                                tr1 = pd.DataFrame(high - low)
-                                tr2 = pd.DataFrame(abs(high - close.shift(1)))
-                                tr3 = pd.DataFrame(abs(low - close.shift(1)))
-                                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                                atr = tr.ewm(alpha=1/period, adjust=False).mean()
-                                
-                                if not atr.empty:
-                                    market_indicators_data[symbol][f'{prefix}atr_14'] = atr.iloc[-1]
-                                
-                                plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, 1e-9))
-                                minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, 1e-9))
-                                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-9)
-                                adx = dx.ewm(alpha=1/period, adjust=False).mean()
-                                if not adx.empty:
-                                    market_indicators_data[symbol][f'{prefix}adx_14'] = adx.iloc[-1]
+                                # (使用 pandas_ta 计算)
+                                adx_data = ta.adx(high, low, close, length=period)
+                                atr_data = ta.atr(high, low, close, length=period)
+                                if adx_data is not None and not adx_data.empty:
+                                    market_indicators_data[symbol][f'{prefix}adx_14'] = adx_data[f'ADX_{period}'].iloc[-1]
+                                if atr_data is not None and not atr_data.empty:
+                                    market_indicators_data[symbol][f'{prefix}atr_14'] = atr_data.iloc[-1]
                             except Exception as e:
-                                self.logger.warning(f"Manual ADX/ATR calc failed for {symbol} {timeframe}: {e}", exc_info=False)
+                                self.logger.warning(f"ta ADX/ATR calc failed for {symbol} {timeframe}: {e}", exc_info=False)
 
                         if len(df) >= 20:
                             try:
                                 period = 20; std_dev = 2.0; closes = df['c']
-                                middle_band = closes.rolling(window=period).mean()
-                                rolling_std = closes.rolling(window=period).std()
-                                upper_band = middle_band + (rolling_std * std_dev)
-                                lower_band = middle_band - (rolling_std * std_dev)
-                                if not upper_band.empty:
-                                    market_indicators_data[symbol][f'{prefix}bb_upper'] = upper_band.iloc[-1]
-                                    market_indicators_data[symbol][f'{prefix}bb_middle'] = middle_band.iloc[-1]
-                                    market_indicators_data[symbol][f'{prefix}bb_lower'] = lower_band.iloc[-1]
+                                bbands = ta.bbands(closes, length=period, std=std_dev)
+                                if bbands is not None and not bbands.empty:
+                                    
+                                    # --- [修复] 使用 iloc 按列索引访问 ---
+                                    market_indicators_data[symbol][f'{prefix}bb_upper'] = bbands.iloc[:, 2].iloc[-1] # BBU (Upper)
+                                    market_indicators_data[symbol][f'{prefix}bb_middle'] = bbands.iloc[:, 1].iloc[-1] # BBM (Middle)
+                                    market_indicators_data[symbol][f'{prefix}bb_lower'] = bbands.iloc[:, 0].iloc[-1] # BBL (Lower)
+                                    
+                                    if timeframe == '15m':
+                                        market_indicators_data[symbol][f'{prefix}bb_upper_prev'] = bbands.iloc[:, 2].iloc[-2]
+                                        market_indicators_data[symbol][f'{prefix}bb_lower_prev'] = bbands.iloc[:, 0].iloc[-2]
+                                        market_indicators_data[symbol][f'{prefix}close_prev'] = closes.iloc[-2]
+                                    # --- [修复结束] ---
+
                             except Exception as e:
-                                self.logger.warning(f"Manual BBands calc failed for {symbol} {timeframe}: {e}", exc_info=False)
+                                self.logger.warning(f"ta BBands calc failed for {symbol} {timeframe}: {e}", exc_info=True)
 
                         if len(df) >= 15:
                             try:
-                                period = 14; delta = df['c'].diff()
-                                gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-                                loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-                                rs = gain / loss.replace(0, 1e-9)
-                                rsi = 100 - (100 / (1 + rs))
-                                if not rsi.empty:
+                                rsi = ta.rsi(df['c'], 14)
+                                if rsi is not None and not rsi.empty:
                                     market_indicators_data[symbol][f'{prefix}rsi_14'] = rsi.iloc[-1]
+                                    if timeframe == '15m':
+                                        market_indicators_data[symbol][f'{prefix}rsi_14_prev'] = rsi.iloc[-2]
                             except Exception as e:
-                                self.logger.warning(f"Manual RSI calc failed for {symbol} {timeframe}: {e}", exc_info=False)
+                                self.logger.warning(f"ta RSI calc failed for {symbol} {timeframe}: {e}", exc_info=False)
 
                         if len(df) >= 26:
                             try:
@@ -475,8 +472,7 @@ class AlphaTrader:
                             market_indicators_data[symbol][f'{prefix}recent_low']=df['l'].tail(20).min()
                         
                         
-                        # --- 2. 计算 Anomaly (IsolationForest) 特征 ---
-                        if timeframe == '15m' and len(df) >= 21: # (20 滚动 + 1 pct_change)
+                        if timeframe == '15m' and len(df) >= 21: 
                             try:
                                 df['returns'] = df['c'].pct_change()
                                 
@@ -506,7 +502,6 @@ class AlphaTrader:
                     except Exception as e: self.logger.error(f"Error during indicator calc loop for {symbol} {timeframe}: {e}", exc_info=False)
         except Exception as e: self.logger.error(f"Error gathering market data: {e}", exc_info=True)
         return market_indicators_data, fetched_tickers
-
 
     def _build_prompt(self, market_data: Dict[str, Dict[str, Any]], portfolio_state: Dict, tickers: Dict) -> str:
         prompt = f"It has been {(time.time() - self.start_time)/60:.0f} minutes since start.\n"
@@ -862,13 +857,18 @@ class AlphaTrader:
             try:
                 price = data.get('current_price')
                 adx_1h = data.get('1hour_adx_14')
-                bb_upper_15m = data.get('15min_bb_upper')
-                bb_lower_15m = data.get('15min_bb_lower')
+                
+                # [修改] 使用 RSI 动能突破所需的数据
+                rsi_14 = data.get('15min_rsi_14')
+                rsi_14_prev = data.get('15min_rsi_14_prev')
+
+                ohlcv_15m = data.get('ohlcv_15m')
                 vol_ratio_5m = data.get('5min_volume_ratio')
                 vol_ratio_15m = data.get('15min_volume_ratio')
                 ema_50_4h = data.get('4hour_ema_50')
                 
-                if not all([price, adx_1h, bb_upper_15m, bb_lower_15m, vol_ratio_5m, vol_ratio_15m, ema_50_4h]):
+                if not all([price, adx_1h, rsi_14, rsi_14_prev, vol_ratio_5m, vol_ratio_15m, ema_50_4h, ohlcv_15m]):
+                    self.logger.debug(f"Rule 8 Skipping {symbol}: Missing key data (incl. RSI values or ohlcv_15m).")
                     continue
 
                 ml_proba_up = 0.5 
@@ -886,10 +886,20 @@ class AlphaTrader:
                 
                 action = None
                 
-                if price > bb_upper_15m:
+                # --- [修改] b. SIGNAL (Break) ---
+                
+                # --- 检查做多 (BUY) ---
+                # 新逻辑: 检查“RSI 刚刚突破 50”
+                if rsi_14_prev <= 50 and rsi_14 > 50:
+                    
                     if price < ema_50_4h: continue
                     if fng_value > 75: continue
                     
+                    has_divergence, div_reason = await self._check_divergence(ohlcv_15m)
+                    if has_divergence and "Bearish" in div_reason:
+                        self.logger.warning(f"Rule 8 (Py) BUY Veto (Divergence): {symbol} {div_reason}")
+                        continue
+
                     if not ml_called:
                         ml_pred = await self._get_ml_prediction_rule8(symbol, market_data)
                         ml_proba_up = ml_pred['proba_up']
@@ -902,10 +912,18 @@ class AlphaTrader:
                         
                     action = "BUY"
 
-                elif price < bb_lower_15m:
+                # --- 检查做空 (SELL) ---
+                # 新逻辑: 检查“RSI 刚刚跌破 50”
+                elif rsi_14_prev >= 50 and rsi_14 < 50:
+                    
                     if price > ema_50_4h: continue
                     if fng_value < 25: continue
                     
+                    has_divergence, div_reason = await self._check_divergence(ohlcv_15m)
+                    if has_divergence and "Bullish" in div_reason:
+                        self.logger.warning(f"Rule 8 (Py) SELL Veto (Divergence): {symbol} {div_reason}")
+                        continue
+
                     if not ml_called:
                         ml_pred = await self._get_ml_prediction_rule8(symbol, market_data)
                         ml_proba_up = ml_pred['proba_up']
@@ -917,9 +935,10 @@ class AlphaTrader:
                         continue
 
                     action = "SELL"
+                # --- [修改结束] ---
 
                 if action:
-                    self.logger.warning(f"🔥 RULE 8 (Python + ML): {action} Signal for {symbol} (Prob Up: {ml_proba_up:.2f}, Down: {ml_proba_down:.2f})")
+                    self.logger.warning(f"🔥 RULE 8 (Python + RSI Momentum): {action} Signal for {symbol} (Prob Up: {ml_proba_up:.2f}, Down: {ml_proba_down:.2f})")
                     order = self._build_python_order(
                         symbol, 
                         action, 
@@ -1258,14 +1277,10 @@ class AlphaTrader:
 
         self.logger.info("="*20 + " AI Cycle Finished " + "="*20 + "\n")
 
-# --- [新] 高频风控循环 ---
+
     async def high_frequency_risk_loop(self):
-        """
-        一个独立的、高频 (2秒) 循环，专门用于执行风控。
-        """
         self.logger.warning("🚀 高频风控循环 (HF Risk Loop) 已启动 (2s 周期)...")
         
-        # (从 start() 循环中移动过来的配置)
         MULTI_TP_STAGE_1_PERCENT = 0.04
         MULTI_TP_STAGE_2_PERCENT = 0.10
         MAX_LOSS_PERCENT = settings.MAX_LOSS_CUTOFF_PERCENT / 100.0
@@ -1273,14 +1288,11 @@ class AlphaTrader:
         
         while True:
             try:
-                # 仅在实盘且 position_manager 加载后运行
                 if self.is_live_trading and self.portfolio.position_manager:
                     
-                    # 1. 高频获取 Tickers (这是唯一的 API 调用)
-                    # (使用 fetch_tickers 一次性获取所有持仓的价格)
                     open_positions = self.portfolio.position_manager.get_all_open_positions()
                     if not open_positions:
-                        await asyncio.sleep(2) # 没有持仓时休息
+                        await asyncio.sleep(2) 
                         continue
                         
                     symbols_to_check = list(open_positions.keys())
@@ -1289,10 +1301,9 @@ class AlphaTrader:
                         tickers = await self.client.fetch_tickers(symbols_to_check)
                     except Exception as e_ticker:
                         self.logger.error(f"HF Risk Loop: 获取 tickers 失败: {e_ticker}")
-                        await asyncio.sleep(2) # 出错时休息
+                        await asyncio.sleep(2) 
                         continue
 
-                    # --- 2. [重要] 从 start() 循环的步骤 5 复制过来的风控逻辑 ---
                     positions_to_close = {} 
                     positions_to_partial_close = []
                     sl_update_tasks = [] 
@@ -1324,7 +1335,6 @@ class AlphaTrader:
                             inval_cond = state.get('invalidation_condition') or '' 
                             is_rule_8_trade = "Python Rule 8" in inval_cond
 
-                            # --- 规则 A: Python Rule 8 动态追踪止损 ---
                             if is_rule_8_trade:
                                 trail_percent = settings.BREAKOUT_TRAIL_STOP_PERCENT
                                 current_sl = state.get('ai_suggested_stop_loss', 0.0)
@@ -1339,9 +1349,8 @@ class AlphaTrader:
                                     sl_update_tasks.append(
                                         self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Rule 8 Trail Stop")
                                     )
-                                # (已删除 continue 修复)
+                                # [修复] 删除 continue
 
-                            # --- 规则 B: AI (Rule 6) 仓位管理 ---
                             if rate <= -MAX_LOSS_PERCENT:
                                 reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
                                 if symbol not in positions_to_close: positions_to_close[symbol] = reason
@@ -1366,22 +1375,22 @@ class AlphaTrader:
                                     if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                     continue 
 
-                            self.tp_counters.setdefault(symbol, {'stage1': 0, 'stage2': 0})
-                            counters = self.tp_counters[symbol]
-                            if rate < 0:
-                                if counters['stage1'] == 1 or counters['stage2'] == 1:
-                                    counters['stage1'] = 0; counters['stage2'] = 0
-                            elif rate >= MULTI_TP_STAGE_2_PERCENT and counters['stage2'] == 0:
-                                positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 2 (>{MULTI_TP_STAGE_2_PERCENT:.0%})"))
-                                counters['stage2'] = 1; counters['stage1'] = 1 
-                            elif rate >= MULTI_TP_STAGE_1_PERCENT and counters['stage1'] == 0:
-                                positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 1 (>{MULTI_TP_STAGE_1_PERCENT:.0%})"))
-                                counters['stage1'] = 1 
+                            if not is_rule_8_trade:
+                                self.tp_counters.setdefault(symbol, {'stage1': 0, 'stage2': 0})
+                                counters = self.tp_counters[symbol]
+                                if rate < 0:
+                                    if counters['stage1'] == 1 or counters['stage2'] == 1:
+                                        counters['stage1'] = 0; counters['stage2'] = 0
+                                elif rate >= MULTI_TP_STAGE_2_PERCENT and counters['stage2'] == 0:
+                                    positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 2 (>{MULTI_TP_STAGE_2_PERCENT:.0%})"))
+                                    counters['stage2'] = 1; counters['stage1'] = 1 
+                                elif rate >= MULTI_TP_STAGE_1_PERCENT and counters['stage1'] == 0:
+                                    positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 1 (>{MULTI_TP_STAGE_1_PERCENT:.0%})"))
+                                    counters['stage1'] = 1 
                     
                     except Exception as e_risk_inner:
                         self.logger.error(f"HF Risk Loop 内部错误: {e_risk_inner}", exc_info=True)
 
-                    # 3. 执行风控动作
                     if sl_update_tasks:
                         await asyncio.gather(*sl_update_tasks, return_exceptions=True)
                     if positions_to_close:
@@ -1403,15 +1412,10 @@ class AlphaTrader:
                 break
             except Exception as e: 
                 self.logger.critical(f"HF Risk Loop 致命错误: {e}", exc_info=True); 
-                await asyncio.sleep(10) # 发生严重错误时降速
-    # --- [新循环结束] ---
+                await asyncio.sleep(10)
 
 
     async def start(self):
-        """
-        [已修改] 启动 AlphaTrader 主循环 (低频)
-        并创建高频风控循环。
-        """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
             self.logger.warning("!!! LIVE MODE !!! Syncing state on startup...")
@@ -1420,10 +1424,8 @@ class AlphaTrader:
                 await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
             except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
         
-        # --- [新] 启动高频风控循环 (在后台独立运行) ---
         asyncio.create_task(self.high_frequency_risk_loop())
         
-        # (从风控循环中移除这些定义)
         LIMIT_ORDER_TIMEOUT_MS = settings.AI_LIMIT_ORDER_TIMEOUT_SECONDS * 1000
         
         while True:
@@ -1438,7 +1440,6 @@ class AlphaTrader:
                 
                 # 步骤 2: 限价单超时清理 (10s 周期)
                 if self.is_live_trading and self.portfolio.pending_limit_orders:
-                    # ... (此处的超时清理逻辑不变) ...
                     now_ms = time.time() * 1000
                     orders_to_cancel = []
                     try:
@@ -1473,13 +1474,11 @@ class AlphaTrader:
                     if self.is_live_trading:
                         rule8_orders = await self._check_python_rule_8(market_data)
                         if rule8_orders:
-                            self.logger.warning(f"🔥 Python Rule 8 (ML) TRIGGERED! Executing {len(rule8_orders)} orders.")
+                            self.logger.warning(f"🔥 Python Rule 8 (RSI Momentum) TRIGGERED! Executing {len(rule8_orders)} orders.")
                             await self._execute_decisions(rule8_orders, market_data)
                 
-                # --- [已删除] ---
-                # 步骤 5: [高频] 硬性风控检查
-                # (此逻辑已移至 high_frequency_risk_loop)
-                # --- [已删除] ---
+                # 步骤 5: [已删除]
+                # (风控逻辑已移至 high_frequency_risk_loop)
                 
                 # 步骤 6: [低频] 决定是否触发 AI (Rule 6)
                 trigger_ai, reason, now = False, "", time.time()
@@ -1487,13 +1486,14 @@ class AlphaTrader:
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
                 if not trigger_ai:
-                    # ... (此处的事件触发逻辑不变) ...
                     cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES
+                    
                     if now - self.last_event_trigger_ai_time > (cooldown * 60):
                         for sym in self.symbols:
                             ohlcv_15m = []
                             try: 
-                                ohlcv_15m = await self.exchange.fetch_ohlcv(sym, '15m', limit=150)
+                                # (我们已经在 market_data 中获取了 15m K线)
+                                ohlcv_15m = market_data.get(sym, {}).get('ohlcv_15m', [])
                                 if not ohlcv_15m: continue
 
                                 event, ev_reason = await self._check_divergence(ohlcv_15m)
