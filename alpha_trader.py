@@ -1258,87 +1258,52 @@ class AlphaTrader:
 
         self.logger.info("="*20 + " AI Cycle Finished " + "="*20 + "\n")
 
-    async def start(self):
-        self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
-        if self.is_live_trading:
-            self.logger.warning("!!! LIVE MODE !!! Syncing state on startup...")
-            if not hasattr(self, 'client') and hasattr(self.portfolio, 'client'): self.client = self.portfolio.client
-            try: 
-                await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
-            except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
+# --- [新] 高频风控循环 ---
+    async def high_frequency_risk_loop(self):
+        """
+        一个独立的、高频 (2秒) 循环，专门用于执行风控。
+        """
+        self.logger.warning("🚀 高频风控循环 (HF Risk Loop) 已启动 (2s 周期)...")
         
+        # (从 start() 循环中移动过来的配置)
         MULTI_TP_STAGE_1_PERCENT = 0.04
         MULTI_TP_STAGE_2_PERCENT = 0.10
         MAX_LOSS_PERCENT = settings.MAX_LOSS_CUTOFF_PERCENT / 100.0
         DUST_MARGIN_USDT = 1.0
-        LIMIT_ORDER_TIMEOUT_MS = settings.AI_LIMIT_ORDER_TIMEOUT_SECONDS * 1000
         
         while True:
             try:
-                # 步骤 1: 状态同步
-                try:
-                    await self.portfolio.sync_state()
-                except Exception as e_sync:
-                    self.logger.critical(f"Main loop sync_state failed: {e_sync}. Skipping AI cycle, will retry...", exc_info=True)
-                    await asyncio.sleep(30) 
-                    continue
-                
-                # 步骤 2: 限价单超时清理
-                if self.is_live_trading and self.portfolio.pending_limit_orders:
-                    now_ms = time.time() * 1000
-                    orders_to_cancel = []
-                    try:
-                        for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
-                            order_id = plan.get('order_id')
-                            timestamp = plan.get('timestamp')
-                            if not order_id:
-                                self.logger.warning(f"Pending order {symbol} 缺少 order_id，正在从本地清理...")
-                                await self.portfolio.remove_pending_limit_order(symbol)
-                                continue
-                            if not timestamp:
-                                self.logger.warning(f"!!! ORPHAN TIMEOUT !!! {symbol} (ID: {order_id}) 缺少 timestamp。立即取消...")
-                                orders_to_cancel.append((order_id, symbol))
-                                await self.portfolio.remove_pending_limit_order(symbol)
-                                continue
-                            if (now_ms - timestamp) > LIMIT_ORDER_TIMEOUT_MS:
-                                self.logger.warning(f"!!! LIMIT ORDER TIMEOUT !!! {symbol} (ID: {order_id}) 已超时 {LIMIT_ORDER_TIMEOUT_MS / 1000}s。正在取消...")
-                                orders_to_cancel.append((order_id, symbol))
-                                await self.portfolio.remove_pending_limit_order(symbol)
+                # 仅在实盘且 position_manager 加载后运行
+                if self.is_live_trading and self.portfolio.position_manager:
+                    
+                    # 1. 高频获取 Tickers (这是唯一的 API 调用)
+                    # (使用 fetch_tickers 一次性获取所有持仓的价格)
+                    open_positions = self.portfolio.position_manager.get_all_open_positions()
+                    if not open_positions:
+                        await asyncio.sleep(2) # 没有持仓时休息
+                        continue
                         
-                        if orders_to_cancel:
-                            cancel_tasks = [self.client.cancel_order(oid, sym) for oid, sym in orders_to_cancel]
-                            await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                            self.logger.info(f"成功取消 {len(orders_to_cancel)} 个超时/孤儿订单。")
-                    except Exception as e_timeout:
-                        self.logger.error(f"限价单超时清理时发生错误: {e_timeout}", exc_info=True)
+                    symbols_to_check = list(open_positions.keys())
+                    tickers = {}
+                    try:
+                        tickers = await self.client.fetch_tickers(symbols_to_check)
+                    except Exception as e_ticker:
+                        self.logger.error(f"HF Risk Loop: 获取 tickers 失败: {e_ticker}")
+                        await asyncio.sleep(2) # 出错时休息
+                        continue
 
-                # 步骤 3: [高频] 获取所有特征数据
-                await self._update_fear_and_greed_index()
-                market_data, tickers = await self._gather_all_market_data()
-
-                # 步骤 4: [高频] Python Rule 8 执行 (已集成 ML)
-                if settings.ENABLE_BREAKOUT_MODIFIER:
-                    if self.is_live_trading:
-                        rule8_orders = await self._check_python_rule_8(market_data)
-                        if rule8_orders:
-                            self.logger.warning(f"🔥 Python Rule 8 (ML) TRIGGERED! Executing {len(rule8_orders)} orders.")
-                            await self._execute_decisions(rule8_orders, market_data)
-                
-                # 步骤 5: [高频] 硬性风控检查
-                if self.is_live_trading and tickers:
+                    # --- 2. [重要] 从 start() 循环的步骤 5 复制过来的风控逻辑 ---
                     positions_to_close = {} 
                     positions_to_partial_close = []
                     sl_update_tasks = [] 
 
-                    open_symbols = set(self.portfolio.position_manager.get_all_open_positions().keys())
+                    open_symbols = set(open_positions.keys())
                     for symbol in list(self.tp_counters.keys()):
                         if symbol not in open_symbols:
-                            self.logger.info(f"Removing TP counter for closed position: {symbol}")
+                            self.logger.info(f"HF Risk Loop: Removing TP counter for closed position: {symbol}")
                             del self.tp_counters[symbol]
 
                     try:
-                        open_positions = self.portfolio.position_manager.get_all_open_positions()
-                        
                         for symbol, state in open_positions.items():
                             price = tickers.get(symbol, {}).get('last')
                             if not price or price <= 0: continue
@@ -1350,7 +1315,7 @@ class AlphaTrader:
                             margin = state.get('margin')
                             
                             if not all([entry, size, side, lev, margin]) or lev <= 0 or entry <= 0 or margin <= 0:
-                                self.logger.warning(f"Risk Check: Skipping {symbol}, invalid state data.")
+                                self.logger.warning(f"HF Risk Loop: Skipping {symbol}, invalid state data.")
                                 continue
 
                             upl = (price - entry) * size if side == 'long' else (entry - price) * size
@@ -1359,6 +1324,7 @@ class AlphaTrader:
                             inval_cond = state.get('invalidation_condition') or '' 
                             is_rule_8_trade = "Python Rule 8" in inval_cond
 
+                            # --- 规则 A: Python Rule 8 动态追踪止损 ---
                             if is_rule_8_trade:
                                 trail_percent = settings.BREAKOUT_TRAIL_STOP_PERCENT
                                 current_sl = state.get('ai_suggested_stop_loss', 0.0)
@@ -1373,8 +1339,9 @@ class AlphaTrader:
                                     sl_update_tasks.append(
                                         self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Rule 8 Trail Stop")
                                     )
-                            
+                                # (已删除 continue 修复)
 
+                            # --- 规则 B: AI (Rule 6) 仓位管理 ---
                             if rate <= -MAX_LOSS_PERCENT:
                                 reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
                                 if symbol not in positions_to_close: positions_to_close[symbol] = reason
@@ -1410,23 +1377,109 @@ class AlphaTrader:
                             elif rate >= MULTI_TP_STAGE_1_PERCENT and counters['stage1'] == 0:
                                 positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 1 (>{MULTI_TP_STAGE_1_PERCENT:.0%})"))
                                 counters['stage1'] = 1 
+                    
+                    except Exception as e_risk_inner:
+                        self.logger.error(f"HF Risk Loop 内部错误: {e_risk_inner}", exc_info=True)
 
-                    except Exception as e_risk:
-                        self.logger.error(f"High-frequency risk check error: {e_risk}", exc_info=True)
-
+                    # 3. 执行风控动作
                     if sl_update_tasks:
                         await asyncio.gather(*sl_update_tasks, return_exceptions=True)
                     if positions_to_close:
-                         tasks_close = [self.portfolio.live_close(symbol, reason=reason) for symbol, reason in positions_to_close.items()]
+                         tasks_close = [self.portfolio.live_close(symbol, reason=f"HF Risk Loop: {reason}") for symbol, reason in positions_to_close.items()]
                          await asyncio.gather(*tasks_close, return_exceptions=True)
-                         self.logger.info(f"Hard Close actions executed for: {list(positions_to_close.keys())}")
+                         self.logger.info(f"HF Risk Loop: Hard Close actions executed for: {list(positions_to_close.keys())}")
                     if positions_to_partial_close:
                         final_partial_tasks = []
                         for symbol, size_pct, reason in positions_to_partial_close:
                             if symbol not in positions_to_close:
-                                final_partial_tasks.append(self.portfolio.live_partial_close(symbol, size_percent=size_pct, reason=reason))
+                                final_partial_tasks.append(self.portfolio.live_partial_close(symbol, size_percent=size_pct, reason=f"HF Risk Loop: {reason}"))
                         if final_partial_tasks:
                             await asyncio.gather(*final_partial_tasks, return_exceptions=True)
+
+                await asyncio.sleep(2) # 2 秒高频循环
+                
+            except asyncio.CancelledError: 
+                self.logger.warning("HF Risk Loop task cancelled, shutting down..."); 
+                break
+            except Exception as e: 
+                self.logger.critical(f"HF Risk Loop 致命错误: {e}", exc_info=True); 
+                await asyncio.sleep(10) # 发生严重错误时降速
+    # --- [新循环结束] ---
+
+
+    async def start(self):
+        """
+        [已修改] 启动 AlphaTrader 主循环 (低频)
+        并创建高频风控循环。
+        """
+        self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
+        if self.is_live_trading:
+            self.logger.warning("!!! LIVE MODE !!! Syncing state on startup...")
+            if not hasattr(self, 'client') and hasattr(self.portfolio, 'client'): self.client = self.portfolio.client
+            try: 
+                await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
+            except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
+        
+        # --- [新] 启动高频风控循环 (在后台独立运行) ---
+        asyncio.create_task(self.high_frequency_risk_loop())
+        
+        # (从风控循环中移除这些定义)
+        LIMIT_ORDER_TIMEOUT_MS = settings.AI_LIMIT_ORDER_TIMEOUT_SECONDS * 1000
+        
+        while True:
+            try:
+                # 步骤 1: 状态同步 (10s 周期)
+                try:
+                    await self.portfolio.sync_state()
+                except Exception as e_sync:
+                    self.logger.critical(f"Main loop sync_state failed: {e_sync}. Skipping AI cycle, will retry...", exc_info=True)
+                    await asyncio.sleep(30) 
+                    continue
+                
+                # 步骤 2: 限价单超时清理 (10s 周期)
+                if self.is_live_trading and self.portfolio.pending_limit_orders:
+                    # ... (此处的超时清理逻辑不变) ...
+                    now_ms = time.time() * 1000
+                    orders_to_cancel = []
+                    try:
+                        for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
+                            order_id = plan.get('order_id')
+                            timestamp = plan.get('timestamp')
+                            if not order_id:
+                                await self.portfolio.remove_pending_limit_order(symbol)
+                                continue
+                            if not timestamp:
+                                orders_to_cancel.append((order_id, symbol))
+                                await self.portfolio.remove_pending_limit_order(symbol)
+                                continue
+                            if (now_ms - timestamp) > LIMIT_ORDER_TIMEOUT_MS:
+                                orders_to_cancel.append((order_id, symbol))
+                                await self.portfolio.remove_pending_limit_order(symbol)
+                        
+                        if orders_to_cancel:
+                            cancel_tasks = [self.client.cancel_order(oid, sym) for oid, sym in orders_to_cancel]
+                            await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                            self.logger.info(f"Main Loop: 成功取消 {len(orders_to_cancel)} 个超时/孤儿订单。")
+                    except Exception as e_timeout:
+                        self.logger.error(f"Main Loop: 限价单超时清理时发生错误: {e_timeout}", exc_info=True)
+
+
+                # 步骤 3: [低频] 获取所有特征数据 (10s 周期)
+                await self._update_fear_and_greed_index()
+                market_data, tickers = await self._gather_all_market_data()
+
+                # 步骤 4: [中频] Python Rule 8 执行 (10s 周期)
+                if settings.ENABLE_BREAKOUT_MODIFIER:
+                    if self.is_live_trading:
+                        rule8_orders = await self._check_python_rule_8(market_data)
+                        if rule8_orders:
+                            self.logger.warning(f"🔥 Python Rule 8 (ML) TRIGGERED! Executing {len(rule8_orders)} orders.")
+                            await self._execute_decisions(rule8_orders, market_data)
+                
+                # --- [已删除] ---
+                # 步骤 5: [高频] 硬性风控检查
+                # (此逻辑已移至 high_frequency_risk_loop)
+                # --- [已删除] ---
                 
                 # 步骤 6: [低频] 决定是否触发 AI (Rule 6)
                 trigger_ai, reason, now = False, "", time.time()
@@ -1434,8 +1487,8 @@ class AlphaTrader:
                 if now - self.last_run_time >= interval: trigger_ai, reason = True, "Scheduled"
                 
                 if not trigger_ai:
+                    # ... (此处的事件触发逻辑不变) ...
                     cooldown = settings.AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES
-                    
                     if now - self.last_event_trigger_ai_time > (cooldown * 60):
                         for sym in self.symbols:
                             ohlcv_15m = []
@@ -1463,11 +1516,9 @@ class AlphaTrader:
                     self.logger.debug("Pre-processing ML scores for AI (L3)...")
                     for symbol in self.symbols:
                         if symbol in market_data:
-                            # 1. 获取 Anomaly 得分
                             anomaly_score = await self._get_ml_anomaly_score(symbol, market_data)
                             market_data[symbol]['anomaly_score'] = anomaly_score
                             
-                            # 2. 获取 Rule 8 (RF) 概率
                             ml_pred = await self._get_ml_prediction_rule8(symbol, market_data)
                             market_data[symbol]['ml_proba_up'] = ml_pred['proba_up']
                             market_data[symbol]['ml_proba_down'] = ml_pred['proba_down']
@@ -1476,8 +1527,8 @@ class AlphaTrader:
                     await self.run_cycle(market_data, tickers); 
                     self.last_run_time = now
                 
-                await asyncio.sleep(10) # 10秒主循环
-            except asyncio.CancelledError: self.logger.warning("Task cancelled, shutting down..."); break
+                await asyncio.sleep(10) # 10秒主循环 (低频)
+            except asyncio.CancelledError: self.logger.warning("Main loop task cancelled, shutting down..."); break
             except Exception as e: 
                 self.logger.critical(f"Main loop fatal error (outside sync/AI): {e}", exc_info=True); 
                 await asyncio.sleep(60)
