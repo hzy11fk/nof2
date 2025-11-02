@@ -1,8 +1,8 @@
-# 文件: alpha_trader.py (完整优化版 - L2/L3 混合模型 + RSI动能突破)
+# 文件: alpha_trader.py (完整优化版 - V-Final)
 # 描述: 
 # L3 (LLM): Rule 6 策略, 由 L2 辅助
 # L2 (ML): Rule 8 RF模型 + Anomaly模型, 作为“专家顾问”
-# L1 (Python): Rule 8 (RSI动能突破) 执行, 硬风控
+# L1 (Python): Rule 8 (K线收盘价突破) 执行, 硬风控
 
 import logging
 import asyncio
@@ -30,7 +30,6 @@ except ImportError:
 class AlphaTrader:
     
     # --- [AI (Rule 6) 专用 PROMPT] ---
-    # (已修改 - 整合 Anomaly, ML Proba, 高级回调, 无对冲, 挂单修复)
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -43,6 +42,11 @@ class AlphaTrader:
         -   To prevent "chasing price," your **only** strategy is to be patient and trade pullbacks (Rule 6.1), mean-reversion (Rule 6.2), or chop-zones (Rule 6.3).
         -   You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL`.
         -   All fast market-order trades (Rule 8) are handled by a separate, high-frequency Python algorithm.
+
+    1.A. **Data Supremacy Rule (CRITICAL):**
+        -   You will be provided with a `Previous AI Summary` for context.
+        -   You MUST treat all data in the `Multi-Timeframe Market Data Overview` (e.g., current Price, RSI, ADX, ML_Proba) as the **absolute truth**.
+        -   If the new, current data contradicts your `Previous AI Summary`, you **MUST** discard your old plan and create a new one based **only** on the new data.
 
     1.5. **Anomaly Veto Rule (CRITICAL):**
         -   Before ANY action, you MUST check the `Anomaly_Score` for the symbol. A low score (e.g., < -0.1) indicates the market is behaving erratically.
@@ -73,9 +77,9 @@ class AlphaTrader:
 
     5.  **Complete Trade Plans (Open/Add):**
         Every new order (LIMIT) is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
-        -   **Smarter Invalidation:** Your `invalidation_condition` MUST be based on a clear technical breakdown of the *original trade thesis*.
-            -   *Trend Trade Example:* `Invalidation='1h Close below the EMA 50'`
-            -   *Ranging Trade Example:* `InvalidATION='15m RSI breaks above 60'`
+        -   **Smarter Invalidation:** Your `stop_loss` (SL) *is* the invalidation of your trade thesis. Do NOT set a separate, tighter technical `invalidation_condition` (like '1h Close above EMA 50') that can be triggered by market noise.
+            -   **You MUST** set the `invalidation_condition` to a simple string describing the SL.
+            -   *Example:* `invalidation_condition="Stop Loss hit (ATR-based)"`
         -   **Smarter Stop-Loss (Pullbacks):** For Rule 6.1 (Pullback) trades, your `stop_loss` MUST be placed relative to volatility using the **ATR**.
             -   *Example (Long):* Place `stop_loss` at `[Confluence_Zone_Low] - (1.5 * 1h_atr_14)`.
             -   *Example (Short):* Place `stop_loss` at `[Confluence_Zone_High] + (1.5 * 1h_atr_14)`.
@@ -83,7 +87,7 @@ class AlphaTrader:
 
     6.  **Market State Recognition (Default Strategy):**
         You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes. This is your **Default Strategy**.
-        -   **1. Strong Trend (Trending Bullish/Bearish) [OPTIMIZED]:**
+        -   **1. Strong Trend (Trending Bullish/Bearish):**
             -   **Condition:** 1h or 4h **ADX_14 > 25**.
             -   **Strategy (LIMIT ONLY):** Identify a **'Pullback Confluence Zone'**. This is a small price area where **at least two** key S/R levels overlap, creating a much stronger barrier.
                 -   *Zone Example (Long):* The `1h EMA 20` is at $65,100 **AND** the `4h BB_Mid` is at $65,050. The zone is 65,050-65,100.
@@ -95,13 +99,16 @@ class AlphaTrader:
         -   **2. Ranging (No Trend):**
             -   **Condition:** 1h and 4h **ADX_14 < 20**.
             -   **Strategy (LIMIT ONLY):** In this regime, your **only** strategy is **mean-reversion**. Identify the `BB_Upper` and `BB_Lower` levels. You MUST issue **`LIMIT_SELL` at (or near) the upper band** or **`LIMIT_BUY` at (or near) the lower band**.
-            -   **[ML Confirmation]:** This is a High-Confidence trade *only if* the `ML_Proba_DOWN` (for Sell) or `ML_Proba_UP` (for Buy) confirms the reversal (e.g., > 0.60).
+            -   **[ML Confirmation]: You MUST check the correct probability for your direction.**
+                -   *For LIMIT_SELL:* You MUST check `ML_Proba_DOWN > 0.60`.
+                -   *For LIMIT_BUY:* You MUST check `ML_Proba_UP > 0.60`.
+                -   *VETO:* If the OPPOSITE probability is high (e.g., `ML_Proba_UP > 0.70` when you want to `LIMIT_SELL`), you MUST ABORT the trade.
         -   **3. Chop (Short-Term Ranging):**
             -   **Condition:** 1h or 4h **ADX_14 is between 20 and 25**.
             -   **Strategy (LIMIT ONLY):** This is a low-conviction market. Shift focus to the **15min timeframe**.
             -   Identify the `15min_bb_upper` and `15min_bb_lower` levels.
             -   You MAY issue **`LIMIT_SELL` at the 15m upper band** or **`LIMIT_BUY` at the 15m lower band**.
-            -   **[ML Confirmation]:** This is a low-confidence trade. You MUST use a reduced `risk_percent` (e.g., 0.01 or 0.015) and tighter stops, AND the `ML_Proba` should confirm (e.g., > 0.55).
+            -   **[ML Confirmation]:** This is a low-confidence trade. You MUST use a reduced `risk_percent` (e.g., 0.01 or 0.015) and tighter stops, AND the correct `ML_Proba` should confirm (e.g., > 0.55).
 
     7.  **Market Sentiment Filter (Fear & Greed Index):**
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter.
@@ -142,14 +149,15 @@ class AlphaTrader:
         Current Market Correlation Assessment: [Assess if positions are overly correlated based on Correlation Control (Rule 4) hard caps]
 
         Let's break down each position:
+        (Note: Python-based Rule 8 trades are managed by Python and are NOT listed here.)
+
         1. [SYMBOL] ([SIDE]):
            UPL: [Current Unrealized PNL and Percent (e.g., +$50.00 (+5.5%))]
            Multi-Timeframe Analysis: [Brief assessment across 5m, 15m, 1h, 4h, mentioning ADX/BBands]
            
            Anomaly Check: [MUST check Anomaly_Score. If < -0.1, prioritize CLOSE.]
            
-           Invalidation Check: [Check condition vs current data. If met, MUST issue CLOSE.]
-           (Note: Python-based Rule 8 trades use their own trailing stop logic and are not managed by you)
+           Invalidation Check: [The `ai_suggested_stop_loss` is the invalidation. Python will close it if hit.]
            
            Reversal & Profit Save Check:
            - [Is this profitable position (UPL > +1.0%) showing strong signs of reversal?]
@@ -165,10 +173,10 @@ class AlphaTrader:
            - [CRITICAL: You MUST NEVER add to a losing position (UPL < 0). Averaging down is forbidden.]
            
            SL/TP Target Update Check:
-           - [Are the current ai_suggested_stop_loss/take_profit targets still optimal based on new data?]
+           - [Assess if the `ai_suggested_stop_loss` or `ai_suggested_take_profit` targets are still optimal based on new data (e.g., move SL up to new 15m BB_Mid).]
            - [IF NOT OPTIMAL: Issue UPDATE_STOPLOSS / UPDATE_TAKEPROFIT.]
            
-           Decision: [Hold/Close/Partial Close/Add/Update StopLoss/Update TakeProfit + Reason. NOTE: Anomaly, Invalidation and Reversal checks override all "Hold" decisions.]
+           Decision: [Hold/Close/Partial Close/Add/Update StopLoss/Update TakeProfit + Reason. NOTE: Anomaly and Reversal checks override all "Hold" decisions.]
 
         ... [Repeat for each open position] ...
 
@@ -182,7 +190,7 @@ class AlphaTrader:
         
         [Analyze opportunities based ONLY on Rule 6, ensuring they pass Rule 1.5 (Anomaly) and Rule 6 (ML Confirmation)]
         
-        [EXAMPLE - RULE 6.1 (OPTIMIZED PULLBACK):]
+        [EXAMPLE - RULE 6.1 (Trending Pullback):]
         BTC Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
         - Anomaly Score: -0.05 (Safe)
         - 4h Trend: Bullish | 1h Momentum: Strong | 15min Setup: Price pulling back.
@@ -191,14 +199,14 @@ class AlphaTrader:
         - ML Confirmation: ML_Proba_UP = 0.68 (Confidence: High)
         - Signal Confluence Score: 5/5 | Final Confidence: High - **PREPARE LIMIT_BUY at 65,100 (Rule 6.1)**
 
-        [EXAMPLE - RULE 6.2 (RANGING VETO):]
+        [EXAMPLE - RULE 6.2 (Ranging):]
         ETH Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
         - Anomaly Score: -0.08 (Safe)
         - 4h Trend: N/A | 1h Setup: Price is *approaching* 1h BB_Upper (@ 3900.0) | 15min RSI: 68.5 (Approaching Overbought)
         - ML Confirmation: ML_Proba_DOWN = 0.45 (Confidence: Low)
         - Signal Confluence Score: 2/4 (ML Confirmation FAILED) | Final Confidence: Low - **ABORT LIMIT_SELL**
 
-        [EXAMPLE - RULE 1.5 (ANOMALY VETO):]
+        [EXAMPLE - RULE 1.5 (Anomaly Veto):]
         SOL Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=30):
         - Anomaly Score: -0.21 (High Risk - VETO)
         - 4h Trend: Bullish | 1h Momentum: Strong.
@@ -212,8 +220,8 @@ class AlphaTrader:
 
     **Order Object Rules:**
     (Market Order Templates Removed)
-    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Support]"}}`
-    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "...", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Resistance]"}}`
+    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Support]"}}`
+    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Resistance]"}}`
     -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
     -   **To Close Partially (Take Profit):** `{{"action": "PARTIAL_CLOSE", "symbol": "...", "size_percent": 0.5, "reasoning": "Taking 50% profit near resistance per Rule 5..."}}` (or `size_absolute`)
     -   **To Update Stop Loss:** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Actively moving SL to new 15m support level..."}}`
@@ -395,7 +403,6 @@ class AlphaTrader:
                         if len(df) >= 28:
                             try:
                                 high = df['h']; low = df['l']; close = df['c']; period = 14
-                                # (使用 pandas_ta 计算)
                                 adx_data = ta.adx(high, low, close, length=period)
                                 atr_data = ta.atr(high, low, close, length=period)
                                 if adx_data is not None and not adx_data.empty:
@@ -410,17 +417,14 @@ class AlphaTrader:
                                 period = 20; std_dev = 2.0; closes = df['c']
                                 bbands = ta.bbands(closes, length=period, std=std_dev)
                                 if bbands is not None and not bbands.empty:
-                                    
-                                    # --- [修复] 使用 iloc 按列索引访问 ---
-                                    market_indicators_data[symbol][f'{prefix}bb_upper'] = bbands.iloc[:, 2].iloc[-1] # BBU (Upper)
-                                    market_indicators_data[symbol][f'{prefix}bb_middle'] = bbands.iloc[:, 1].iloc[-1] # BBM (Middle)
-                                    market_indicators_data[symbol][f'{prefix}bb_lower'] = bbands.iloc[:, 0].iloc[-1] # BBL (Lower)
+                                    market_indicators_data[symbol][f'{prefix}bb_upper'] = bbands.iloc[:, 2].iloc[-1] # BBU
+                                    market_indicators_data[symbol][f'{prefix}bb_middle'] = bbands.iloc[:, 1].iloc[-1] # BBM
+                                    market_indicators_data[symbol][f'{prefix}bb_lower'] = bbands.iloc[:, 0].iloc[-1] # BBL
                                     
                                     if timeframe == '15m':
                                         market_indicators_data[symbol][f'{prefix}bb_upper_prev'] = bbands.iloc[:, 2].iloc[-2]
                                         market_indicators_data[symbol][f'{prefix}bb_lower_prev'] = bbands.iloc[:, 0].iloc[-2]
                                         market_indicators_data[symbol][f'{prefix}close_prev'] = closes.iloc[-2]
-                                    # --- [修复结束] ---
 
                             except Exception as e:
                                 self.logger.warning(f"ta BBands calc failed for {symbol} {timeframe}: {e}", exc_info=True)
@@ -472,6 +476,7 @@ class AlphaTrader:
                             market_indicators_data[symbol][f'{prefix}recent_low']=df['l'].tail(20).min()
                         
                         
+                        # --- 2. 计算 Anomaly (IsolationForest) 特征 ---
                         if timeframe == '15m' and len(df) >= 21: 
                             try:
                                 df['returns'] = df['c'].pct_change()
@@ -503,8 +508,13 @@ class AlphaTrader:
         except Exception as e: self.logger.error(f"Error gathering market data: {e}", exc_info=True)
         return market_indicators_data, fetched_tickers
 
+
     def _build_prompt(self, market_data: Dict[str, Dict[str, Any]], portfolio_state: Dict, tickers: Dict) -> str:
         prompt = f"It has been {(time.time() - self.start_time)/60:.0f} minutes since start.\n"
+        
+        prompt += "\n--- Previous AI Summary (For Context Only) ---\n"
+        prompt += f"{self.last_strategy_summary}\n"
+        
         prompt += "\n--- Multi-Timeframe Market Data Overview (5m, 15m, 1h, 4h) ---\n"
         def safe_format(value, precision, is_rsi=False):
             is_na = pd.isna(value) if pd else value is None
@@ -557,8 +567,8 @@ class AlphaTrader:
         prompt += f"Total Equity: {portfolio_state.get('account_value_usd', 'N/A')}\n" 
         prompt += f"Available Cash: {portfolio_state.get('cash_usd', 'N/A')}\n" 
 
-        prompt += "Open Positions (Live / Filled):\n"
-        prompt += portfolio_state.get('open_positions', "No open positions.")
+        prompt += "Open Positions (Live / Filled - Rule 6 Only):\n"
+        prompt += portfolio_state.get('open_positions_rule6', "No open positions.")
         prompt += "\n\nPending Limit Orders (AI Rule 6 - Waiting / Unfilled):\n"
         prompt += portfolio_state.get('pending_limit_orders', "No pending limit orders.")
         
@@ -858,17 +868,18 @@ class AlphaTrader:
                 price = data.get('current_price')
                 adx_1h = data.get('1hour_adx_14')
                 
-                # [修改] 使用 RSI 动能突破所需的数据
-                rsi_14 = data.get('15min_rsi_14')
-                rsi_14_prev = data.get('15min_rsi_14_prev')
+                # [修改] 换回 "K线收盘价" 触发器
+                close_prev = data.get('15min_close_prev')
+                bb_upper_prev = data.get('15min_bb_upper_prev')
+                bb_lower_prev = data.get('15min_bb_lower_prev')
 
                 ohlcv_15m = data.get('ohlcv_15m')
                 vol_ratio_5m = data.get('5min_volume_ratio')
                 vol_ratio_15m = data.get('15min_volume_ratio')
                 ema_50_4h = data.get('4hour_ema_50')
                 
-                if not all([price, adx_1h, rsi_14, rsi_14_prev, vol_ratio_5m, vol_ratio_15m, ema_50_4h, ohlcv_15m]):
-                    self.logger.debug(f"Rule 8 Skipping {symbol}: Missing key data (incl. RSI values or ohlcv_15m).")
+                if not all([price, adx_1h, close_prev, bb_upper_prev, bb_lower_prev, vol_ratio_5m, vol_ratio_15m, ema_50_4h, ohlcv_15m]):
+                    self.logger.debug(f"Rule 8 Skipping {symbol}: Missing key data (incl. _prev values or ohlcv_15m).")
                     continue
 
                 ml_proba_up = 0.5 
@@ -889,8 +900,8 @@ class AlphaTrader:
                 # --- [修改] b. SIGNAL (Break) ---
                 
                 # --- 检查做多 (BUY) ---
-                # 新逻辑: 检查“RSI 刚刚突破 50”
-                if rsi_14_prev <= 50 and rsi_14 > 50:
+                # 换回 "K线收盘价" 逻辑
+                if close_prev > bb_upper_prev:
                     
                     if price < ema_50_4h: continue
                     if fng_value > 75: continue
@@ -913,8 +924,8 @@ class AlphaTrader:
                     action = "BUY"
 
                 # --- 检查做空 (SELL) ---
-                # 新逻辑: 检查“RSI 刚刚跌破 50”
-                elif rsi_14_prev >= 50 and rsi_14 < 50:
+                # 换回 "K线收盘价" 逻辑
+                elif close_prev < bb_lower_prev:
                     
                     if price > ema_50_4h: continue
                     if fng_value < 25: continue
@@ -938,7 +949,7 @@ class AlphaTrader:
                 # --- [修改结束] ---
 
                 if action:
-                    self.logger.warning(f"🔥 RULE 8 (Python + RSI Momentum): {action} Signal for {symbol} (Prob Up: {ml_proba_up:.2f}, Down: {ml_proba_down:.2f})")
+                    self.logger.warning(f"🔥 RULE 8 (Python + K-Line Confirm): {action} Signal for {symbol} (Prob Up: {ml_proba_up:.2f}, Down: {ml_proba_down:.2f})")
                     order = self._build_python_order(
                         symbol, 
                         action, 
@@ -1235,7 +1246,7 @@ class AlphaTrader:
         self.invocation_count += 1
         if not self.is_live_trading: await self._check_and_execute_hard_stops()
 
-        portfolio_state = self.portfolio.get_state_for_prompt(tickers)
+        portfolio_state = self.portfolio.get_state_for_prompt(tickers, filter_rule8=True)
         
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
@@ -1325,8 +1336,10 @@ class AlphaTrader:
                             lev = state.get('leverage')
                             margin = state.get('margin')
                             
-                            if not all([entry, size, side, lev, margin]) or lev <= 0 or entry <= 0 or margin <= 0:
-                                self.logger.warning(f"HF Risk Loop: Skipping {symbol}, invalid state data.")
+                            initial_sl = state.get('ai_suggested_stop_loss', 0.0) 
+                            
+                            if not all([entry, size, side, lev, margin, initial_sl]) or lev <= 0 or entry <= 0 or margin <= 0 or initial_sl <= 0:
+                                self.logger.warning(f"HF Risk Loop: Skipping {symbol}, invalid state data (entry, size, side, lev, margin, or initial_sl missing/zero).")
                                 continue
 
                             upl = (price - entry) * size if side == 'long' else (entry - price) * size
@@ -1337,7 +1350,7 @@ class AlphaTrader:
 
                             if is_rule_8_trade:
                                 trail_percent = settings.BREAKOUT_TRAIL_STOP_PERCENT
-                                current_sl = state.get('ai_suggested_stop_loss', 0.0)
+                                current_sl = initial_sl
                                 new_sl = 0.0
                                 
                                 if side == 'long': new_sl = price * (1 - trail_percent)
@@ -1349,7 +1362,6 @@ class AlphaTrader:
                                     sl_update_tasks.append(
                                         self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Rule 8 Trail Stop")
                                     )
-                                # [修复] 删除 continue
 
                             if rate <= -MAX_LOSS_PERCENT:
                                 reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
@@ -1361,10 +1373,10 @@ class AlphaTrader:
                                 if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                 continue 
 
-                            ai_sl = state.get('ai_suggested_stop_loss')
-                            if ai_sl and ai_sl > 0:
-                                if (side == 'long' and price <= ai_sl) or (side == 'short' and price >= ai_sl):
-                                    reason = f"AI SL Hit ({ai_sl:.4f})"
+                            current_active_sl = state.get('ai_suggested_stop_loss') 
+                            if current_active_sl and current_active_sl > 0:
+                                if (side == 'long' and price <= current_active_sl) or (side == 'short' and price >= current_active_sl):
+                                    reason = f"AI SL Hit ({current_active_sl:.4f})"
                                     if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                     continue 
 
@@ -1474,8 +1486,8 @@ class AlphaTrader:
                     if self.is_live_trading:
                         rule8_orders = await self._check_python_rule_8(market_data)
                         if rule8_orders:
-                            self.logger.warning(f"🔥 Python Rule 8 (RSI Momentum) TRIGGERED! Executing {len(rule8_orders)} orders.")
-                            await self._execute_decisions(rule8_orders, market_data)
+                            self.logger.warning(f"🔥 Python Rule 8 (K-Line Confirm) TRIGGERED! Executing {len(rule8_orders)} orders.")
+                            await self.execute_decisions(rule8_orders, market_data)
                 
                 # 步骤 5: [已删除]
                 # (风控逻辑已移至 high_frequency_risk_loop)
@@ -1492,7 +1504,6 @@ class AlphaTrader:
                         for sym in self.symbols:
                             ohlcv_15m = []
                             try: 
-                                # (我们已经在 market_data 中获取了 15m K线)
                                 ohlcv_15m = market_data.get(sym, {}).get('ohlcv_15m', [])
                                 if not ohlcv_15m: continue
 
