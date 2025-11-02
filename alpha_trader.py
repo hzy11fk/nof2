@@ -1426,8 +1426,12 @@ class AlphaTrader:
                 self.logger.critical(f"HF Risk Loop 致命错误: {e}", exc_info=True); 
                 await asyncio.sleep(10)
 
-
     async def start(self):
+        """
+        [已修改] 启动 AlphaTrader 主循环 (低频)
+        并创建高频风控循环。
+        主循环 (10s) 负责 Rule 6 的 ATR 追踪止损。
+        """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
             self.logger.warning("!!! LIVE MODE !!! Syncing state on startup...")
@@ -1487,10 +1491,66 @@ class AlphaTrader:
                         rule8_orders = await self._check_python_rule_8(market_data)
                         if rule8_orders:
                             self.logger.warning(f"🔥 Python Rule 8 (K-Line Confirm) TRIGGERED! Executing {len(rule8_orders)} orders.")
-                            await self.execute_decisions(rule8_orders, market_data)
+                            await self._execute_decisions(rule8_orders, market_data)
                 
-                # 步骤 5: [已删除]
-                # (风控逻辑已移至 high_frequency_risk_loop)
+                # --- [新逻辑] 步骤 5: [中频] Rule 6 ATR 追踪止损 (10s 周期) ---
+                if self.is_live_trading:
+                    sl_update_tasks_rule6 = []
+                    try:
+                        open_positions_rule6 = self.portfolio.position_manager.get_all_open_positions()
+                        for symbol, state in open_positions_rule6.items():
+                            inval_cond = state.get('invalidation_condition') or '' 
+                            is_rule_8_trade = "Python Rule 8" in inval_cond
+                            
+                            # 只管理 Rule 6 仓位 (AI 仓位)
+                            if is_rule_8_trade:
+                                continue
+                                
+                            # 确保仓位盈利
+                            price = tickers.get(symbol, {}).get('last')
+                            entry = state.get('avg_entry_price')
+                            side = state.get('side')
+                            if not price or not entry:
+                                continue
+                            
+                            is_profitable = (side == 'long' and price > entry) or (side == 'short' and price < entry)
+                            
+                            if is_profitable:
+                                # 从 market_data 中获取 ATR
+                                atr_15m = market_data.get(symbol, {}).get('15min_atr_14')
+                                if not atr_15m or atr_15m <= 0:
+                                    self.logger.warning(f"Main Loop (ATR Trail): 无法获取 {symbol} 的 15min_atr_14")
+                                    continue
+                                
+                                # 计算新的 ATR 追踪止损
+                                # (使用 2.0 作为乘数, 您可以将其移至 config)
+                                ATR_TRAIL_MULTIPLIER = 2.0 
+                                current_sl = state.get('ai_suggested_stop_loss', 0.0)
+                                new_sl = 0.0
+
+                                if side == 'long':
+                                    new_sl = price - (ATR_TRAIL_MULTIPLIER * atr_15m)
+                                    # 检查新 SL 是否优于 (高于) 当前 SL
+                                    if new_sl > current_sl:
+                                        sl_update_tasks_rule6.append(
+                                            self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Main Loop: Rule 6 ATR Trail")
+                                        )
+                                elif side == 'short':
+                                    new_sl = price + (ATR_TRAIL_MULTIPLIER * atr_15m)
+                                    # 检查新 SL 是否优于 (低于) 当前 SL
+                                    if new_sl < current_sl:
+                                        sl_update_tasks_rule6.append(
+                                            self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Main Loop: Rule 6 ATR Trail")
+                                        )
+
+                        if sl_update_tasks_rule6:
+                            self.logger.info(f"Main Loop (ATR Trail): 正在为 {len(sl_update_tasks_rule6)} 个 Rule 6 仓位更新追踪止损...")
+                            await asyncio.gather(*sl_update_tasks_rule6, return_exceptions=True)
+
+                    except Exception as e_atr_trail:
+                        self.logger.error(f"Main Loop: Rule 6 ATR 追踪止损失败: {e_atr_trail}", exc_info=True)
+                # --- [新逻辑结束] ---
+                
                 
                 # 步骤 6: [低频] 决定是否触发 AI (Rule 6)
                 trigger_ai, reason, now = False, "", time.time()
