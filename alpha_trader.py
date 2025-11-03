@@ -1,8 +1,11 @@
-# 文件: alpha_trader.py (完整优化版 - V-Final)
+# 文件: alpha_trader.py (完整优化版 - V-Memory)
 # 描述: 
-# L3 (LLM): Rule 6 策略, 由 L2 辅助
-# L2 (ML): Rule 8 RF模型 + Anomaly模型, 作为“专家顾问”
-# L1 (Python): Rule 8 (K线收盘价突破) 执行, 硬风控
+# 1. (新) 增加了 "峰值利润记忆" 标签。HF 循环 负责记录 Rule 6 仓位的历史最高UPL。
+# 2. (新) AI (LLM) 现在会看到这个 "Peak_Profit_Achieved" 标签，并使用它来更积极地保护利润。
+# 3. (保留) Rule 8 使用 "K线收盘价" 突破逻辑。
+# 4. (保留) Rule 6 使用 高级回调 + ATR止损 + 提前切断亏损 逻辑。
+# 5. (保留) 2秒/10秒 循环拆分。
+# 6. (保留) 所有 Bug (1R/ATR追踪/No Hedging/Invalidation/ML Bug) 均已修复。
 
 import logging
 import asyncio
@@ -152,16 +155,24 @@ class AlphaTrader:
         (Note: Python-based Rule 8 trades are managed by Python and are NOT listed here.)
 
         1. [SYMBOL] ([SIDE]):
-           UPL: [Current Unrealized PNL and Percent (e.g., +$50.00 (+5.5%))]
+           UPL: [Current Unrealized PNL and Percent (e.g., +$50.00 (+2.1%))]
+           Peak_Profit_Achieved: [Historical high profit percent (e.g., +5.5%)]
            Multi-Timeframe Analysis: [Brief assessment across 5m, 15m, 1h, 4h, mentioning ADX/BBands]
            
            Anomaly Check: [MUST check Anomaly_Score. If < -0.1, prioritize CLOSE.]
            
            Invalidation Check: [The `ai_suggested_stop_loss` is the invalidation. Python will close it if hit.]
            
-           Reversal & Profit Save Check:
-           - [Is this profitable position (UPL > +1.0%) showing strong signs of reversal?]
-           - [IF YES: The risk of giving back profits is high. Decision: MUST issue a CLOSE order to secure profits.]
+           Losing Position Tighter Stop Check (Rule 2.5):
+           - [Is this position losing money (e.g., UPL < -0.5%)?]
+           - [AND is the market structure now strongly opposing the original thesis? (e.g., for a LONG, has the 15m EMA 20 crossed BELOW the 50? Or for a SHORT, has the 15m EMA 20 crossed ABOVE the 50?)]
+           - [IF YES: The original thesis is likely wrong, and the ATR stop-loss is too far. Decision: MUST issue a CLOSE order to cut losses early.]
+           
+           Reversal & Profit Save Check (With Memory):
+           - [Check 1: Is this position *currently* significantly profitable (e.g., UPL Percent > +2.0%)?]
+           - [Check 2: Has this position *previously* been significantly profitable (e.g., Peak_Profit_Achieved > 2.0%) AND has now pulled back significantly (e.g., UPL is < 60% of Peak_Profit)?]
+           - [IF (Check 1 OR Check 2 is True) AND (it is showing *strong* signs of reversal, e.g., 1h RSI divergence):]
+           - [Decision: MUST issue a CLOSE order to secure profits.]
 
            Pyramiding Check (Adding to a Winner):
            - [Is UPL Percent > +2.5% AND is the original trend (ADX > 25) still strong?]
@@ -173,10 +184,10 @@ class AlphaTrader:
            - [CRITICAL: You MUST NEVER add to a losing position (UPL < 0). Averaging down is forbidden.]
            
            SL/TP Target Update Check:
-           - [Assess if the `ai_suggested_stop_loss` or `ai_suggested_take_profit` targets are still optimal based on new data (e.g., move SL up to new 15m BB_Mid).]
-           - [IF NOT OPTIMAL: Issue UPDATE_STOPLOSS / UPDATE_TAKEPROFIT.]
+           - [NOTE: Python handles 1R Breakeven and ATR Trailing automatically. Your task is to assess if the *Take Profit* target is still optimal.]
+           - [IF TP is NOT OPTIMAL: Issue UPDATE_TAKEPROFIT.]
            
-           Decision: [Hold/Close/Partial Close/Add/Update StopLoss/Update TakeProfit + Reason. NOTE: Anomaly and Reversal checks override all "Hold" decisions.]
+           Decision: [Hold/Close/Partial Close/Add/Update TakeProfit + Reason. NOTE: Anomaly, Losing Position Check, and Reversal checks override all "Hold" decisions.]
 
         ... [Repeat for each open position] ...
 
@@ -302,6 +313,8 @@ class AlphaTrader:
         self.logger.info(f"--- 总共加载了 {len(self.ml_anomaly_detectors)} 个 Anomaly ML 模型 ---")
         
         self.tp_counters: Dict[str, Dict[str, int]] = {}
+        # --- [新] 峰值利润追踪器 ---
+        self.peak_profit_tracker: Dict[str, float] = {}
 
 
     def _setup_log_handler(self):
@@ -535,6 +548,10 @@ class AlphaTrader:
             prompt += f"Anomaly_Score: {anomaly_score:.3f} ({anomaly_status})\n"
             prompt += f"ML_Proba_UP (15m): {safe_format(d.get('ml_proba_up'), 2)}\n"
             prompt += f"ML_Proba_DOWN (15m): {safe_format(d.get('ml_proba_down'), 2)}\n"
+            
+            # --- [新] 增加峰值利润 ---
+            prompt += f"Peak_Profit_Achieved: {safe_format(d.get('peak_profit_achieved_percent'), 1)}%\n"
+            # ---
             
             timeframes = ['5min', '15min', '1hour', '4hour']
             
@@ -868,7 +885,6 @@ class AlphaTrader:
                 price = data.get('current_price')
                 adx_1h = data.get('1hour_adx_14')
                 
-                # [修改] 换回 "K线收盘价" 触发器
                 close_prev = data.get('15min_close_prev')
                 bb_upper_prev = data.get('15min_bb_upper_prev')
                 bb_lower_prev = data.get('15min_bb_lower_prev')
@@ -897,10 +913,6 @@ class AlphaTrader:
                 
                 action = None
                 
-                # --- [修改] b. SIGNAL (Break) ---
-                
-                # --- 检查做多 (BUY) ---
-                # 换回 "K线收盘价" 逻辑
                 if close_prev > bb_upper_prev:
                     
                     if price < ema_50_4h: continue
@@ -923,8 +935,6 @@ class AlphaTrader:
                         
                     action = "BUY"
 
-                # --- 检查做空 (SELL) ---
-                # 换回 "K线收盘价" 逻辑
                 elif close_prev < bb_lower_prev:
                     
                     if price > ema_50_4h: continue
@@ -946,7 +956,6 @@ class AlphaTrader:
                         continue
 
                     action = "SELL"
-                # --- [修改结束] ---
 
                 if action:
                     self.logger.warning(f"🔥 RULE 8 (Python + K-Line Confirm): {action} Signal for {symbol} (Prob Up: {ml_proba_up:.2f}, Down: {ml_proba_down:.2f})")
@@ -1324,6 +1333,11 @@ class AlphaTrader:
                         if symbol not in open_symbols:
                             self.logger.info(f"HF Risk Loop: Removing TP counter for closed position: {symbol}")
                             del self.tp_counters[symbol]
+                    # [新] 清理已平仓的峰值利润追踪器
+                    for symbol in list(self.peak_profit_tracker.keys()):
+                        if symbol not in open_symbols:
+                            self.logger.info(f"HF Risk Loop: Removing Peak Profit tracker for closed position: {symbol}")
+                            del self.peak_profit_tracker[symbol]
 
                     try:
                         for symbol, state in open_positions.items():
@@ -1372,6 +1386,27 @@ class AlphaTrader:
                                 reason = f"Dust Close (<{DUST_MARGIN_USDT:.1f}U)"
                                 if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                 continue 
+
+                            if not is_rule_8_trade:
+                                # --- [新] Python 1R 移至盈亏平衡点 (仅限 Rule 6) ---
+                                if abs(initial_sl - entry) > 1e-9: # 仅在 SL 未被移动时检查
+                                    initial_risk_distance = abs(entry - initial_sl)
+                                    current_upl_distance = 0.0
+                                    if side == 'long' and price > entry:
+                                        current_upl_distance = price - entry
+                                    elif side == 'short' and price < entry:
+                                        current_upl_distance = entry - price
+                                        
+                                    if current_upl_distance >= initial_risk_distance:
+                                        self.logger.warning(f"🔥 HF Risk Loop (1R Breakeven): {symbol} 达到 1R。正在将 SL 移至 {entry:.4f}")
+                                        sl_update_tasks.append(
+                                            self.portfolio.update_position_rules(symbol, stop_loss=entry, reason="HF Risk Loop: 1R Breakeven")
+                                        )
+                                
+                                # --- [新] Python 峰值利润追踪器 (仅限 Rule 6) ---
+                                current_peak = self.peak_profit_tracker.get(symbol, 0.0)
+                                if rate > current_peak:
+                                    self.peak_profit_tracker[symbol] = rate
 
                             current_active_sl = state.get('ai_suggested_stop_loss') 
                             if current_active_sl and current_active_sl > 0:
@@ -1426,12 +1461,8 @@ class AlphaTrader:
                 self.logger.critical(f"HF Risk Loop 致命错误: {e}", exc_info=True); 
                 await asyncio.sleep(10)
 
+
     async def start(self):
-        """
-        [已修改] 启动 AlphaTrader 主循环 (低频)
-        并创建高频风控循环。
-        主循环 (10s) 负责 Rule 6 的 ATR 追踪止损。
-        """
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
             self.logger.warning("!!! LIVE MODE !!! Syncing state on startup...")
@@ -1491,9 +1522,9 @@ class AlphaTrader:
                         rule8_orders = await self._check_python_rule_8(market_data)
                         if rule8_orders:
                             self.logger.warning(f"🔥 Python Rule 8 (K-Line Confirm) TRIGGERED! Executing {len(rule8_orders)} orders.")
-                            await self._execute_decisions(rule8_orders, market_data)
+                            await self.execute_decisions(rule8_orders, market_data)
                 
-                # --- [新逻辑] 步骤 5: [中频] Rule 6 ATR 追踪止损 (10s 周期) ---
+                # 步骤 5: [中频] Rule 6 ATR 追踪止损 (10s 周期)
                 if self.is_live_trading:
                     sl_update_tasks_rule6 = []
                     try:
@@ -1502,11 +1533,9 @@ class AlphaTrader:
                             inval_cond = state.get('invalidation_condition') or '' 
                             is_rule_8_trade = "Python Rule 8" in inval_cond
                             
-                            # 只管理 Rule 6 仓位 (AI 仓位)
                             if is_rule_8_trade:
                                 continue
                                 
-                            # 确保仓位盈利
                             price = tickers.get(symbol, {}).get('last')
                             entry = state.get('avg_entry_price')
                             side = state.get('side')
@@ -1516,28 +1545,23 @@ class AlphaTrader:
                             is_profitable = (side == 'long' and price > entry) or (side == 'short' and price < entry)
                             
                             if is_profitable:
-                                # 从 market_data 中获取 ATR
                                 atr_15m = market_data.get(symbol, {}).get('15min_atr_14')
                                 if not atr_15m or atr_15m <= 0:
                                     self.logger.warning(f"Main Loop (ATR Trail): 无法获取 {symbol} 的 15min_atr_14")
                                     continue
                                 
-                                # 计算新的 ATR 追踪止损
-                                # (使用 2.0 作为乘数, 您可以将其移至 config)
                                 ATR_TRAIL_MULTIPLIER = 2.0 
                                 current_sl = state.get('ai_suggested_stop_loss', 0.0)
                                 new_sl = 0.0
 
                                 if side == 'long':
                                     new_sl = price - (ATR_TRAIL_MULTIPLIER * atr_15m)
-                                    # 检查新 SL 是否优于 (高于) 当前 SL
                                     if new_sl > current_sl:
                                         sl_update_tasks_rule6.append(
                                             self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Main Loop: Rule 6 ATR Trail")
                                         )
                                 elif side == 'short':
                                     new_sl = price + (ATR_TRAIL_MULTIPLIER * atr_15m)
-                                    # 检查新 SL 是否优于 (低于) 当前 SL
                                     if new_sl < current_sl:
                                         sl_update_tasks_rule6.append(
                                             self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Main Loop: Rule 6 ATR Trail")
@@ -1549,7 +1573,6 @@ class AlphaTrader:
 
                     except Exception as e_atr_trail:
                         self.logger.error(f"Main Loop: Rule 6 ATR 追踪止损失败: {e_atr_trail}", exc_info=True)
-                # --- [新逻辑结束] ---
                 
                 
                 # 步骤 6: [低频] 决定是否触发 AI (Rule 6)
@@ -1587,12 +1610,19 @@ class AlphaTrader:
                     self.logger.debug("Pre-processing ML scores for AI (L3)...")
                     for symbol in self.symbols:
                         if symbol in market_data:
+                            # 1. 获取 Anomaly 得分
                             anomaly_score = await self._get_ml_anomaly_score(symbol, market_data)
                             market_data[symbol]['anomaly_score'] = anomaly_score
                             
+                            # 2. 获取 Rule 8 (RF) 概率
                             ml_pred = await self._get_ml_prediction_rule8(symbol, market_data)
                             market_data[symbol]['ml_proba_up'] = ml_pred['proba_up']
                             market_data[symbol]['ml_proba_down'] = ml_pred['proba_down']
+                            
+                            # 3. [新] 获取峰值利润 (UPL Rate)
+                            peak_profit_rate = self.peak_profit_tracker.get(symbol, 0.0)
+                            market_data[symbol]['peak_profit_achieved_percent'] = peak_profit_rate * 100.0 # 转换为百分比
+                            
                     self.logger.debug("ML scores pre-processed.")
 
                     await self.run_cycle(market_data, tickers); 
