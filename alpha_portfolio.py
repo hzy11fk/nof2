@@ -1,9 +1,8 @@
-# 文件: alpha_portfolio.py (V45.39 - 杠杆同步修复)
-# 1. [V45.39 修复] 修复了 sync_state 中 V45.37 逻辑会过早删除"已成交"限价单计划的Bug。
-#    - V45.37 的 "open_order_ids" 检查现在只记录日志 (debug)，不再执行 remove_pending_limit_order。
-#    - 这确保了成交逻辑 (V45.38) 能够成功 'pop' 出计划并获取正确的杠杆。
-# 2. [V45.38 修复] 新增 _load/_save_pending_limits，使挂单计划持久化。
-# 3. [V45.37 优化] sync_state 现在只精确地、并行地获取 self.pending_limit_orders 中品种的挂单。
+# 文件: alpha_portfolio.py (V45.40 - 增加 filter_rule8 修复)
+# 1. [V45.40 修复] get_state_for_prompt 现已支持 'filter_rule8' 参数。
+#    - 这用于过滤掉 Rule 8 的持仓，防止 AI (LLM) 看到或管理它们。
+# 2. [V45.39 修复] 修复了 sync_state 中 V45.37 逻辑会过早删除"已成交"限价单计划的Bug。
+# 3. [V45.38 修复] 新增 _load/_save_pending_limits，使挂单计划持久化。
 
 import logging
 import time
@@ -46,12 +45,8 @@ class AlphaPortfolio:
         self.state_file = os.path.join('data', 'alpha_portfolio_state_PAPER.json')
         if not self.is_live: self._load_paper_state()
 
-        # [V45.38 修复] 挂单持久化
-        # 结构: { "BTC/USDT:USDT": {"order_id": "123", "timestamp": ..., "leverage": 10, "limit_price": 65000, ...}, ... }
         self.pending_limit_orders: Dict[str, Dict] = {}
-        # [V45.38 修复] 定义持久化文件路径
         self.pending_limits_file = os.path.join(futures_settings.FUTURES_STATE_DIR, 'alpha_pending_limits.json')
-        # [V45.38 修复] 在启动时加载
         self._load_pending_limits()
 
 
@@ -86,10 +81,8 @@ class AlphaPortfolio:
         except TypeError as e: self.logger.error(f"保存模拟状态失败：类型错误 - {e}. State: {state}", exc_info=True)
         except Exception as e: self.logger.error(f"保存模拟状态失败: {e}", exc_info=True)
 
-    # --- [V45.38 修复] 新增挂单持久化函数 ---
     def _load_pending_limits(self):
-        """[V45.38 修复] 从 JSON 加载待处理的限价单"""
-        if not self.is_live: return # 模拟盘不需要
+        if not self.is_live: return
         if not os.path.exists(self.pending_limits_file):
             self.logger.info(f"{self.mode_str} 待处理限价单文件不存在，跳过加载。")
             return
@@ -107,14 +100,10 @@ class AlphaPortfolio:
             self.logger.error(f"加载待处理限价单失败: {e}", exc_info=True)
 
     async def _save_pending_limits(self):
-        """[V45.38 修复] 异步保存待处理的限价单到 JSON"""
-        if not self.is_live: return # 模拟盘不需要
+        if not self.is_live: return
         
-        # (这是一个简化的异步保存，在真实的多线程环境中可能需要锁)
         try:
             os.makedirs(os.path.dirname(self.pending_limits_file), exist_ok=True)
-            # 使用异步 IO 写入 (如果可用)，或者回退到同步写入
-            # (为简单起见，这里使用同步写入，因为它足够快)
             with open(self.pending_limits_file, 'w', encoding='utf-8') as f:
                 json.dump(self.pending_limit_orders, f, indent=4, ensure_ascii=False)
             self.logger.debug(f"已保存 {len(self.pending_limit_orders)} 个待处理限价单。")
@@ -122,26 +111,18 @@ class AlphaPortfolio:
             self.logger.error(f"保存待处理限价单失败: {e}", exc_info=True)
 
     async def add_pending_limit_order(self, symbol: str, plan: Dict):
-        """[V45.38 修复] 安全地添加一个挂单计划并保存"""
         self.pending_limit_orders[symbol] = plan
         await self._save_pending_limits()
 
     async def remove_pending_limit_order(self, symbol: str) -> Optional[Dict]:
-        """[V45.38 修复] 安全地移除一个挂单计划并保存"""
         plan = self.pending_limit_orders.pop(symbol, None)
         await self._save_pending_limits()
         return plan
-    # --- [V45.38 修复结束] ---
 
 
     async def sync_state(self):
         """
         [V45.39 修复] 阻止 V45.37 逻辑过早删除"已成交"订单，确保 V45.38 逻辑能正确获取杠杆。
-        [V45.38 修复] 修改 pop S' S' S' 
-        [V45.37 策略A 重大修复]
-        1. 不再调用高风险的 fetch_open_orders() (无参数)。
-        2. 仅并行获取 self.pending_limit_orders 中品种的挂单。
-        [GEMINI V5 修复] 增加了 'elif pending_plan:' 逻辑块，以正确处理 "限价加仓" 订单的成交。
         """
         try:
             if self.is_live:
@@ -160,7 +141,6 @@ class AlphaPortfolio:
                         symbols_to_check = list(self.pending_limit_orders.keys())
                         self.logger.debug(f"Sync: 正在检查 {len(symbols_to_check)} 个品种的待处理订单: {symbols_to_check}")
                         
-                        # 并行获取所有相关品种的挂单
                         fetch_tasks = [self.client.fetch_open_orders(symbol=s) for s in symbols_to_check]
                         results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
                         
@@ -179,17 +159,13 @@ class AlphaPortfolio:
                             plan_order_id = plan.get('order_id')
                             if not plan_order_id:
                                 self.logger.warning(f"Sync: 待处理计划 {symbol} 缺少 order_id，已移除。")
-                                # [V45.38 修复]
                                 await self.remove_pending_limit_order(symbol)
                                 continue
 
                             if plan_order_id not in open_order_ids:
-                                # 这个订单不再是 "open" 状态，它可能已成交 (将在下面被同步) 或被取消/超时
-                                # [V45.39 修复] 我们在这里只记录日志，不要删除它。
-                                # [V45.39 修复] 删除操作由下面的持仓同步逻辑 (pop) 处理。
+                                # [V45.39 修复] 只记录日志，不删除
                                 self.logger.debug(f"Sync: 待处理订单 {plan_order_id} ({symbol}) 不再 'open'。等待持仓同步...")
-                                # [V45.38 修复]
-                                # await self.remove_pending_limit_order(symbol) # <--- !!! [V45.39] 已修复：注释掉此行 !!!
+                                # await self.remove_pending_limit_order(symbol) # <--- [V45.39] 已修复：注释掉此行
                     # --- [V45.37 步骤 1 结束] ---
 
                     real_positions = await self.client.fetch_positions(self.symbols); exchange_open_symbols = set()
@@ -201,14 +177,10 @@ class AlphaPortfolio:
                             if abs(size) > 1e-9:
                                 exchange_open_symbols.add(symbol)
                                 
-                                # --- [V45.38 修复] 检查限价单成交 ---
-                                # 检查此持仓是否由待处理的限价单触发
-                                # (注意: 我们在检查时 'pop'，如果匹配，它将被移除并保存)
                                 pending_plan = await self.remove_pending_limit_order(symbol)
                                 
                                 if not self.position_manager.is_open(symbol):
                                     # --- [V45.36 策略A 步骤 2: 修复杠杆和通知] ---
-                                    # 这是一个 "新" 持仓
                                     self.logger.warning(f"{self.mode_str} sync: 发现交易所新持仓 {symbol}，正在同步到本地...")
                                     
                                     entry_str = pos.get('entryPrice') or pos.get('basePrice'); entry = float(entry_str) if entry_str else 0.0
@@ -230,7 +202,6 @@ class AlphaPortfolio:
                                         
                                         plan_leverage = pending_plan.get('leverage')
                                         if plan_leverage and isinstance(plan_leverage, (int, float)) and plan_leverage > 0:
-                                            # [V45.38 修复] 这是关键！使用计划中的杠杆！
                                             self.logger.info(f"Sync: 使用AI计划的杠杆 {plan_leverage}x (交易所报告为 {exchange_lev_val}x)")
                                             final_leverage = int(plan_leverage)
                                         else:
@@ -244,11 +215,6 @@ class AlphaPortfolio:
                                             self.logger.error(f"Sync: 发送成交通知失败: {e_notify}")
                                     
                                     else:
-                                        # [V45.38 修复] 如果 'pending_plan' 是 None (因为重启丢失了)，
-                                        # 我们也必须把刚 'pop' 失败的 symbol 加回去，因为它还在交易所挂着
-                                        # (哦，不... 如果它成交了，它就不在交易所挂着了... 
-                                        # 这里的逻辑是：如果 'pop' 失败，说明本地没有这个计划。)
-                                        # (这是正确的行为：我们没有计划，所以我们只能用交易所的杠杆)
                                         self.logger.warning(f"Sync: 新持仓 {symbol} 未匹配到AI计划，使用默认值同步 (杠杆 {final_leverage}x)。")
 
                                     self.position_manager.open_position(
@@ -266,27 +232,22 @@ class AlphaPortfolio:
                                     )
                                     # --- [V45.36 步骤 2 结束] ---
                                     
-                                # --- [GEMINI V5 修复] 新增 'elif pending_plan:' 块来处理限价加仓 ---
                                 elif pending_plan:
-                                    # 这是一个 "限价加仓"
+                                    # --- [GEMINI V5 修复] 处理限价加仓 ---
                                     self.logger.warning(f"{self.mode_str} sync: 发现交易所持仓 {symbol} 变动，匹配到AI限价加仓计划。")
                                     
-                                    # 我们需要从交易所获取 *最新* 的均价和总数
                                     entry_str = pos.get('entryPrice') or pos.get('basePrice');
                                     current_avg_price = float(entry_str) if entry_str else 0.0
                                     current_total_size = abs(size)
                                     
-                                    # 从本地获取 *旧* 的状态
                                     old_state = self.position_manager.get_position_state(symbol)
                                     old_total_size = old_state.get('total_size', 0.0) if old_state else 0.0
                                     
-                                    # 计算本次加仓的数量和价格
                                     added_size = current_total_size - old_total_size
                                     
                                     if added_size > 1e-9:
                                         self.logger.info(f"Sync: 本次加仓 {added_size} (Exch: {current_total_size}, Local: {old_total_size})")
                                         
-                                        # 价格计算 (反推)
                                         old_avg_price = old_state.get('avg_entry_price', 0.0) if old_state else 0.0
                                         
                                         add_price = 0.0
@@ -301,23 +262,20 @@ class AlphaPortfolio:
                                         plan_tp = pending_plan.get('take_profit')
                                         plan_inval = pending_plan.get('invalidation_condition')
                                         plan_reason = pending_plan.get('reason', 'live_sync_add_with_plan')
-                                        # [V45.38 修复] 使用计划中的杠杆
                                         plan_leverage = pending_plan.get('leverage')
                                         
-                                        # 使用 position_manager.add_entry 来正确更新均价和规则
                                         self.position_manager.add_entry(
                                             symbol=symbol,
                                             entry_price=add_price,
                                             size=added_size,
-                                            entry_fee=0.0, # TODO: 费用无法反推，暂时记为0
-                                            leverage=plan_leverage, # 使用计划的杠杆
+                                            entry_fee=0.0,
+                                            leverage=plan_leverage, 
                                             stop_loss=plan_sl,
                                             take_profit=plan_tp,
                                             timestamp=int(pos.get('timestamp', time.time()*1000)),
                                             invalidation_condition=plan_inval
                                         )
                                         
-                                        # 获取 *更新后* 的本地状态，以显示正确的均价
                                         final_state = self.position_manager.get_position_state(symbol)
                                         final_avg_price = final_state.get('avg_entry_price', current_avg_price)
                                         final_total_size = final_state.get('total_size', current_total_size)
@@ -331,12 +289,9 @@ class AlphaPortfolio:
                                             
                                     else:
                                         self.logger.warning(f"Sync: 匹配到限价单 {symbol}，但计算出的 added_size 为 0 或负数 ({added_size})。不同步加仓。")
-                                        # [V45.38 修复] 如果加仓失败，我们必须把 'pop' 出来的计划加回去
                                         await self.add_pending_limit_order(symbol, pending_plan)
                                         
-                                # --- [GEMINI V5 修复结束] ---
                                 else:
-                                    # 本地和交易所均存在，且没有匹配到限价单
                                     self.logger.debug(f"{self.mode_str} sync: {symbol} 本地和交易所均存在。")
                     
                     local_open_symbols = set(self.position_manager.get_all_open_positions().keys())
@@ -355,7 +310,6 @@ class AlphaPortfolio:
                     else: self.logger.warning(f"{self.mode_str} sync: 跳过追加净值历史，Equity无效: {current_equity_to_append} (Type: {type(current_equity_to_append)})")
                 except Exception as e: self.logger.critical(f"{self.mode_str} sync 失败 (实盘部分): {e}", exc_info=True)
             else: # 模拟盘
-                # ... (模拟盘逻辑无变化) ...
                 unrealized_pnl = 0.0; total_margin = 0.0; tickers = {}
                 try: tickers = await self.exchange.fetch_tickers(self.symbols)
                 except Exception as e: self.logger.error(f"{self.mode_str} sync: 获取 Tickers 失败: {e}")
@@ -388,8 +342,15 @@ class AlphaPortfolio:
         except Exception as e: self.logger.critical(f"{self.mode_str} sync_state 顶层执行失败: {e}", exc_info=True)
 
 
-    def get_state_for_prompt(self, tickers: dict = None):
-        # ... (此函数无变化) ...
+    # --- [V45.40 修复] ---
+    def get_state_for_prompt(self, tickers: dict = None, filter_rule8: bool = False):
+        """
+        [V45.40 修复]
+        1. 增加 filter_rule8=False 参数
+        2. 过滤掉 Rule 8 持仓 (如果 filter_rule8=True)
+        3. 增加 'pending_limit_orders' 键
+        4. 将 'open_positions' 重命名为 'open_positions_rule6'
+        """
         position_details = []
         
         if self.is_live:
@@ -399,6 +360,14 @@ class AlphaPortfolio:
 
             open_positions = self.position_manager.get_all_open_positions()
             for symbol, state in open_positions.items():
+                
+                # --- [V45.40 修复] 过滤 Rule 8 持仓 ---
+                if filter_rule8:
+                    inval_cond = state.get('invalidation_condition') or '' 
+                    is_rule_8_trade = "Python Rule 8" in inval_cond
+                    if is_rule_8_trade:
+                        continue # 跳过 Rule 8 持仓, 不发送给 AI (LLM)
+                # --- [修复结束] ---
                 
                 upl_str = "UPL=N/A"
                 try:
@@ -429,22 +398,31 @@ class AlphaPortfolio:
                             f"Invalidation='{state.get('invalidation_condition', 'N/A')}'")
                 position_details.append(pos_str)
 
-        else:
+        else: # 模拟盘
             for symbol, pos in self.paper_positions.items():
                 if pos and isinstance(pos, dict) and pos.get('size', 0) > 0:
+                    
+                    # --- [V45.40 修复] 过滤 Rule 8 持仓 (模拟盘) ---
+                    if filter_rule8:
+                        inval_cond = pos.get('invalidation_condition') or '' 
+                        is_rule_8_trade = "Python Rule 8" in inval_cond
+                        if is_rule_8_trade:
+                            continue # 跳过 Rule 8 持仓
+                    # --- [修复结束] ---
+                    
                     pos_str = ( f"- {symbol.split(':')[0]}: Side={pos['side'].upper()}, Size={pos['size']:.4f}, Entry={pos['entry_price']:.4f}, "
                                 f"UPL={pos.get('unrealized_pnl', 0.0):.2f}, TP={pos.get('take_profit', 'N/A')}, SL={pos.get('stop_loss', 'N/A')}, "
                                 f"Invalidation='{pos.get('invalidation_condition', 'N/A')}'")
                     position_details.append(pos_str)
         
         if not position_details: position_details.append("No open positions.")
-        # --- [新增逻辑开始] ---
+        
+        # --- [V-Pending 修复] 新增挂单详情 ---
         pending_orders_details = []
+        # (只在实盘模式下获取, 模拟盘不支持挂单)
         if self.is_live and self.pending_limit_orders:
             for symbol, plan in self.pending_limit_orders.items():
                 try:
-                    # [V45.38] 'plan' 结构
-                    # { 'order_id': ..., 'side': ..., 'leverage': ..., 'limit_price': ..., ... }
                     plan_str = ( f"- {symbol.split(':')[0]}: Side={plan.get('side', 'N/A').upper()}, "
                                  f"Price={plan.get('limit_price', 0.0):.4f}, "
                                  f"Reason='{plan.get('reason', 'N/A')}'" )
@@ -452,10 +430,10 @@ class AlphaPortfolio:
                 except Exception as e:
                     self.logger.error(f"Error formatting pending order {symbol}: {e}")
                     pending_orders_details.append(f"- {symbol.split(':')[0]}: Error formatting plan.")
-
+        
         if not pending_orders_details:
             pending_orders_details.append("No pending limit orders.")
-        # --- [新增逻辑结束] ---
+        # --- [V-Pending 修复结束] ---
         
         initial_capital_for_calc = settings.ALPHA_LIVE_INITIAL_CAPITAL if self.is_live else settings.ALPHA_PAPER_CAPITAL
         performance_percent_str = "N/A (Invalid Initial)"
@@ -468,10 +446,13 @@ class AlphaPortfolio:
         return { "account_value_usd": f"{float(self.equity):.2f}" if self.equity is not None else "0.00",
                  "cash_usd": f"{float(self.cash):.2f}" if self.cash is not None else "0.00",
                  "performance_percent": performance_percent_str,
-                 "open_positions": "\n".join(position_details)}
+                 "open_positions_rule6": "\n".join(position_details), # [V45.40 修复] 更改键名
+                 "pending_limit_orders": "\n".join(pending_orders_details) # [V-Pending 修复] 新增键
+               }
+    # --- [V45.40 修复结束] ---
+    
     
     async def live_open(self, symbol, side, size, leverage, reason: str = "N/A", stop_loss: float = None, take_profit: float = None, invalidation_condition: str = "N/A"):
-        # ... (此函数无变化) ...
         is_adding = self.position_manager.is_open(symbol); action_type = "加仓" if is_adding else "开新仓"
         self.logger.warning(f"!!! {self.mode_str} AI 请求 {action_type} (市价): {side.upper()} {size} {symbol} !!!")
         
@@ -571,47 +552,32 @@ class AlphaPortfolio:
         except InsufficientFunds as e: self.logger.error(f"!!! {self.mode_str} {action_type} 失败 (资金不足): {e}", exc_info=False); await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n原因: 资金不足")
         except Exception as e: self.logger.error(f"!!! {self.mode_str} {action_type} 失败: {e}", exc_info=True); await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n错误: {e}")
 
-    # --- [GEMINI V4 修复] 升级此函数，使其支持 "限价加仓" (Pyramiding) 并存储 "limit_price" ---
     async def live_open_limit(self, symbol, side, size, leverage, limit_price: float, reason: str = "N/A", stop_loss: float = None, take_profit: float = None, invalidation_condition: str = "N/A"):
-        """[实盘] 挂一个限价开仓单，并将 SL/TP/Leverage 计划存储起来。
-        [GEMINI V3 修复] 此函数现在支持对同向持仓进行限价加仓。
-        [GEMINI V4 修复] 此函数现在存储 'limit_price'。
-        [V45.38 修复] 此函数现在调用持久化方法。
-        """
-        action_type = "限价开仓" # 默认为开新仓
+        action_type = "限价开仓"
         self.logger.warning(f"!!! {self.mode_str} AI 请求 {action_type} (初步): {side.upper()} {size} {symbol} @ {limit_price} !!!")
         
-        # --- [GEMINI V3 修复] ---
-        # 检查是否已有持仓，以区分 "开仓" 和 "加仓"
         if self.position_manager.is_open(symbol):
             pos_state = self.position_manager.get_position_state(symbol)
             
             if pos_state and pos_state.get('side') == side:
-                # 1. 方向一致：这是允许的 "限价加仓" (Pyramiding)
                 action_type = "限价加仓"
                 self.logger.warning(f"!!! {self.mode_str} AI 请求 {action_type}: {side.upper()} {size} {symbol} @ {limit_price} !!!")
                 
-                # 关键：加仓时，必须强制使用现有杠杆，忽略 AI 请求的杠杆
                 current_leverage = pos_state.get('leverage')
                 if current_leverage and int(current_leverage) > 0:
                     if int(leverage) != int(current_leverage):
                          self.logger.warning(f"{action_type}: AI 请求杠杆 {leverage}x, 但将强制使用现有杠杆 {current_leverage}x 以规避 -4161 错误。")
-                         leverage = int(current_leverage) # 强制覆盖
+                         leverage = int(current_leverage)
                 else:
                     self.logger.error(f"{action_type}: 无法获取 {symbol} 的现有杠杆！将冒险使用 AI 请求的 {leverage}x。")
             
             else:
-                # 2. 方向相反：这是 "对冲"，我们不允许
                 self.logger.error(f"!!! {self.mode_str} 限价单失败: {symbol} 已有 *相反* 持仓 (已有 {pos_state.get('side')}, 请求 {side})。")
                 await send_bark_notification(f"❌ {self.mode_str} AI 限价单失败", f"品种: {symbol}\n原因: 已有相反持仓")
                 return
-        # --- [GEMINI V3 修复结束] ---
 
         try:
-            # --- (此处的逻辑与您 V45.36 版的 live_open_limit 相同) ---
-            # --- 检查是否已有旧的限价单，有则取消 ---
             if symbol in self.pending_limit_orders:
-                # [V45.38 修复]
                 old_plan = await self.remove_pending_limit_order(symbol)
                 old_order_id = old_plan.get('order_id') if old_plan else None
                 if old_order_id:
@@ -624,13 +590,11 @@ class AlphaPortfolio:
                     except Exception as e_cancel:
                         self.logger.error(f"取消旧订单 {old_order_id} 失败: {e_cancel}。继续尝试设置新订单...")
 
-            # --- (此处的计算逻辑与您 V45.36 版的 live_open_limit 相同) ---
             raw_exchange = self.client.exchange
             if not raw_exchange.markets: await self.client.load_markets()
             market = raw_exchange.markets.get(symbol);
             if not market: raise ValueError(f"无市场信息 {symbol}")
 
-            # [GEMINI V3 修复] 杠杆 (leverage) 变量可能在上面 "加仓" 逻辑中被修改了
             required_margin_initial = (size * limit_price) / leverage
             if required_margin_initial <= 0: raise ValueError(f"保证金无效 (<= 0) | Size: {size}, Price: {limit_price}, Lev: {leverage}")
 
@@ -661,11 +625,8 @@ class AlphaPortfolio:
                  self.logger.error(f"!!! {self.mode_str} {action_type} 现金不足 !!! (需 {required_margin_final + estimated_fee:.2f}, 可用 {self.cash:.2f})")
                  await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n原因: 现金不足"); return
 
-            # --- (此处的下单逻辑与您 V45.36 版的 live_open_limit 相同) ---
             await self.client.set_margin_mode(futures_settings.FUTURES_MARGIN_MODE, symbol)
             
-            # [GEMINI V3 修复] 杠杆 (leverage) 变量可能已被修改
-            # 只有在不是加仓时才设置杠杆 (加仓时杠杆已匹配)
             if action_type == "限价开仓":
                  await self.client.set_leverage(leverage, symbol)
             else:
@@ -680,45 +641,37 @@ class AlphaPortfolio:
             if not order_id:
                 raise ValueError(f"交易所未返回 order_id: {order_result}")
 
-            # --- [GEMINI V4 修复：存储 limit_price] ---
             pending_plan = {
                 'order_id': order_id,
                 'side': side,
-                'leverage': int(leverage), # <-- [GEMINI V3 修复] 存储最终使用的杠杆
-                'limit_price': limit_price, # <-- [GEMINI V4 修复] 存储挂单价格
+                'leverage': int(leverage),
+                'limit_price': limit_price,
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'invalidation_condition': invalidation_condition,
                 'reason': reason,
                 'timestamp': time.time() * 1000 
             }
-            # --- [修复结束] ---
             
-            # [V45.38 修复]
             await self.add_pending_limit_order(symbol, pending_plan)
             
             self.logger.warning(f"!!! {self.mode_str} {action_type} 挂单成功: {side.upper()} {adjusted_size} {symbol} @ {limit_price} (Order ID: {order_id})")
             self.logger.info(f"    SL: {stop_loss}, TP: {take_profit}, Inval: {invalidation_condition}")
             
-            # --- [V45.36 修复：添加挂单通知] ---
-            title_prefix = "⌛" if action_type == "限价开仓" else "🔼" # 开仓用沙漏, 加仓用箭头
+            title_prefix = "⌛" if action_type == "限价开仓" else "🔼"
             title = f"{title_prefix} {self.mode_str} AI {action_type}: {side.upper()} {symbol.split('/')[0]}"
             body = f"价格: {limit_price:.4f}\n数量: {adjusted_size}\n杠杆: {leverage}x\nTP/SL: {take_profit}/{stop_loss}\nAI原因: {reason}"
             if adjusted_size != size: body += f"\n(请求 {size} 缩减至 {adjusted_size})"
             await send_bark_notification(title, body)
-            # --- [修复结束] ---
 
         except InsufficientFunds as e: self.logger.error(f"!!! {self.mode_str} {action_type} 失败 (资金不足): {e}", exc_info=False); await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n原因: 资金不足")
         except Exception as e: 
             self.logger.error(f"!!! {self.mode_str} {action_type} 失败: {e}", exc_info=True); 
             await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n错误: {e}")
-            # [V45.38 修复]
             await self.remove_pending_limit_order(symbol)
-    # --- [V45.34/36 修复结束] ---
 
 
     async def live_partial_close(self, symbol: str, size_percent: Optional[float] = None, size_absolute: Optional[float] = None, reason: str = "N/A"):
-        # ... (此函数无变化) ...
         self.logger.warning(f"!!! {self.mode_str} AI 请求部分平仓: {symbol} | %: {size_percent} | Abs: {size_absolute} | 原因: {reason} !!!")
 
         pos_state = self.position_manager.get_position_state(symbol)
@@ -728,7 +681,7 @@ class AlphaPortfolio:
 
         current_total_size = pos_state['total_size']
         size_to_close = 0.0
-        if size_percent is not None and 0 < size_percent <= 1: # 允许 1.0 (100%)
+        if size_percent is not None and 0 < size_percent <= 1: 
             if abs(size_percent - 1.0) < 1e-9:
                  self.logger.warning(f"{self.mode_str} 部分平仓请求 100%，转为全平。")
                  await self.live_close(symbol, reason=f"{reason} (转为全平)")
@@ -821,7 +774,6 @@ class AlphaPortfolio:
 
 
     async def live_close(self, symbol, reason: str = "N/A"):
-        # ... (此函数无变化) ...
         self.logger.warning(f"!!! {self.mode_str} 正在尝试(全)平仓: {symbol} | 原因: {reason} !!!")
         pos_state = self.position_manager.get_position_state(symbol) 
         if not pos_state or pos_state.get('total_size', 0) <= 0:
@@ -842,12 +794,10 @@ class AlphaPortfolio:
             if not exit_price or exit_price <= 0: exit_price = float(order_result['price'])
             filled_size = float(order_result['filled']); timestamp = int(order_result['timestamp'])
 
-            # --- [ V45.33 核心修复 ] ---
             if filled_size <= 0:
                 self.logger.error(f"!!! {self.mode_str} (全)平仓失败: 交易所返回成交量为 0 (Filled=0)。仓位可能过小 (Dust) 或API错误。")
                 self.logger.error("!!! 本地状态未改变，等待下一次 sync_state 或风控循环。")
                 return
-            # --- [ 修复结束 ] ---
 
             close_fee = await self._parse_fee_from_order(order_result, symbol)
 
@@ -883,7 +833,6 @@ class AlphaPortfolio:
 
 
     async def paper_open(self, symbol, side, size, price, leverage, reason: str = "N/A", stop_loss: float = None, take_profit: float = None, invalidation_condition: str = "N/A"):
-        # ... (此函数无变化) ...
         action_type = "加仓" if self.paper_positions.get(symbol) and self.paper_positions[symbol].get('side') == side else "开新仓"
         margin_required = (size * price) / leverage; fee = size * price * self.FEE_RATE
         if self.paper_cash < (margin_required + fee): self.logger.error(f"{self.mode_str} {action_type} 失败: 资金不足"); return
@@ -900,7 +849,6 @@ class AlphaPortfolio:
         await self.sync_state()
 
     async def paper_close(self, symbol, price, reason: str = "N/A"):
-        # ... (此函数无变化) ...
         pos = self.paper_positions.pop(symbol, None)
         if not pos or not isinstance(pos, dict) or pos.get('size', 0) <= 0: self.logger.error(f"{self.mode_str} (全)平仓失败: 未找到 {symbol} 持仓。"); return
         entry_price = pos.get('entry_price', 0.0); size = pos.get('size', 0.0); leverage = pos.get('leverage'); margin_recorded = pos.get('margin', 0.0)
@@ -916,7 +864,6 @@ class AlphaPortfolio:
         await self.sync_state()
 
     async def paper_partial_close(self, symbol: str, price: float, size_percent: Optional[float] = None, size_absolute: Optional[float] = None, reason: str = "N/A"):
-        # ... (此函数无变化) ...
         pos = self.paper_positions.get(symbol)
         if not pos or not isinstance(pos, dict) or pos.get('size', 0) <= 0: self.logger.error(f"{self.mode_str} 部分平仓失败: 未找到 {symbol} 持仓。"); return
         current_total_size = pos.get('size', 0.0); current_total_margin = pos.get('margin', 0.0); size_to_close = 0.0
@@ -938,7 +885,6 @@ class AlphaPortfolio:
         await self.sync_state()
 
     async def _parse_fee_from_order(self, order_result: dict, symbol: str) -> float:
-        # ... (此函数无变化) ...
         fees_paid_usdt = 0.0
         if not order_result: return fees_paid_usdt
 
@@ -1020,7 +966,6 @@ class AlphaPortfolio:
         else: return self.paper_trade_history
 
     async def update_position_rules(self, symbol: str, stop_loss: Optional[float] = None, take_profit: Optional[float] = None, invalidation_condition: Optional[str] = None, reason: str = "AI update"):
-        # ... (此函数无变化) ...
         if self.is_live:
             success = self.position_manager.update_rules(symbol, stop_loss, take_profit, invalidation_condition) 
             if success: self.logger.info(f"{self.mode_str} 更新规则 {symbol}: SL={stop_loss}, TP={take_profit}, Inval='{invalidation_condition}'. R: {reason}")
