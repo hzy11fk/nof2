@@ -273,7 +273,6 @@ class AlphaTrader:
     2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding all.
 
     **Order Object Rules:**
-    (Market Order Templates Removed)
     -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Confidence: [Score]/100. Market State: [Trending Pullback or Ranging Support]"}}`
     -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Confidence: [Score]/100. Market State: [Trending Pullback or Ranging Resistance]"}}`
     -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
