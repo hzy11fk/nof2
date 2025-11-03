@@ -104,6 +104,8 @@ class FuturesSettings(BaseSettings):
     # [Rule 8 杠杆] Python 突破策略使用的杠杆
     FUTURES_LEVERAGE: int = 5 
 
+    FUTURES_MARGIN_MODE: str = 'isolated'
+
     # [Rule 8 风险] Python 突破策略的单笔风险 (占总权益的百分比)
     FUTURES_RISK_PER_TRADE_PERCENT: float = 1.5 
 
