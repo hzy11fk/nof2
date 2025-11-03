@@ -47,10 +47,8 @@ class AlphaTrader:
         -   All fast market-order trades (Rule 8) are handled by a separate, high-frequency Python algorithm.
 
     1.A. **Data Supremacy Rule (CRITICAL):**
-        -   You will be provided with a `Previous AI Summary` for context.
-        -   You MUST treat all data in the `Multi-Timeframe Market Data Overview` (e.g., current Price, RSI, ADX, ML_Proba, OI_Change, Taker_Buy_Ratio) as the **absolute truth**.
-        -   If the new, current data contradicts your `Previous AI Summary`, you **MUST** discard your old plan and create a new one based **only** on the new data.
-
+        -   You MUST treat all data in the `Multi-Timeframe Market Data Overview` (e.g., current Price, RSI, ADX, ML_Proba, OI_Change) as the **absolute truth** for this cycle.
+        -   You MUST base your decisions **only** on the new data provided in the current prompt.
     1.B. **Trend Filter Veto (CRITICAL):**
         -   You MUST use the `4hour_ema_50` as the primary trend direction filter.
         -   **VETO LONG:** You MUST ABORT all new `LIMIT_BUY` plans if `current_price` is BELOW the `4hour_ema_50`.
@@ -74,7 +72,7 @@ class AlphaTrader:
         Profit is the goal, but capital preservation is the foundation.
         -   **AI's Task (Strategy):** Your job is to select the *risk parameters* based on your confidence, not to perform the final math. The Python system will perform all final calculations and safety checks.
         -   **AI Must Provide (for LIMIT_BUY, LIMIT_SELL):**
-            1.  `"leverage": [e.g., 8]`
+            1.  `"leverage": [CHOSEN_LEVERAGE]` (You MUST choose leverage dynamically based on the asset. Use 5x-8x for volatile assets like SOL/DOGE. Use 8x-15x for major assets like BTC/ETH.)`
             2.  `"risk_percent": [e.g., 0.025]`
         -   **System's Task (Calculation):** The Python system will automatically use your `risk_percent` and `Total Equity` to calculate the `final_desired_margin`, check it against `Available Cash`, and perform all hard checks.
         -   **Total Exposure:** The sum of all margins for all open positions should generally not exceed 50-60% of your total equity.
@@ -602,8 +600,8 @@ class AlphaTrader:
     def _build_prompt(self, market_data: Dict[str, Dict[str, Any]], portfolio_state: Dict, tickers: Dict) -> str:
         prompt = f"It has been {(time.time() - self.start_time)/60:.0f} minutes since start.\n"
         
-        prompt += "\n--- Previous AI Summary (For Context Only) ---\n"
-        prompt += f"{self.last_strategy_summary}\n"
+       # prompt += "\n--- Previous AI Summary (For Context Only) ---\n"
+      #  prompt += f"{self.last_strategy_summary}\n"
         
         prompt += "\n--- Multi-Timeframe Market Data Overview (5m, 15m, 1h, 4h) ---\n"
         def safe_format(value, precision, is_rsi=False, is_pct=False):
@@ -1508,15 +1506,15 @@ class AlphaTrader:
                                 # 2. [集成] Graded Profit Taker (分级主动止盈)
                                 target_profit_rate = 0.0
                                 if current_peak_rate >= 0.15: # > 15%
-                                    target_profit_rate = current_peak_rate * 0.65 # 锁定 65%
+                                    target_profit_rate = current_peak_rate * 0.70 # 锁定 70%
                                 elif current_peak_rate >= 0.08: # 8% - 15%
-                                    target_profit_rate = current_peak_rate * 0.70 # 锁定 70% (回撤 30%)
-                                elif current_peak_rate >= 0.05: # 5% - 8%
                                     target_profit_rate = current_peak_rate * 0.75 # 锁定 75% (回撤 25%)
-                                elif current_peak_rate >= 0.03: # 3% - 5%
+                                elif current_peak_rate >= 0.05: # 5% - 8%
                                     target_profit_rate = current_peak_rate * 0.80 # 锁定 80% (回撤 20%)
+                                elif current_peak_rate >= 0.03: # 3% - 5%
+                                    target_profit_rate = current_peak_rate * 0.85 # 锁定 85% (回撤 15%)
                                 elif current_peak_rate >= 0.007: # 0.7% - 3%
-                                    target_profit_rate = current_peak_rate * 0.60 # 锁定 60% (回撤 40%)
+                                    target_profit_rate = current_peak_rate * 0.65 # 锁定 65% (回撤 35%)
                                 
                                 if target_profit_rate > 0.0:
                                     target_upl = target_profit_rate * margin
