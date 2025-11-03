@@ -1,11 +1,14 @@
-# 文件: run_alpha.py (V2 - 功能完整版)
+# 文件: run_alpha.py (V3 - 修复了 ccxt 导入)
 
 # 步骤 1: 确保 .env 文件在所有自定义模块导入前被加载
 from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
-import ccxt.pro as ccxtpro
+# [V-FIX] 错误: ccxt.pro 是 WebSocket 库。
+# import ccxt.pro as ccxtpro 
+# [V-FIX] 正确: ccxt.async_support 是 asyncio REST 库。
+import ccxt.async_support as ccxt 
 import logging
 from config import settings
 from exchange_client import ExchangeClient
@@ -25,19 +28,21 @@ async def main():
     # 创建交易所连接
     exchange_config = {
         'apiKey': settings.BINANCE_API_KEY, 'secret': settings.BINANCE_SECRET_KEY,
-        'options': {'defaultType': 'swap'}
+        'options': {'defaultType': 'swap'} # 确保默认类型是合约
     }
     if settings.USE_TESTNET:
         exchange_config.update({
             'apiKey': settings.BINANCE_TESTNET_API_KEY,
             'secret': settings.BINANCE_TESTNET_SECRET_KEY,
         })
-        exchange = ccxtpro.binance(exchange_config)
+        # [V-FIX] 确保使用 U本位合约 和正确的 ccxt 对象
+        exchange = ccxt.binanceusdm(exchange_config) 
         exchange.set_sandbox_mode(True)
-        logger.info("正在连接到币安测试网...")
+        logger.info("正在连接到币安合约测试网 (binanceusdm)...")
     else:
-        exchange = ccxtpro.binance(exchange_config)
-        logger.info("正在连接到币安实盘...")
+        # [V-FIX] 确保使用 U本位合约 和正确的 ccxt 对象
+        exchange = ccxt.binanceusdm(exchange_config)
+        logger.info("正在连接到币安合约实盘 (binanceusdm)...")
     
     exchange_client = ExchangeClient(exchange)
 
