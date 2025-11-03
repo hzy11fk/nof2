@@ -1,4 +1,4 @@
-# 文件: exchange_client.py (V5 - 增加了缺失的 fetch_open_orders)
+# 文件: exchange_client.py (V9 - 移除了 Taker Ratio 函数)
 
 import logging
 import asyncio
@@ -8,6 +8,27 @@ class ExchangeClient:
     def __init__(self, exchange):
         self.exchange = exchange
         self.logger = logging.getLogger(self.__class__.__name__)
+
+    # --- [ V-FIX 3: 添加 .market() 方法 ] ---
+    def market(self, symbol):
+        """将 .market() 方法从内部 ccxt 对象传递出去。"""
+        if hasattr(self.exchange, 'market'):
+            return self.exchange.market(symbol)
+        self.logger.error(f"内部交易所对象缺少 'market' 方法。")
+        # 返回一个带 'id' 的回退字典，以防止 ['id'] 访问崩溃
+        return {'id': symbol} 
+    # --- [ V-FIX 3 结束 ] ---
+
+    # --- [ V-FIX 1: 添加 .has 属性 ] ---
+    @property
+    def has(self):
+        """将 .has 属性从内部的 ccxt 交易所对象传递出去。"""
+        if hasattr(self.exchange, 'has'):
+            return self.exchange.has
+        # 提供一个回退，以防内部对象也没有 .has
+        self.logger.warning("内部交易所对象缺少 'has' 属性。")
+        return {} 
+    # --- [ V-FIX 1 结束 ] ---
 
     async def _retry_async_method(self, method, *args, **kwargs):
         """
@@ -58,6 +79,14 @@ class ExchangeClient:
         """[新增整合] 获取未平仓合约量，并应用重试逻辑。"""
         return await self._retry_async_method(self.exchange.fetch_open_interest, symbol)
 
+    # --- [ V-FIX 2: 添加缺失的方法 ] ---
+    async def fetch_open_interest_history(self, symbol: str, timeframe: str = '5m', limit: int = 2, params={}):
+        """[新增] 获取OI历史数据，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.fetch_open_interest_history, symbol, timeframe=timeframe, limit=limit, params=params)
+    # --- [ V-FIX 2 结束 ] ---
+
+    # --- [ V-FIX 4: 导致崩溃的 Taker Ratio 函数已被移除 ] ---
+
     async def fetch_balance(self, params={}):
         """获取余额，并应用重试逻辑。"""
         try:
@@ -79,11 +108,9 @@ class ExchangeClient:
         """获取订单信息，并应用重试逻辑。"""
         return await self._retry_async_method(self.exchange.fetch_order, order_id, symbol=symbol)
 
-    # --- [V45.36 修复：添加缺失的方法] ---
     async def fetch_open_orders(self, symbol: str = None, since: int = None, limit: int = None, params={}):
         """获取所有未结订单，并应用重试逻辑。"""
         return await self._retry_async_method(self.exchange.fetch_open_orders, symbol=symbol, since=since, limit=limit, params=params)
-    # --- [修复结束] ---
 
     async def cancel_order(self, order_id: str, symbol: str):
         """取消订单，并应用重试逻辑。"""
