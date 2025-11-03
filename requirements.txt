@@ -8,4 +8,6 @@ python-dotenv>=1.0.0 # 用于加载 .env 文件
 pydantic-settings>=2.0.0 # 用于加载和验证配置
 pydantic>=2.0.0    # 数据验证库 (pydantic-settings 的依赖)
 openai>=1.0.0
+scikit-learn>=1.0
+joblib>=1.1.0
 # requests         # 可选: bark_notifier.py 可能需要 requests 库
