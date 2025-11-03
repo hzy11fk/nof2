@@ -1,8 +1,11 @@
-# 文件: alpha_trader.py (完整优化版 - L2/L3 混合模型 + 动态 Python 风控)
+# 文件: alpha_trader.py (完整优化版 - V-Unified-ML-Fixed)
 # 描述: 
-# L3 (LLM): Rule 6 策略 (高层战略, 止盈)
-# L2 (ML): Rule 8 RF模型 + Anomaly模型 (专家顾问)
-# L1 (Python): Rule 8 (K线收盘价突破) 执行, 硬风控
+# 1. (修复) 统一了 ML 模型。Rule 6 和 Rule 8 
+#    现在共享同一个 "Strategic" (75分钟趋势) 模型。
+# 2. (修复) 修复了 'execute_decisions' 和 'ml_models_rule6_strategic' 的 AttributeError。
+# 3. (保留) Rule 8 使用 "K线收盘价" 突破逻辑。
+# 4. (保留) Rule 6 (AI) 拥有所有高级风控逻辑。
+# 5. (保留) 2秒/10秒 循环拆分。
 
 import logging
 import asyncio
@@ -47,6 +50,11 @@ class AlphaTrader:
         -   You will be provided with a `Previous AI Summary` for context.
         -   You MUST treat all data in the `Multi-Timeframe Market Data Overview` (e.g., current Price, RSI, ADX, ML_Proba) as the **absolute truth**.
         -   If the new, current data contradicts your `Previous AI Summary`, you **MUST** discard your old plan and create a new one based **only** on the new data.
+
+    1.B. **Trend Filter Veto (CRITICAL):**
+        -   You MUST use the `4hour_ema_50` as the primary trend direction filter.
+        -   **VETO LONG:** You MUST ABORT all new `LIMIT_BUY` plans if `current_price` is BELOW the `4hour_ema_50`.
+        -   **VETO SHORT:** You MUST ABORT all new `LIMIT_SELL` plans if `current_price` is ABOVE the `4hour_ema_50`.
 
     1.5. **Anomaly Veto Rule (CRITICAL):**
         -   Before ANY action, you MUST check the `Anomaly_Score` for the symbol. A low score (e.g., < -0.1) indicates the market is behaving erratically.
@@ -109,6 +117,12 @@ class AlphaTrader:
             -   Identify the `15min_bb_upper` and `15min_bb_lower` levels.
             -   You MAY issue **`LIMIT_SELL` at the 15m upper band** or **`LIMIT_BUY` at the 15m lower band**.
             -   **[ML Confirmation]:** This is a low-confidence trade. You MUST use a reduced `risk_percent` (e.g., 0.01 or 0.015) and tighter stops, AND the correct `ML_Proba` should confirm (e.g., > 0.55).
+        -   **4. Breakout-Retest:**
+            -   **Condition:** You observe that a **clear breakout** has just occurred (e.g., `15min_close_prev > 15min_bb_upper_prev`). This is a **high-volume, confirmed** breakout.
+            -   **Strategy (LIMIT ONLY): DO NOT CHASE.** A "fake breakout" is likely. The professional play is to wait for the retest.
+            -   **Action:** Place a **`LIMIT_BUY`** order on the level that was just broken (e.g., the `15min_bb_upper_prev` level), as it is now likely to act as new **support**.
+            -   *(Vice-versa for a `LIMIT_SELL` on a breakdown)*.
+            -   **[ML Confirmation]:** This is a High-Confidence trade *only if* the `ML_Proba_UP` (for Long) or `ML_Proba_DOWN` (for Short) is also confirming your thesis (e.g., > 0.60).
 
     7.  **Market Sentiment Filter (Fear & Greed Index):**
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter.
@@ -140,7 +154,7 @@ class AlphaTrader:
 
         Market State Analysis:
         - 1h ADX: [Value] | 4h ADX: [Value]
-        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Applying Rule 6: Ranging (ADX<20) / Applying Rule 6: Chop Zone (ADX 20-25)]
+        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Applying Rule 6: Ranging (ADX<20) / Applying Rule 6: Chop Zone (ADX 20-25) / Applying Rule 6.4: Breakout-Retest]
         - Key Support/Resistance Levels: [Identify major S/R levels, including BB_Upper/Lower and recent_high/low for relevant symbols]
         - Market Sentiment: [MUST state the F&G Index value and its implication, e.g., "Extreme Greed (80)"]
 
@@ -166,8 +180,8 @@ class AlphaTrader:
            - [IF YES: The original thesis is likely wrong, and the ATR stop-loss is too far. Decision: MUST issue a CLOSE order to cut losses early.]
            
            Reversal & Profit Save Check (With Memory):
-           - [Check 1: Is this position *currently* significantly profitable (e.g., UPL Percent > +2.0%)?]
-           - [Check 2: Has this position *previously* been significantly profitable (e.g., Peak_Profit_Achieved > 2.0%) AND has now pulled back significantly (e.g., UPL is < 60% of Peak_Profit)?]
+           - [Check 1: Is this position *currently* significantly profitable (e.g., UPL Percent > +1.5%)?]
+           - [Check 2: Has this position *previously* been significantly profitable (e.g., Peak_Profit_Achieved > 1.5%) AND has now pulled back significantly (e.g., UPL is < 80% of Peak_Profit)?]
            - [IF (Check 1 OR Check 2 is True) AND (it is showing *strong* signs of reversal, e.g., 1h RSI divergence):]
            - [Decision: MUST issue a CLOSE order to secure profits.]
 
@@ -196,30 +210,34 @@ class AlphaTrader:
         
         [CRITICAL STATE CHECK (NO HEDGING): Before analyzing any new symbol, you MUST check the 'Open Positions (Live / Filled)' list. If a position for that [SYMBOL] already exists, you MUST SKIP analysis for that symbol. AI's role is to MANAGE existing positions (in the section above) or open new ones, NEVER to hold LONG and SHORT on the same symbol (No Hedging).]
         
-        [Analyze opportunities based ONLY on Rule 6, ensuring they pass Rule 1.5 (Anomaly) and Rule 6 (ML Confirmation)]
+        [Analyze opportunities based ONLY on Rule 6, ensuring they pass Rule 1.B (Trend Filter), Rule 1.5 (Anomaly), and Rule 6 (ML Confirmation)]
+        
+        [EXAMPLE - RULE 6.4 (Breakout-Retest):]
+        BTC Multi-Timeframe Assessment (Market State: Breakout-Retest, 1h ADX=23):
+        - Anomaly Score: -0.05 (Safe)
+        - Trend Filter (Rule 1.B): PASS (Price > 4h EMA 50)
+        - Breakout: 15min_close_prev (65,500) > 15min_bb_upper_prev (65,300). Breakout is confirmed.
+        - Strategy: Do not chase. Wait for retest.
+        - Retest Level (New Support): 65,300.
+        - ML Confirmation: ML_Proba_UP = 0.75 (Confidence: High)
+        - Signal Confluence Score: 4/4 | Final Confidence: High - **PREPARE LIMIT_BUY at 65,300 (Rule 6.4)**
         
         [EXAMPLE - RULE 6.1 (Trending Pullback):]
-        BTC Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
+        ETH Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
         - Anomaly Score: -0.05 (Safe)
+        - Trend Filter (Rule 1.B): PASS (Price > 4h EMA 50)
         - 4h Trend: Bullish | 1h Momentum: Strong | 15min Setup: Price pulling back.
-        - Confluence Zone: Found at 65,050 (4h BB_Mid) - 65,100 (1h EMA 20).
+        - Confluence Zone: Found at 3550 (4h BB_Mid) - 3555 (1h EMA 20).
         - Timing: 15m RSI is 38 (Near reset level < 40).
         - ML Confirmation: ML_Proba_UP = 0.68 (Confidence: High)
-        - Signal Confluence Score: 5/5 | Final Confidence: High - **PREPARE LIMIT_BUY at 65,100 (Rule 6.1)**
+        - Signal Confluence Score: 5/5 | Final Confidence: High - **PREPARE LIMIT_BUY at 3555 (Rule 6.1)**
 
-        [EXAMPLE - RULE 6.2 (Ranging):]
+        [EXAMPLE - RULE 1.B (Trend Filter VETO):]
         ETH Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
         - Anomaly Score: -0.08 (Safe)
-        - 4h Trend: N/A | 1h Setup: Price is *approaching* 1h BB_Upper (@ 3900.0) | 15min RSI: 68.5 (Approaching Overbought)
-        - ML Confirmation: ML_Proba_DOWN = 0.45 (Confidence: Low)
-        - Signal Confluence Score: 2/4 (ML Confirmation FAILED) | Final Confidence: Low - **ABORT LIMIT_SELL**
-
-        [EXAMPLE - RULE 1.5 (Anomaly Veto):]
-        SOL Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=30):
-        - Anomaly Score: -0.21 (High Risk - VETO)
-        - 4h Trend: Bullish | 1h Momentum: Strong.
-        - ML Confirmation: ML_Proba_UP = 0.70 (Confidence: High)
-        - Signal Confluence Score: N/A (Rule 1.5 VETO) | Final Confidence: VETO - **ABORT ALL NEW TRADES due to Anomaly**
+        - Trend Filter (Rule 1.B): FAILED (Price 3850 < 4h EMA 50 3860)
+        - 4h Trend: N/A | 1h Setup: Price is *approaching* 1h BB_Lower.
+        - Signal Confluence Score: N/A (Rule 1.B VETO) | Final Confidence: VETO - **ABORT LIMIT_BUY due to Trend Filter**
 
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
         ```
@@ -270,35 +288,23 @@ class AlphaTrader:
         ] 
         self.logger.info(f"ML 特征列表已定义 (数量: {len(self.ml_feature_names)})")
 
-        self.ml_models_rule6_strategic = {}
-        self.ml_scalers_rule6_strategic = {}
+        # [修复] 统一加载 "Strategic" 模型
+        self.ml_models_strategic = {}
+        self.ml_scalers_strategic = {}
         for symbol in self.symbols:
             symbol_safe = symbol.split(':')[0].replace('/', '') 
             model_path = os.path.join('models', f'rf_classifier_rule6_strategic_{symbol_safe}.pkl')
             scaler_path = os.path.join('models', f'scaler_rule6_strategic_{symbol_safe}.pkl')
             try:
                 if os.path.exists(model_path) and os.path.exists(scaler_path):
-                    self.ml_models_rule6_strategic[symbol] = joblib.load(model_path)
-                    self.ml_scalers_rule6_strategic[symbol] = joblib.load(scaler_path)
-                    self.logger.info(f"成功加载 {symbol} 的 Rule 6 (Strategic) ML 模型。")
+                    self.ml_models_strategic[symbol] = joblib.load(model_path)
+                    self.ml_scalers_strategic[symbol] = joblib.load(scaler_path)
+                    self.logger.info(f"成功加载 {symbol} 的 (Strategic) ML 模型。")
             except Exception as e:
-                self.logger.error(f"加载 {symbol} 的 Rule 6 (Strategic) ML 模型时出错: {e}", exc_info=True)
-        self.logger.info(f"--- 总共加载了 {len(self.ml_models_rule6_strategic)} 个 Rule 6 (Strategic) ML 模型 ---")
+                self.logger.error(f"加载 {symbol} 的 (Strategic) ML 模型时出错: {e}", exc_info=True)
+        self.logger.info(f"--- 总共加载了 {len(self.ml_models_strategic)} 个 (Strategic) ML 模型 ---")
 
-        self.ml_models_rule8_tactical = {}
-        self.ml_scalers_rule8_tactical = {}
-        for symbol in self.symbols:
-            symbol_safe = symbol.split(':')[0].replace('/', '') 
-            model_path = os.path.join('models', f'rf_classifier_rule8_tactical_{symbol_safe}.pkl')
-            scaler_path = os.path.join('models', f'scaler_rule8_tactical_{symbol_safe}.pkl')
-            try:
-                if os.path.exists(model_path) and os.path.exists(scaler_path):
-                    self.ml_models_rule8_tactical[symbol] = joblib.load(model_path)
-                    self.ml_scalers_rule8_tactical[symbol] = joblib.load(scaler_path)
-                    self.logger.info(f"成功加载 {symbol} 的 Rule 8 (Tactical) ML 模型。")
-            except Exception as e:
-                self.logger.error(f"加载 {symbol} 的 Rule 8 (Tactical) ML 模型时出错: {e}", exc_info=True)
-        self.logger.info(f"--- 总共加载了 {len(self.ml_models_rule8_tactical)} 个 Rule 8 (Tactical) ML 模型 ---")
+        # [修复] 删除了 'ml_models_rule8_tactical' 的加载
 
         self.ml_anomaly_detectors = {}
         self.ml_anomaly_scalers = {}
@@ -421,7 +427,6 @@ class AlphaTrader:
                             
                         prefix = f"{timeframe.replace('m', 'min').replace('h', 'hour')}_"
 
-                        # --- 1. 计算 Rule 8/6 (RF 模型) 特征 ---
                         if len(df) >= 28:
                             try:
                                 high = df['h']; low = df['l']; close = df['c']; period = 14
@@ -429,6 +434,8 @@ class AlphaTrader:
                                 atr_data = ta.atr(high, low, close, length=period)
                                 if adx_data is not None and not adx_data.empty:
                                     market_indicators_data[symbol][f'{prefix}adx_14'] = adx_data[f'ADX_{period}'].iloc[-1]
+                                    if timeframe == '15m':
+                                        market_indicators_data[symbol][f'{prefix}adx_14_prev'] = adx_data[f'ADX_{period}'].iloc[-2]
                                 if atr_data is not None and not atr_data.empty:
                                     market_indicators_data[symbol][f'{prefix}atr_14'] = atr_data.iloc[-1]
                             except Exception as e:
@@ -498,7 +505,6 @@ class AlphaTrader:
                             market_indicators_data[symbol][f'{prefix}recent_low']=df['l'].tail(20).min()
                         
                         
-                        # --- 2. 计算 Anomaly (IsolationForest) 特征 ---
                         if timeframe == '15m' and len(df) >= 21: 
                             try:
                                 df['returns'] = df['c'].pct_change()
@@ -565,20 +571,14 @@ class AlphaTrader:
             for tf in timeframes:
                 prompt += f"\n[{tf.upper()}]\n"
                 prompt += f" RSI:{safe_format(d.get(f'{tf}_rsi_14'), 0, is_rsi=True)}|"
-                prompt += f" ADX:{safe_format(d.get(f'{tf}_adx_14'), 0, is_rsi=True)}|" 
-                prompt += f" ATR:{safe_format(d.get(f'{tf}_atr_14'), 4)}|"
-                prompt += f"MACD:{safe_format(d.get(f'{tf}_macd'), 4)}|"
-                prompt += f"Sig:{safe_format(d.get(f'{tf}_macd_signal'), 4)}|"
-                prompt += f"Hist:{safe_format(d.get(f'{tf}_macd_hist'), 4)}\n"
+                prompt += f" ADX:{safe_format(d.get(f'{tf}_adx_14'), 0, is_rsi=True)}|\n"
                 prompt += f" EMA20:{safe_format(d.get(f'{tf}_ema_20'), 3)}|"
-                prompt += f"EMA50:{safe_format(d.get(f'{tf}_ema_50'), 3)}|"
-                prompt += f"VolR:{safe_format(d.get(f'{tf}_volume_ratio'), 1)}x\n"
+                prompt += f"EMA50:{safe_format(d.get(f'{tf}_ema_50'), 3)}|\n"
                 prompt += f" BB_Up:{safe_format(d.get(f'{tf}_bb_upper'), 3)}|"   
                 prompt += f"BB_Mid:{safe_format(d.get(f'{tf}_bb_middle'), 3)}|" 
                 prompt += f"BB_Low:{safe_format(d.get(f'{tf}_bb_lower'), 3)}\n" 
                 prompt += f" Hi:{safe_format(d.get(f'{tf}_recent_high'), 2)}|"
-                prompt += f"Lo:{safe_format(d.get(f'{tf}_recent_low'), 2)}|"
-                prompt += f"Chg:{safe_format(d.get(f'{tf}_price_change_pct'), 1)}%\n"
+                prompt += f"Lo:{safe_format(d.get(f'{tf}_recent_low'), 2)}|\n"
             prompt += "-----\n"
         
         prompt += "\n--- Market Context ---\n"
@@ -594,7 +594,7 @@ class AlphaTrader:
         prompt += "Open Positions (Live / Filled - Rule 6 Only):\n"
         prompt += portfolio_state.get('open_positions_rule6', "No open positions.")
         prompt += "\n\nPending Limit Orders (AI Rule 6 - Waiting / Unfilled):\n"
-        prompt += portfolio_state.get('pending_limit_orders', "No pending limit orders.")
+        prompt += portfolio_state.get('pending_limit_orders', "No open positions.")
         
         return prompt
 
@@ -931,7 +931,8 @@ class AlphaTrader:
                         continue
 
                     if not ml_called:
-                        ml_pred = await self._get_ml_prediction_rule8_tactical(symbol, market_data)
+                        # [修复] 统一调用 "Strategic" 模型
+                        ml_pred = await self._get_ml_prediction(symbol, market_data)
                         ml_proba_up = ml_pred['proba_up']
                         ml_proba_down = ml_pred['proba_down']
                         ml_called = True
@@ -953,7 +954,8 @@ class AlphaTrader:
                         continue
 
                     if not ml_called:
-                        ml_pred = await self._get_ml_prediction_rule8_tactical(symbol, market_data)
+                        # [修复] 统一调用 "Strategic" 模型
+                        ml_pred = await self._get_ml_prediction(symbol, market_data)
                         ml_proba_up = ml_pred['proba_up']
                         ml_proba_down = ml_pred['proba_down']
                         ml_called = True
@@ -1014,22 +1016,22 @@ class AlphaTrader:
         }
 
 
-    async def _get_ml_prediction_rule6_strategic(self, symbol: str, market_data: Dict) -> Dict:
-        """ [新] 为 AI (Rule 6) 调用战略 (75分钟) 模型 """
-        model = self.ml_models_rule6_strategic.get(symbol)
-        scaler = self.ml_scalers_rule6_strategic.get(symbol)
+    async def _get_ml_prediction(self, symbol: str, market_data: Dict) -> Dict:
+        """ [修复] 统一的 ML 预测函数 (使用 Strategic 模型) """
+        model = self.ml_models_strategic.get(symbol)
+        scaler = self.ml_scalers_strategic.get(symbol)
         
         if not model or not scaler:
             return {'proba_up': 0.5, 'proba_down': 0.5} 
 
         symbol_data = market_data.get(symbol)
         if not symbol_data:
-            self.logger.warning(f"Rule 6 ML: 无法获取 {symbol} 的 market_data")
+            self.logger.warning(f"ML: 无法获取 {symbol} 的 market_data")
             return {'proba_up': 0.5, 'proba_down': 0.5}
 
         try:
             features_live = {}
-            for f in self.ml_feature_names: # 使用共享的特征列表
+            for f in self.ml_feature_names: 
                 val = symbol_data.get(f)
                 if val is None or pd.isna(val):
                     val = 0.0
@@ -1047,44 +1049,7 @@ class AlphaTrader:
             }
 
         except Exception as e:
-            self.logger.error(f"Rule 6 (Strategic) ML 预测失败 {symbol}: {e}", exc_info=False)
-            return {'proba_up': 0.5, 'proba_down': 0.5}
-
-
-    async def _get_ml_prediction_rule8_tactical(self, symbol: str, market_data: Dict) -> Dict:
-        """ [新] 为 Python (Rule 8) 调用战术 (ATR SL/TP) 模型 """
-        model = self.ml_models_rule8_tactical.get(symbol)
-        scaler = self.ml_scalers_rule8_tactical.get(symbol)
-        
-        if not model or not scaler:
-            return {'proba_up': 0.5, 'proba_down': 0.5} 
-
-        symbol_data = market_data.get(symbol)
-        if not symbol_data:
-            self.logger.warning(f"Rule 8 ML: 无法获取 {symbol} 的 market_data")
-            return {'proba_up': 0.5, 'proba_down': 0.5}
-
-        try:
-            features_live = {}
-            for f in self.ml_feature_names: # 使用共享的特征列表
-                val = symbol_data.get(f)
-                if val is None or pd.isna(val):
-                    val = 0.0
-                features_live[f] = val
-
-            df_live = pd.DataFrame([features_live], columns=self.ml_feature_names)
-            
-            X_scaled_live = scaler.transform(df_live)
-            probabilities = model.predict_proba(X_scaled_live)[0]
-            class_map = {cls: prob for cls, prob in zip(model.classes_, probabilities)}
-            
-            return {
-                'proba_up': class_map.get(1, 0.0),    
-                'proba_down': class_map.get(-1, 0.0) 
-            }
-
-        except Exception as e:
-            self.logger.error(f"Rule 8 (Tactical) ML 预测失败 {symbol}: {e}", exc_info=False)
+            self.logger.error(f"ML (Strategic) 预测失败 {symbol}: {e}", exc_info=False)
             return {'proba_up': 0.5, 'proba_down': 0.5}
 
     
@@ -1564,9 +1529,7 @@ class AlphaTrader:
                         rule8_orders = await self._check_python_rule_8(market_data)
                         if rule8_orders:
                             self.logger.warning(f"🔥 Python Rule 8 (K-Line Confirm) TRIGGERED! Executing {len(rule8_orders)} orders.")
-                            # --- [修复] 增加下划线 ---
                             await self._execute_decisions(rule8_orders, market_data)
-                            # --- [修复结束] ---
                 
                 # 步骤 5: [中频] Rule 6 ATR 追踪止损 (10s 周期)
                 if self.is_live_trading:
@@ -1657,7 +1620,8 @@ class AlphaTrader:
                             anomaly_score = await self._get_ml_anomaly_score(symbol, market_data)
                             market_data[symbol]['anomaly_score'] = anomaly_score
                             
-                            ml_pred = await self._get_ml_prediction_rule6_strategic(symbol, market_data)
+                            # [修改] 统一调用 "Strategic" 模型
+                            ml_pred = await self._get_ml_prediction(symbol, market_data)
                             market_data[symbol]['ml_proba_up'] = ml_pred['proba_up']
                             market_data[symbol]['ml_proba_down'] = ml_pred['proba_down']
                             
