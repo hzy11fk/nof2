@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     ### 3. Python (Rule 8 - 突破) 策略配置 (被 settings.XXX 调用) ###
     
     # [Rule 8 主开关] 是否启用 Python 高频突破策略
-    ENABLE_BREAKOUT_MODIFIER: bool = False 
+    ENABLE_BREAKOUT_MODIFIER: bool = True
 
     # [Rule 8 止盈] Python 突破策略的动态追踪止损百分比
     # (被 alpha_trader.py:start() 中的 settings.BREAKOUT_TRAIL_STOP_PERCENT 调用)
