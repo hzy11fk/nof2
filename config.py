@@ -30,6 +30,7 @@ class Settings(BaseSettings):
 
     # [!!! 核心安全开关 !!!] 
     # True: 实盘交易, False: 模拟盘。
+    ALPHA_MODE_ENABLED: bool = True
     ALPHA_LIVE_TRADING: bool = False
 
     # 模拟盘 (Paper Trading) 的初始资金
