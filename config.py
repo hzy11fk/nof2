@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     # [Rule 8 主开关] 是否启用 Python 高频突破策略（已失效）
     ENABLE_BREAKOUT_MODIFIER: bool = True
     #是否启用4H EMA 判断
-    ENABLE_4H_EMA_FILTER = True
+    ENABLE_4H_EMA_FILTER: bool = True
 
     # [Rule 8 止盈] Python 突破策略的动态追踪止损百分比
     # (被 alpha_trader.py:start() 中的 settings.BREAKOUT_TRAIL_STOP_PERCENT 调用)
