@@ -1,11 +1,11 @@
-# 文件: alpha_trader.py (完整优化版 - V-Unified-ML-Fixed)
+# 文件: alpha_trader.py (V-Integrated - 融入了 OI/Taker Ratio 和分级止盈)
 # 描述: 
-# 1. (修复) 统一了 ML 模型。Rule 6 和 Rule 8 
-#    现在共享同一个 "Strategic" (75分钟趋势) 模型。
-# 2. (修复) 修复了 'execute_decisions' 和 'ml_models_rule6_strategic' 的 AttributeError。
-# 3. (保留) Rule 8 使用 "K线收盘价" 突破逻辑。
-# 4. (保留) Rule 6 (AI) 拥有所有高级风控逻辑。
-# 5. (保留) 2秒/10秒 循环拆分。
+# 1. (集成) SYSTEM_PROMPT 中加入了 Rule 6.5 客观信心度评分系统。
+# 2. (集成) _gather_all_market_data 现在尝试获取 OI 变化 和 Taker Buy/Sell Ratio。
+# 3. (集成) _build_prompt 现在向 AI 提供 OI 和 Taker Ratio 数据。
+# 4. (集成) high_frequency_risk_loop 用“分级主动止盈” (Graded Profit Taker) 替换了固定的 4%/10% 止盈。
+# 5. (保留) 统一的 ML 模型 (Strategic) 供 Rule 6 和 Rule 8 使用。
+# 6. (保留) 2秒/10秒 循环拆分。
 
 import logging
 import asyncio
@@ -32,7 +32,7 @@ except ImportError:
 
 class AlphaTrader:
     
-    # --- [AI (Rule 6) 专用 PROMPT] ---
+    # --- [AI (Rule 6) 专用 PROMPT (纯英文)] ---
     SYSTEM_PROMPT_TEMPLATE = """
     You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
 
@@ -48,7 +48,7 @@ class AlphaTrader:
 
     1.A. **Data Supremacy Rule (CRITICAL):**
         -   You will be provided with a `Previous AI Summary` for context.
-        -   You MUST treat all data in the `Multi-Timeframe Market Data Overview` (e.g., current Price, RSI, ADX, ML_Proba) as the **absolute truth**.
+        -   You MUST treat all data in the `Multi-Timeframe Market Data Overview` (e.g., current Price, RSI, ADX, ML_Proba, OI_Change, Taker_Buy_Ratio) as the **absolute truth**.
         -   If the new, current data contradicts your `Previous AI Summary`, you **MUST** discard your old plan and create a new one based **only** on the new data.
 
     1.B. **Trend Filter Veto (CRITICAL):**
@@ -104,6 +104,7 @@ class AlphaTrader:
                 -   *Timing Signal (Long):* Place the `LIMIT_BUY` only if price is in the 'Confluence Zone' **AND** the `15min RSI` or `1h RSI` has dropped to a 'reset' level (e.g., < 40).
                 -   *Timing Signal (Short):* Place the `LIMIT_SELL` only if price is in the 'Confluence Zone' **AND** the `15min RSI` or `1h RSI` has risen to a 'reset' level (e.g., > 60).
             -   **[ML Confirmation]:** This is a High-Confidence trade *only if* the `ML_Proba_UP` (for Long) or `ML_Proba_DOWN` (for Short) is also confirming your thesis (e.g., > 0.60).
+            -   **[Data Confirmation]:** Check `OI_Change_5m_Pct` (e.g., > +0.01 for 1%).
         -   **2. Ranging (No Trend):**
             -   **Condition:** 1h and 4h **ADX_14 < 20**.
             -   **Strategy (LIMIT ONLY):** In this regime, your **only** strategy is **mean-reversion**. Identify the `BB_Upper` and `BB_Lower` levels. You MUST issue **`LIMIT_SELL` at (or near) the upper band** or **`LIMIT_BUY` at (or near) the lower band**.
@@ -123,6 +124,28 @@ class AlphaTrader:
             -   **Action:** Place a **`LIMIT_BUY`** order on the level that was just broken (e.g., the `15min_bb_upper_prev` level), as it is now likely to act as new **support**.
             -   *(Vice-versa for a `LIMIT_SELL` on a breakdown)*.
             -   **[ML Confirmation]:** This is a High-Confidence trade *only if* the `ML_Proba_UP` (for Long) or `ML_Proba_DOWN` (for Short) is also confirming your thesis (e.g., > 0.60).
+            -   **[Data Confirmation]:** A true breakout should be confirmed by `OI_Change_5m_Pct > 0.01` (1%) and strong `Taker_Buy_Ratio_5m > 0.60`.
+
+    6.5. **Objective Confidence Score (CRITICAL):**
+        -   You MUST NOT trade if your final confidence score is **< 85**.
+        -   **Base Score: 60 points**
+        -   **Add +5 points for each:**
+            1.  `[+5]` Multi-Timeframe Alignment (e.g., 15m/1h/4h MACD or EMA trend aligned).
+            2.  `[+5]` Strong Technical Level (e.g., 1h/4h EMA, BBand, or major S/R zone).
+            3.  `[+5]` Volume Confirmation (e.g., `5min_volume_ratio > 1.5` on the setup candle).
+            4.  `[+5]` ML Confirmation (e.g., `ML_Proba > 0.65` in the correct direction).
+            5.  `[+5]` Data Confirmation (e.g., `OI_Change_5m_Pct > 0.01`.
+            6.  `[+5]` Risk:Reward Ratio > 1:3.
+            7.  `[+5]` Pullback Timing (e.g., For LONG, 15m RSI is < 40, indicating a good pullback).
+            8.  `[+5]` Market Sentiment (e.g., F&G Index supports a contrarian entry, like Extreme Fear for a LONG).
+        -   **Subtract -10 points for each:**
+            1.  `[-10]` Contradictory Signal (e.g., 15m MACD opposes 1h trend).
+            2.  `[-10]` Weak Technical Level (e.g., only a 5min level).
+            3.  `[-10]` Low Volume (e.g., `5min_volume_ratio < 0.8`).
+            4.  `[-10]` Weak ML Confirmation (e.g., `ML_Proba < 0.55`).
+        -   **VETO (Score = 0):**
+            1.  `[VETO]` Fails Rule 1.B (Trend Filter Veto).
+            2.  `[VETO]` Fails Rule 1.5 (Anomaly Veto).
 
     7.  **Market Sentiment Filter (Fear & Greed Index):**
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter.
@@ -195,7 +218,7 @@ class AlphaTrader:
            - [CRITICAL: You MUST NEVER add to a losing position (UPL < 0). Averaging down is forbidden.]
            
            SL/TP Target Update Check:
-           - [NOTE: Python handles 1R Breakeven and ATR Trailing automatically. Your task is to assess if the *Take Profit* target is still optimal.]
+           - [NOTE: Python handles 1R Breakeven and Graded Trailing automatically. Your task is to assess if the *Take Profit* target is still optimal.]
            - [IF TP is NOT OPTIMAL: Issue UPDATE_TAKEPROFIT.]
            
            Decision: [Hold/Close/Partial Close/Add/Update TakeProfit + Reason. NOTE: Anomaly, Losing Position Check, and Reversal checks override all "Hold" decisions.]
@@ -212,16 +235,6 @@ class AlphaTrader:
         
         [Analyze opportunities based ONLY on Rule 6, ensuring they pass Rule 1.B (Trend Filter), Rule 1.5 (Anomaly), and Rule 6 (ML Confirmation)]
         
-        [EXAMPLE - RULE 6.4 (Breakout-Retest):]
-        BTC Multi-Timeframe Assessment (Market State: Breakout-Retest, 1h ADX=23):
-        - Anomaly Score: -0.05 (Safe)
-        - Trend Filter (Rule 1.B): PASS (Price > 4h EMA 50)
-        - Breakout: 15min_close_prev (65,500) > 15min_bb_upper_prev (65,300). Breakout is confirmed.
-        - Strategy: Do not chase. Wait for retest.
-        - Retest Level (New Support): 65,300.
-        - ML Confirmation: ML_Proba_UP = 0.75 (Confidence: High)
-        - Signal Confluence Score: 4/4 | Final Confidence: High - **PREPARE LIMIT_BUY at 65,300 (Rule 6.4)**
-        
         [EXAMPLE - RULE 6.1 (Trending Pullback):]
         ETH Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
         - Anomaly Score: -0.05 (Safe)
@@ -229,15 +242,30 @@ class AlphaTrader:
         - 4h Trend: Bullish | 1h Momentum: Strong | 15min Setup: Price pulling back.
         - Confluence Zone: Found at 3550 (4h BB_Mid) - 3555 (1h EMA 20).
         - Timing: 15m RSI is 38 (Near reset level < 40).
-        - ML Confirmation: ML_Proba_UP = 0.68 (Confidence: High)
-        - Signal Confluence Score: 5/5 | Final Confidence: High - **PREPARE LIMIT_BUY at 3555 (Rule 6.1)**
+        - Data Check: OI_Change_5m_Pct = +0.012 (1.2%), Taker_Buy_Ratio_5m = 0.58.
+        - ML Confirmation: ML_Proba_UP = 0.68.
+        - Confidence Score Calculation (Rule 6.5):
+          - Base: 60
+          - [+5] Multi-TF Align: Yes (4h/1h Bullish)
+          - [+5] Strong Level: Yes (4h BB_Mid + 1h EMA 20)
+          - [+5] Volume Confirm: N/A (Assume 1.0)
+          - [+5] ML Confirm: Yes (> 0.65)
+          - [+5] Data Confirm: Yes (OI > 1%, Taker > 0.55)
+          - [+5] R:R: Yes (Assume > 1:3)
+          - [+5] Timing: Yes (RSI < 40)
+          - Total: 95
+        - Final Confidence: High (95) - **PREPARE LIMIT_BUY at 3555 (Rule 6.1)**
 
         [EXAMPLE - RULE 1.B (Trend Filter VETO):]
         ETH Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
         - Anomaly Score: -0.08 (Safe)
         - Trend Filter (Rule 1.B): FAILED (Price 3850 < 4h EMA 50 3860)
         - 4h Trend: N/A | 1h Setup: Price is *approaching* 1h BB_Lower.
-        - Signal Confluence Score: N/A (Rule 1.B VETO) | Final Confidence: VETO - **ABORT LIMIT_BUY due to Trend Filter**
+        - Confidence Score Calculation (Rule 6.5):
+          - Base: 60
+          - [VETO] Failed Rule 1.B
+          - Total: 0
+        - Final Confidence: VETO - **ABORT LIMIT_BUY due to Trend Filter**
 
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
         ```
@@ -246,8 +274,8 @@ class AlphaTrader:
 
     **Order Object Rules:**
     (Market Order Templates Removed)
-    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Support]"}}`
-    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Leverage: [...]. Risk: [...]. Market State: [Trending Pullback or Ranging Resistance]"}}`
+    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Confidence: [Score]/100. Market State: [Trending Pullback or Ranging Support]"}}`
+    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Confidence: [Score]/100. Market State: [Trending Pullback or Ranging Resistance]"}}`
     -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
     -   **To Close Partially (Take Profit):** `{{"action": "PARTIAL_CLOSE", "symbol": "...", "size_percent": 0.5, "reasoning": "Taking 50% profit near resistance per Rule 5..."}}` (or `size_absolute`)
     -   **To Update Stop Loss:** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Actively moving SL to new 15m support level..."}}`
@@ -280,6 +308,14 @@ class AlphaTrader:
         self.fng_data: Dict[str, Any] = {"value": 50, "value_classification": "Neutral"}
         self.last_fng_fetch_time: float = 0.0
         self.FNG_CACHE_DURATION_SECONDS = 3600
+        
+        # 检查交易所能力
+        self.has_oi_history = self.client.has.get('fetchOpenInterestHistory', False)
+        self.has_taker_ratio = self.client.has.get('fapiPublicGetTakerlongshortRatio', False)
+        if not self.has_oi_history:
+             self.logger.warning("Exchange does not support 'fetchOpenInterestHistory'. OI data will be unavailable.")
+        if not self.has_taker_ratio:
+             self.logger.warning("Exchange does not support 'fapiPublicGetTakerlongshortRatio'. Taker Ratio data will be unavailable.")
 
         self.ml_feature_names = [
             '5min_rsi_14', '5min_adx_14', '5min_volume_ratio', '5min_price_change_pct',
@@ -288,7 +324,6 @@ class AlphaTrader:
         ] 
         self.logger.info(f"ML 特征列表已定义 (数量: {len(self.ml_feature_names)})")
 
-        # [修复] 统一加载 "Strategic" 模型
         self.ml_models_strategic = {}
         self.ml_scalers_strategic = {}
         for symbol in self.symbols:
@@ -303,8 +338,6 @@ class AlphaTrader:
             except Exception as e:
                 self.logger.error(f"加载 {symbol} 的 (Strategic) ML 模型时出错: {e}", exc_info=True)
         self.logger.info(f"--- 总共加载了 {len(self.ml_models_strategic)} 个 (Strategic) ML 模型 ---")
-
-        # [修复] 删除了 'ml_models_rule8_tactical' 的加载
 
         self.ml_anomaly_detectors = {}
         self.ml_anomaly_scalers = {}
@@ -328,7 +361,7 @@ class AlphaTrader:
                 self.logger.error(f"加载 {symbol} 的 Anomaly Detector 模型时出错: {e}", exc_info=True)
         self.logger.info(f"--- 总共加载了 {len(self.ml_anomaly_detectors)} 个 Anomaly ML 模型 ---")
         
-        self.tp_counters: Dict[str, Dict[str, int]] = {}
+        # [修改] 移除 tp_counters，因为分级止盈不再需要它
         self.peak_profit_tracker: Dict[str, float] = {}
 
 
@@ -353,7 +386,7 @@ class AlphaTrader:
 
     
     async def _gather_all_market_data(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-        self.logger.debug("Gathering multi-TF market data (5m, 15m, 1h, 4h) + Indicators (Manual Calc)...")
+        self.logger.debug("Gathering multi-TF market data (5m, 15m, 1h, 4h) + Indicators + OI/Taker...")
         market_indicators_data: Dict[str, Dict[str, Any]] = {}
         fetched_tickers: Dict[str, Any] = {}
         
@@ -376,6 +409,17 @@ class AlphaTrader:
                     self.logger.error(f"Safe Fetch Ticker Error ({symbol}): {e}", exc_info=False)
                     return e
         
+        async def _safe_fetch_oi_history(symbol):
+            if not self.has_oi_history: return None
+            async with semaphore:
+                try:
+                    # 获取最近2个周期的 5m OI
+                    return await self.exchange.fetch_open_interest_history(symbol, timeframe='5m', limit=2)
+                except Exception as e:
+                    self.logger.error(f"Safe Fetch OI History Error ({symbol}): {e}", exc_info=False)
+                    return e
+
+
         try:
             timeframes = ['5m', '15m', '1h', '4h']
             tasks = []
@@ -384,21 +428,40 @@ class AlphaTrader:
                     limit = 150 if timeframe == '15m' else 100
                     tasks.append(_safe_fetch_ohlcv(symbol, timeframe, limit=limit))
                 tasks.append(_safe_fetch_ticker(symbol))
+                # [集成] 添加新数据任务
+                tasks.append(_safe_fetch_oi_history(symbol))
+               # tasks.append(_safe_fetch_taker_ratio(symbol))
                 
             results = await asyncio.gather(*tasks)
             
-            total_timeframes = len(timeframes); tasks_per_symbol = total_timeframes + 1
+            total_timeframes = len(timeframes)
+            tasks_per_symbol = total_timeframes + 1 + 1 # 2 个新任务
             
             for i, symbol in enumerate(self.symbols):
-                start_index = i * tasks_per_symbol; symbol_ohlcv_results = results[start_index:start_index + total_timeframes]
+                start_index = i * tasks_per_symbol
+                symbol_ohlcv_results = results[start_index : start_index + total_timeframes]
                 ticker_result = results[start_index + total_timeframes]
-                
+                oi_history_result = results[start_index + total_timeframes + 1]
+              #  taker_ratio_result = results[start_index + total_timeframes + 2]
+
                 if not isinstance(ticker_result, Exception) and ticker_result and ticker_result.get('last') is not None:
                     fetched_tickers[symbol] = ticker_result; market_indicators_data[symbol] = {'current_price': ticker_result.get('last')}
                 else: 
                     market_indicators_data[symbol] = {'current_price': None}
                     self.logger.warning(f"Failed fetch ticker/price for {symbol} (Result: {ticker_result})")
                 
+                # [集成] 处理 OI 数据
+                market_indicators_data[symbol]['oi_change_5m_pct'] = 0.0
+                if isinstance(oi_history_result, list) and len(oi_history_result) == 2:
+                    try:
+                        oi_curr = float(oi_history_result[1]['openInterestValue']) # 最新
+                        oi_prev = float(oi_history_result[0]['openInterestValue']) # 之前
+                        if oi_prev > 0:
+                            market_indicators_data[symbol]['oi_change_5m_pct'] = (oi_curr - oi_prev) / oi_prev
+                    except Exception as e_oi:
+                        self.logger.warning(f"Error processing OI data for {symbol}: {e_oi}")
+
+
                 for j, timeframe in enumerate(timeframes):
                     ohlcv_data = symbol_ohlcv_results[j]
                     
@@ -544,10 +607,11 @@ class AlphaTrader:
         prompt += f"{self.last_strategy_summary}\n"
         
         prompt += "\n--- Multi-Timeframe Market Data Overview (5m, 15m, 1h, 4h) ---\n"
-        def safe_format(value, precision, is_rsi=False):
+        def safe_format(value, precision, is_rsi=False, is_pct=False):
             is_na = pd.isna(value) if pd else value is None
             if isinstance(value, (int, float)) and not is_na:
                 if is_rsi: return f"{round(value):d}"
+                if is_pct: return f"{value:+.2%}"
                 try: return f"{value:.{precision}f}"
                 except (ValueError, TypeError): return str(value) if value is not None else "N/A"
             return "N/A"
@@ -564,6 +628,9 @@ class AlphaTrader:
             prompt += f"ML_Proba_UP (15m): {safe_format(d.get('ml_proba_up'), 2)}\n"
             prompt += f"ML_Proba_DOWN (15m): {safe_format(d.get('ml_proba_down'), 2)}\n"
             
+            # [集成] 添加新数据
+            prompt += f"OI_Change_5m_Pct: {safe_format(d.get('oi_change_5m_pct'), 2, is_pct=True)}\n"
+
             prompt += f"Peak_Profit_Achieved: {safe_format(d.get('peak_profit_achieved_percent'), 1)}%\n"
             
             timeframes = ['5min', '15min', '1hour', '4hour']
@@ -827,7 +894,7 @@ class AlphaTrader:
                         if new_take_profit<=0: raise ValueError("无效止盈价")
                     except (ValueError,TypeError,KeyError) as e: self.logger.error(f"跳过UPDATE_TAKEPROFIT参数错误: {order}. Err: {e}"); continue
                     
-                    self.logger.warning(f"AI 请求更新止盈 {symbol}: {new_take_profit:.4f}. 原因: {reason}")
+                    self.logger.warning(f"AI 请求更新止Ying {symbol}: {new_take_profit:.4f}. 原因: {reason}")
                     if hasattr(self.portfolio, 'update_position_rules'): 
                         await self.portfolio.update_position_rules(symbol, take_profit=new_take_profit, reason=reason)
                     else: 
@@ -874,6 +941,10 @@ class AlphaTrader:
         R8_VOL_RATIO_5M = 2.5
         R8_VOL_RATIO_15M = 2.0
         ML_CONFIDENCE_THRESHOLD = 0.65
+        # [集成] Rule 8 确认 OI 和 Taker
+        OI_CHANGE_THRESHOLD = 0.01 # 1% OI 增长
+        TAKER_BUY_RATIO_LONG_THRESHOLD = 0.55 # 55% 买方
+        TAKER_BUY_RATIO_SHORT_THRESHOLD = 0.45 # 45% 买方 (即 55% 卖方)
         
         leverage = futures_settings.FUTURES_LEVERAGE
         risk_percent = futures_settings.FUTURES_RISK_PER_TRADE_PERCENT / 100.0
@@ -901,8 +972,12 @@ class AlphaTrader:
                 vol_ratio_15m = data.get('15min_volume_ratio')
                 ema_50_4h = data.get('4hour_ema_50')
                 
-                if not all([price, adx_1h, close_prev, bb_upper_prev, bb_lower_prev, vol_ratio_5m, vol_ratio_15m, ema_50_4h, ohlcv_15m]):
-                    self.logger.debug(f"Rule 8 Skipping {symbol}: Missing key data (incl. _prev values or ohlcv_15m).")
+                # [集成] 获取新数据
+                oi_change_pct = data.get('oi_change_5m_pct')
+                taker_buy_ratio = data.get('taker_buy_ratio_5m')
+                
+                if not all([price, adx_1h, close_prev, bb_upper_prev, bb_lower_prev, vol_ratio_5m, vol_ratio_15m, ema_50_4h, ohlcv_15m, oi_change_pct is not None, taker_buy_ratio is not None]):
+                    self.logger.debug(f"Rule 8 Skipping {symbol}: Missing key data (incl. _prev, ohlcv, oi, or taker).")
                     continue
 
                 ml_proba_up = 0.5 
@@ -925,13 +1000,21 @@ class AlphaTrader:
                     if price < ema_50_4h: continue
                     if fng_value > 75: continue
                     
+                    # [集成] 检查 OI 和 Taker
+                    if oi_change_pct < OI_CHANGE_THRESHOLD:
+                        self.logger.debug(f"Rule 8 (Py) BUY Veto (OI): {symbol} OI Change {oi_change_pct:+.2%} < {OI_CHANGE_THRESHOLD:+.2%}")
+                        continue
+
+                    # [V-FIX] 仅当交易所支持时才检查 Taker Ratio
+                    if self.has_taker_ratio and taker_buy_ratio < TAKER_BUY_RATIO_LONG_THRESHOLD:
+                        self.logger.debug(f"Rule 8 (Py) BUY Veto (Taker): {symbol} Taker Ratio {taker_buy_ratio:.2f} < {TAKER_BUY_RATIO_LONG_THRESHOLD:.2f}")
+                        continue
                     has_divergence, div_reason = await self._check_divergence(ohlcv_15m)
                     if has_divergence and "Bearish" in div_reason:
                         self.logger.warning(f"Rule 8 (Py) BUY Veto (Divergence): {symbol} {div_reason}")
                         continue
 
                     if not ml_called:
-                        # [修复] 统一调用 "Strategic" 模型
                         ml_pred = await self._get_ml_prediction(symbol, market_data)
                         ml_proba_up = ml_pred['proba_up']
                         ml_proba_down = ml_pred['proba_down']
@@ -948,13 +1031,22 @@ class AlphaTrader:
                     if price > ema_50_4h: continue
                     if fng_value < 25: continue
                     
+                    # [集成] 检查 OI 和 Taker
+                    if oi_change_pct < OI_CHANGE_THRESHOLD: # OI 增加通常确认下跌
+                        self.logger.debug(f"Rule 8 (Py) SELL Veto (OI): {symbol} OI Change {oi_change_pct:+.2%} < {OI_CHANGE_THRESHOLD:+.2%}")
+                        continue
+
+                    # [V-FIX] 仅当交易所支持时才检查 Taker Ratio
+                    if self.has_taker_ratio and taker_buy_ratio > TAKER_BUY_RATIO_SHORT_THRESHOLD:
+                        self.logger.debug(f"Rule 8 (Py) SELL Veto (Taker): {symbol} Taker Ratio {taker_buy_ratio:.2f} > {TAKER_BUY_RATIO_SHORT_THRESHOLD:.2f}")
+                        continue
+
                     has_divergence, div_reason = await self._check_divergence(ohlcv_15m)
                     if has_divergence and "Bullish" in div_reason:
                         self.logger.warning(f"Rule 8 (Py) SELL Veto (Divergence): {symbol} {div_reason}")
                         continue
 
                     if not ml_called:
-                        # [修复] 统一调用 "Strategic" 模型
                         ml_pred = await self._get_ml_prediction(symbol, market_data)
                         ml_proba_up = ml_pred['proba_up']
                         ml_proba_down = ml_pred['proba_down']
@@ -1017,7 +1109,6 @@ class AlphaTrader:
 
 
     async def _get_ml_prediction(self, symbol: str, market_data: Dict) -> Dict:
-        """ [修复] 统一的 ML 预测函数 (使用 Strategic 模型) """
         model = self.ml_models_strategic.get(symbol)
         scaler = self.ml_scalers_strategic.get(symbol)
         
@@ -1291,11 +1382,12 @@ class AlphaTrader:
             extracted_summary = parts[1].strip().lstrip(' :').rstrip('`')
             if extracted_summary:
                 summary_for_ui = extracted_summary 
-                self.logger.info(f"Extracted Chinese summary: '{summary_for_ui[:50]}...'")
+                # [修改] 摘要日志记录改为英文
+                self.logger.info(f"Extracted English summary: '{summary_for_ui[:50]}...'")
             else:
-                summary_for_ui = "AI 摘要为空。"
+                 summary_for_ui = "AI summary was empty." # 英文
         else:
-            self.logger.warning("AI CoT 未找到 'In summary,' 关键字。")
+            self.logger.warning("AI CoT did not find 'In summary,' keyword.") # 英文
         
         self.last_strategy_summary = summary_for_ui
 
@@ -1311,8 +1403,7 @@ class AlphaTrader:
     async def high_frequency_risk_loop(self):
         self.logger.warning("🚀 高频风控循环 (HF Risk Loop) 已启动 (2s 周期)...")
         
-        MULTI_TP_STAGE_1_PERCENT = 0.04
-        MULTI_TP_STAGE_2_PERCENT = 0.10
+        # [修改] 移除了固定的 TP STAGES
         MAX_LOSS_PERCENT = settings.MAX_LOSS_CUTOFF_PERCENT / 100.0
         DUST_MARGIN_USDT = 1.0
         
@@ -1335,14 +1426,11 @@ class AlphaTrader:
                         continue
 
                     positions_to_close = {} 
-                    positions_to_partial_close = []
+                    # [修改] 移除了 positions_to_partial_close
                     sl_update_tasks = [] 
 
                     open_symbols = set(open_positions.keys())
-                    for symbol in list(self.tp_counters.keys()):
-                        if symbol not in open_symbols:
-                            self.logger.info(f"HF Risk Loop: Removing TP counter for closed position: {symbol}")
-                            del self.tp_counters[symbol]
+                    # [修改] 移除了 tp_counters
                     for symbol in list(self.peak_profit_tracker.keys()):
                         if symbol not in open_symbols:
                             self.logger.info(f"HF Risk Loop: Removing Peak Profit tracker for closed position: {symbol}")
@@ -1361,7 +1449,7 @@ class AlphaTrader:
                             
                             initial_sl = state.get('ai_suggested_stop_loss', 0.0) 
                             
-                            if not all([entry, size, side, lev, margin, initial_sl]) or lev <= 0 or entry <= 0 or margin <= 0 or initial_sl <= 0:
+                            if not all([entry, size, side, lev, margin, initial_sl]) or lev <= 0 or entry <= 0 or margin <= 0 or initial_sl <= 0 or size <= 0:
                                 self.logger.warning(f"HF Risk Loop: Skipping {symbol}, invalid state data (entry, size, side, lev, margin, or initial_sl missing/zero).")
                                 continue
 
@@ -1396,7 +1484,14 @@ class AlphaTrader:
                                 if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                 continue 
 
+                            # [集成] 更新 Peak Profit (适用于所有策略)
+                            current_peak_rate = self.peak_profit_tracker.get(symbol, 0.0)
+                            if rate > current_peak_rate:
+                                self.peak_profit_tracker[symbol] = rate
+                                current_peak_rate = rate # 使用最新峰值
+
                             if not is_rule_8_trade:
+                                # 1. 1R Breakeven Check
                                 if abs(initial_sl - entry) > 1e-9: 
                                     initial_risk_distance = abs(entry - initial_sl)
                                     current_upl_distance = 0.0
@@ -1411,10 +1506,45 @@ class AlphaTrader:
                                             self.portfolio.update_position_rules(symbol, stop_loss=entry, reason="HF Risk Loop: 1R Breakeven")
                                         )
                                 
-                                current_peak = self.peak_profit_tracker.get(symbol, 0.0)
-                                if rate > current_peak:
-                                    self.peak_profit_tracker[symbol] = rate
-
+                                # 2. [集成] Graded Profit Taker (分级主动止盈)
+                                target_profit_rate = 0.0
+                                if current_peak_rate >= 0.15: # > 15%
+                                    target_profit_rate = current_peak_rate * 0.65 # 锁定 65%
+                                elif current_peak_rate >= 0.08: # 8% - 15%
+                                    target_profit_rate = current_peak_rate * 0.70 # 锁定 70% (回撤 30%)
+                                elif current_peak_rate >= 0.05: # 5% - 8%
+                                    target_profit_rate = current_peak_rate * 0.75 # 锁定 75% (回撤 25%)
+                                elif current_peak_rate >= 0.03: # 3% - 5%
+                                    target_profit_rate = current_peak_rate * 0.80 # 锁定 80% (回撤 20%)
+                                elif current_peak_rate >= 0.007: # 0.7% - 3%
+                                    target_profit_rate = current_peak_rate * 0.60 # 锁定 60% (回撤 40%)
+                                
+                                if target_profit_rate > 0.0:
+                                    target_upl = target_profit_rate * margin
+                                    new_graded_sl_price = 0.0
+                                    if side == 'long':
+                                        new_graded_sl_price = (target_upl / size) + entry
+                                    else:
+                                        new_graded_sl_price = entry - (target_upl / size)
+                                    
+                                    current_sl = state.get('ai_suggested_stop_loss', 0.0)
+                                    
+                                    if side == 'long':
+                                        # 新 SL 必须高于条目 和 当前 SL
+                                        final_sl_floor = max(entry, current_sl)
+                                        if new_graded_sl_price > final_sl_floor:
+                                            sl_update_tasks.append(
+                                                self.portfolio.update_position_rules(symbol, stop_loss=new_graded_sl_price, reason="HF Risk Loop: Graded Profit Taker")
+                                            )
+                                    elif side == 'short':
+                                        # 新 SL 必须低于条目 和 当前 SL
+                                        final_sl_floor = min(entry, current_sl)
+                                        if new_graded_sl_price < final_sl_floor:
+                                             sl_update_tasks.append(
+                                                self.portfolio.update_position_rules(symbol, stop_loss=new_graded_sl_price, reason="HF Risk Loop: Graded Profit Taker")
+                                            )
+                            
+                            # 3. 检查 AI 设定的 SL/TP (所有策略)
                             current_active_sl = state.get('ai_suggested_stop_loss') 
                             if current_active_sl and current_active_sl > 0:
                                 if (side == 'long' and price <= current_active_sl) or (side == 'short' and price >= current_active_sl):
@@ -1429,18 +1559,7 @@ class AlphaTrader:
                                     if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                     continue 
 
-                            if not is_rule_8_trade:
-                                self.tp_counters.setdefault(symbol, {'stage1': 0, 'stage2': 0})
-                                counters = self.tp_counters[symbol]
-                                if rate < 0:
-                                    if counters['stage1'] == 1 or counters['stage2'] == 1:
-                                        counters['stage1'] = 0; counters['stage2'] = 0
-                                elif rate >= MULTI_TP_STAGE_2_PERCENT and counters['stage2'] == 0:
-                                    positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 2 (>{MULTI_TP_STAGE_2_PERCENT:.0%})"))
-                                    counters['stage2'] = 1; counters['stage1'] = 1 
-                                elif rate >= MULTI_TP_STAGE_1_PERCENT and counters['stage1'] == 0:
-                                    positions_to_partial_close.append((symbol, 0.5, f"Hard TP Stage 1 (>{MULTI_TP_STAGE_1_PERCENT:.0%})"))
-                                    counters['stage1'] = 1 
+                            # [修改] 移除了固定的 4%/10% 部分止盈逻辑
                     
                     except Exception as e_risk_inner:
                         self.logger.error(f"HF Risk Loop 内部错误: {e_risk_inner}", exc_info=True)
@@ -1451,13 +1570,8 @@ class AlphaTrader:
                          tasks_close = [self.portfolio.live_close(symbol, reason=f"HF Risk Loop: {reason}") for symbol, reason in positions_to_close.items()]
                          await asyncio.gather(*tasks_close, return_exceptions=True)
                          self.logger.info(f"HF Risk Loop: Hard Close actions executed for: {list(positions_to_close.keys())}")
-                    if positions_to_partial_close:
-                        final_partial_tasks = []
-                        for symbol, size_pct, reason in positions_to_partial_close:
-                            if symbol not in positions_to_close:
-                                final_partial_tasks.append(self.portfolio.live_partial_close(symbol, size_percent=size_pct, reason=f"HF Risk Loop: {reason}"))
-                        if final_partial_tasks:
-                            await asyncio.gather(*final_partial_tasks, return_exceptions=True)
+                    
+                    # [修改] 移除了 partial_close 逻辑
 
                 await asyncio.sleep(2) # 2 秒高频循环
                 
@@ -1570,10 +1684,12 @@ class AlphaTrader:
                                 elif side == 'short':
                                     new_sl = price + (ATR_TRAIL_MULTIPLIER * atr_15m)
                                     if new_sl < current_sl:
-                                        sl_update_tasks_rule6.append(
+                                         sl_update_tasks_rule6.append(
                                             self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Main Loop: Rule 6 ATR Trail")
                                         )
 
+                        # --- [以下是您缺失的代码] ---
+                        
                         if sl_update_tasks_rule6:
                             self.logger.info(f"Main Loop (ATR Trail): 正在为 {len(sl_update_tasks_rule6)} 个 Rule 6 仓位更新追踪止损...")
                             await asyncio.gather(*sl_update_tasks_rule6, return_exceptions=True)
@@ -1620,7 +1736,6 @@ class AlphaTrader:
                             anomaly_score = await self._get_ml_anomaly_score(symbol, market_data)
                             market_data[symbol]['anomaly_score'] = anomaly_score
                             
-                            # [修改] 统一调用 "Strategic" 模型
                             ml_pred = await self._get_ml_prediction(symbol, market_data)
                             market_data[symbol]['ml_proba_up'] = ml_pred['proba_up']
                             market_data[symbol]['ml_proba_down'] = ml_pred['proba_down']
@@ -1634,7 +1749,10 @@ class AlphaTrader:
                     self.last_run_time = now
                 
                 await asyncio.sleep(10) # 10秒主循环 (低频)
-            except asyncio.CancelledError: self.logger.warning("Main loop task cancelled, shutting down..."); break
+                
+            except asyncio.CancelledError: 
+                self.logger.warning("Main loop task cancelled, shutting down..."); 
+                break
             except Exception as e: 
                 self.logger.critical(f"Main loop fatal error (outside sync/AI): {e}", exc_info=True); 
                 await asyncio.sleep(60)
