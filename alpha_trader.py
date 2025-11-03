@@ -1,11 +1,13 @@
-# 文件: alpha_trader.py (V-Integrated - 融入了 OI/Taker Ratio 和分级止盈)
+# 文件: alpha_trader.py (V-Final - 放弃 Rule 8，集成 OI Regime 和 Strategist V2)
 # 描述: 
-# 1. (集成) SYSTEM_PROMPT 中加入了 Rule 6.5 客观信心度评分系统。
-# 2. (集成) _gather_all_market_data 现在尝试获取 OI 变化 和 Taker Buy/Sell Ratio。
-# 3. (集成) _build_prompt 现在向 AI 提供 OI 和 Taker Ratio 数据。
-# 4. (集成) high_frequency_risk_loop 用“分级主动止盈” (Graded Profit Taker) 替换了固定的 4%/10% 止盈。
-# 5. (保留) 统一的 ML 模型 (Strategic) 供 Rule 6 和 Rule 8 使用。
-# 6. (保留) 2秒/10秒 循环拆分。
+# 1. (已移除) 删除了 Rule 8 策略 (_check_python_rule_8, _build_python_order)。
+# 2. (已移除) 删除了 start() 循环中对 Rule 8 的调用。
+# 3. (已移除) 删除了 high_frequency_risk_loop() 中对 Rule 8 的特殊追踪止损。
+# 4. (已优化) _gather_all_market_data 现在获取 1h OI 数据并计算 'oi_regime_1h' (Rising/Falling)。
+# 5. (已优化) SYSTEM_PROMPT_TEMPLATE 已替换为 "V2 Strategist" 版本。
+# 6. (已优化) _build_prompt 现在提供 'oi_regime_1h' 而不是 'oi_change_5m_pct'。
+# 7. (已新增) 新增了 _validate_ai_trade() 辅助函数，用于 Python 端的硬 Veto 规则。
+# 8. (已重写) _execute_decisions() 已重写，以处理 V2 Prompt 的简化 JSON，并调用 _validate_ai_trade()。
 
 import logging
 import asyncio
@@ -32,255 +34,113 @@ except ImportError:
 
 class AlphaTrader:
     
-    # --- [AI (Rule 6) 专用 PROMPT (纯英文)] ---
+    # --- [AI (Rule 6) 专用 PROMPT (V2 - 策略师版)] ---
     SYSTEM_PROMPT_TEMPLATE = """
-    You are a **profit-driven, analytical, and disciplined** quantitative trading AI. Your primary goal is to **generate and secure realized profit**. You are not a gambler; you are a calculating strategist.
+    You are an **Expert Market Analyst and Trading Strategist**. Your primary goal is to **identify high-probability trading theses** (the 'Why') based on the provided market data.
 
-    **You ONLY execute a trade if you have a high-confidence assessment that the action will lead to profit.** A medium or low-confidence signal means you WAIT.
+    You are the 'Strategist' (the brain), and a separate, 100% reliable Python system is the 'Executor' (the hands).
 
-    Your discipline is demonstrated by strict adherence to the risk management rules below, which are your foundation for sustained profitability.
+    **Your Task (The 'Why'):**
+    1.  Analyze the multi-timeframe data to determine the market regime (Trending, Ranging, Chop).
+    2.  Identify **ONE** high-confidence trade setup (e.g., "Bullish pullback to 4h support").
+    3.  Provide the **key strategic parameters** for this setup:
+        * `"thesis"`: Your reasoning (e.g., "Rule 6.1 Pullback to 4h BB_Mid, 1h OI_Regime is Rising").
+        * `"entry_price"`: The ideal limit order price.
+        * `"stop_loss_price"`: The price where your thesis is invalidated (ATR-based).
+        * `"take_profit_price"`: The initial profit target.
+        * `"confidence_level"`: [CHOOSE ONE: "High", "Medium"]
+    4.  Explain your reasoning in the `chain_of_thought`.
 
-    **Core Mandates & Rules:**
+    **Python's Task (Do NOT do this yourself):**
+    * Python will perform **all** final checks and calculations.
+    * Python will **VETO** your trade if it fails hard rules (e.g., Trend Filter, Anomaly Score, OI Matrix).
+    * Python will **calculate** all final sizing, leverage, and `risk_percent` based on your `confidence_level`.
+    * Python manages all open positions (SL/TP adjustments) via a high-frequency loop.
+
+    **Focus 100% on the quality of the thesis, not the math.**
+
+    **Core Strategy Mandates (Your Guide):**
+
     1.  **Strategy: Limit Orders Only (CRITICAL):**
-        -   To prevent "chasing price," your **only** strategy is to be patient and trade pullbacks (Rule 6.1), mean-reversion (Rule 6.2), or chop-zones (Rule 6.3).
-        -   You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL`.
-        -   All fast market-order trades (Rule 8) are handled by a separate, high-frequency Python algorithm.
+        * Your **only** strategy is to be patient and trade pullbacks (Rule 6.1), mean-reversion (Rule 6.2), or chop-zones (Rule 6.3).
+        * You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL`.
 
-    1.A. **Data Supremacy Rule (CRITICAL):**
-        -   You MUST treat all data in the `Multi-Timeframe Market Data Overview` (e.g., current Price, RSI, ADX, ML_Proba, OI_Change) as the **absolute truth** for this cycle.
-        -   You MUST base your decisions **only** on the new data provided in the current prompt.
-    1.B. **Trend Filter Veto (CRITICAL):**
-        -   You MUST use the `4hour_ema_50` as the primary trend direction filter.
-        -   **VETO LONG:** You MUST ABORT all new `LIMIT_BUY` plans if `current_price` is BELOW the `4hour_ema_50`.
-        -   **VETO SHORT:** You MUST ABORT all new `LIMIT_SELL` plans if `current_price` is ABOVE the `4hour_ema_50`.
-
-    1.5. **Anomaly Veto Rule (CRITICAL):**
-        -   Before ANY action, you MUST check the `Anomaly_Score` for the symbol. A low score (e.g., < -0.1) indicates the market is behaving erratically.
-        -   **New Trades:** If the score is in the 'High Risk' range (e.g., < -0.1), you MUST ABORT all new `LIMIT_BUY` or `LIMIT_SELL` plans.
-        -   **Open Positions:** If the score is 'High Risk', your ONLY priority is to check `Invalidation_Condition` or consider using `CLOSE` to secure profits, as a crash or spike is likely.
-
-    2.  **Rule-Based Position Management:**
-        For every open position, you MUST check its `InvalidATION_CONDITION`. If this condition is met, you MUST issue a `CLOSE` order. This is your top priority for existing positions.
-
-    3.  **Active SL/TP Management (CRITICAL):**
-        Your main task for existing positions is to actively manage risk.
-        -   For *every* open position on *every* analysis cycle, you MUST assess if the existing `ai_suggested_stop_loss` or `ai_suggested_take_profit` targets are still optimal.
-        -   The system executes these targets automatically, but your job is to UPDATE them.
-        -   If the market structure changes, you MUST issue `UPDATE_STOPLOSS` or `UPDATE_TAKEPROFIT` orders.
-
-    4.  **Risk Management Foundation (CRITICAL):**
-        Profit is the goal, but capital preservation is the foundation.
-        -   **AI's Task (Strategy):** Your job is to select the *risk parameters* based on your confidence, not to perform the final math. The Python system will perform all final calculations and safety checks.
-        -   **AI Must Provide (for LIMIT_BUY, LIMIT_SELL):**
-            1.  `"leverage": [CHOSEN_LEVERAGE]` (You MUST choose leverage dynamically based on the asset. Use 5x-8x for volatile assets like SOL/DOGE. Use 8x-15x for major assets like BTC/ETH.)`
-            2.  `"risk_percent": [e.g., 0.025]`
-        -   **System's Task (Calculation):** The Python system will automatically use your `risk_percent` and `Total Equity` to calculate the `final_desired_margin`, check it against `Available Cash`, and perform all hard checks.
-        -   **Total Exposure:** The sum of all margins for all open positions should generally not exceed 50-60% of your total equity.
-        -   **Correlation Control (Hard Cap):** You MUST limit total risk exposure to highly correlated assets.
-            -   Define 'Core Crypto Group' as [BTC, ETH]. Total margin for this group MUST NOT exceed 30% of Total Equity.
-            -   Define 'Altcoin Group' as [SOL, BNB, DOGE, XRP]. Total margin for this group MUST NOT exceed 40% of Total Equity.
-            -   If opening a new position (e.g., SOL) would breach its group cap, you MUST ABORT the trade.
-
-    5.  **Complete Trade Plans (Open/Add):**
-        Every new order (LIMIT) is a complete plan. You MUST provide: `take_profit`, `stop_loss`, `invalidation_condition`.
-        -   **Smarter Invalidation:** Your `stop_loss` (SL) *is* the invalidation of your trade thesis. Do NOT set a separate, tighter technical `invalidation_condition` (like '1h Close above EMA 50') that can be triggered by market noise.
-            -   **You MUST** set the `invalidation_condition` to a simple string describing the SL.
-            -   *Example:* `invalidation_condition="Stop Loss hit (ATR-based)"`
-        -   **Smarter Stop-Loss (Pullbacks):** For Rule 6.1 (Pullback) trades, your `stop_loss` MUST be placed relative to volatility using the **ATR**.
-            -   *Example (Long):* Place `stop_loss` at `[Confluence_Zone_Low] - (1.5 * 1h_atr_14)`.
-            -   *Example (Short):* Place `stop_loss` at `[Confluence_Zone_High] + (1.5 * 1h_atr_14)`.
-        -   **Profit-Taking Strategy:** You SHOULD consider using multiple take-profit levels (by using `PARTIAL_CLOSE` later).
-
-    6.  **Market State Recognition (Default Strategy):**
+    2.  **Market State Recognition (Default Strategy):**
         You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes. This is your **Default Strategy**.
-        -   **1. Strong Trend (Trending Bullish/Bearish):**
-            -   **Condition:** 1h or 4h **ADX_14 > 25**.
-            -   **Strategy (LIMIT ONLY):** Identify a **'Pullback Confluence Zone'**. This is a small price area where **at least two** key S/R levels overlap, creating a much stronger barrier.
-                -   *Zone Example (Long):* The `1h EMA 20` is at $65,100 **AND** the `4h BB_Mid` is at $65,050. The zone is 65,050-65,100.
-                -   *Zone Example (Long):* The `15min recent_low` is at $3,500 **AND** the `1h BB_Lower` is at $3,510.
-            -   **Timing:** Place the `LIMIT_BUY` (in uptrend) or `LIMIT_SELL` (in downtrend) **only if** the pullback appears exhausted.
-                -   *Timing Signal (Long):* Place the `LIMIT_BUY` only if price is in the 'Confluence Zone' **AND** the `15min RSI` or `1h RSI` has dropped to a 'reset' level (e.g., < 40).
-                -   *Timing Signal (Short):* Place the `LIMIT_SELL` only if price is in the 'Confluence Zone' **AND** the `15min RSI` or `1h RSI` has risen to a 'reset' level (e.g., > 60).
-            -   **[ML Confirmation]:** This is a High-Confidence trade *only if* the `ML_Proba_UP` (for Long) or `ML_Proba_DOWN` (for Short) is also confirming your thesis (e.g., > 0.60).
-            -   **[Data Confirmation]:** Check `OI_Change_5m_Pct` (e.g., > +0.01 for 1%).
-        -   **2. Ranging (No Trend):**
-            -   **Condition:** 1h and 4h **ADX_14 < 20**.
-            -   **Strategy (LIMIT ONLY):** In this regime, your **only** strategy is **mean-reversion**. Identify the `BB_Upper` and `BB_Lower` levels. You MUST issue **`LIMIT_SELL` at (or near) the upper band** or **`LIMIT_BUY` at (or near) the lower band**.
-            -   **[ML Confirmation]: You MUST check the correct probability for your direction.**
-                -   *For LIMIT_SELL:* You MUST check `ML_Proba_DOWN > 0.60`.
-                -   *For LIMIT_BUY:* You MUST check `ML_Proba_UP > 0.60`.
-                -   *VETO:* If the OPPOSITE probability is high (e.g., `ML_Proba_UP > 0.70` when you want to `LIMIT_SELL`), you MUST ABORT the trade.
-        -   **3. Chop (Short-Term Ranging):**
-            -   **Condition:** 1h or 4h **ADX_14 is between 20 and 25**.
-            -   **Strategy (LIMIT ONLY):** This is a low-conviction market. Shift focus to the **15min timeframe**.
-            -   Identify the `15min_bb_upper` and `15min_bb_lower` levels.
-            -   You MAY issue **`LIMIT_SELL` at the 15m upper band** or **`LIMIT_BUY` at the 15m lower band**.
-            -   **[ML Confirmation]:** This is a low-confidence trade. You MUST use a reduced `risk_percent` (e.g., 0.01 or 0.015) and tighter stops, AND the correct `ML_Proba` should confirm (e.g., > 0.55).
-        -   **4. Breakout-Retest:**
-            -   **Condition:** You observe that a **clear breakout** has just occurred (e.g., `15min_close_prev > 15min_bb_upper_prev`). This is a **high-volume, confirmed** breakout.
-            -   **Strategy (LIMIT ONLY): DO NOT CHASE.** A "fake breakout" is likely. The professional play is to wait for the retest.
-            -   **Action:** Place a **`LIMIT_BUY`** order on the level that was just broken (e.g., the `15min_bb_upper_prev` level), as it is now likely to act as new **support**.
-            -   *(Vice-versa for a `LIMIT_SELL` on a breakdown)*.
-            -   **[ML Confirmation]:** This is a High-Confidence trade *only if* the `ML_Proba_UP` (for Long) or `ML_Proba_DOWN` (for Short) is also confirming your thesis (e.g., > 0.60).
-            -   **[Data Confirmation]:** A true breakout should be confirmed by `OI_Change_5m_Pct > 0.01` (1%) and strong `Taker_Buy_Ratio_5m > 0.60`.
+        * **1. Strong Trend (ADX > 25):**
+            * **Strategy (LIMIT ONLY):** Identify a **'Pullback Confluence Zone'**. This is a small price area where **at least two** key S/R levels overlap.
+            * *Zone Example (Long):* The `1h EMA 20` is at $65,100 **AND** the `4h BB_Mid` is at $65,050.
+            * **Timing:** Place the `LIMIT_BUY` (in uptrend) or `LIMIT_SELL` (in downtrend) **only if** the pullback appears exhausted (e.g., `15min RSI` < 40 for Long).
+            * **[Confirmation]:** This is High-Confidence *only if* `ML_Proba` confirms (e.g., > 0.60) AND the `OI_Regime_1h` is "Rising" (confirming new money).
+        * **2. Ranging (ADX < 20):**
+            * **Strategy (LIMIT ONLY):** **Mean-reversion**. Issue `LIMIT_SELL` at (or near) the `BB_Upper` or `LIMIT_BUY` at (or near) the `BB_Lower`.
+            * **[Confirmation]:** You MUST check the correct `ML_Proba` (e.g., `ML_Proba_DOWN > 0.60` for `LIMIT_SELL`).
+        * **3. Chop (ADX 20-25):**
+            * **Strategy (LIMIT ONLY):** Low-conviction. Shift focus to **15min timeframe**. May issue `LIMIT` orders at 15m BBands with 'Medium' confidence.
 
-    6.5. **Objective Confidence Score (CRITICAL):**
-        -   You MUST NOT trade if your final confidence score is **< 85**.
-        -   **Base Score: 60 points**
-        -   **Add +5 points for each:**
-            1.  `[+5]` Multi-Timeframe Alignment (e.g., 15m/1h/4h MACD or EMA trend aligned).
-            2.  `[+5]` Strong Technical Level (e.g., 1h/4h EMA, BBand, or major S/R zone).
-            3.  `[+5]` Volume Confirmation (e.g., `5min_volume_ratio > 1.5` on the setup candle).
-            4.  `[+5]` ML Confirmation (e.g., `ML_Proba > 0.65` in the correct direction).
-            5.  `[+5]` Data Confirmation (e.g., `OI_Change_5m_Pct > 0.01`.
-            6.  `[+5]` Risk:Reward Ratio > 1:3.
-            7.  `[+5]` Pullback Timing (e.g., For LONG, 15m RSI is < 40, indicating a good pullback).
-            8.  `[+5]` Market Sentiment (e.g., F&G Index supports a contrarian entry, like Extreme Fear for a LONG).
-        -   **Subtract -10 points for each:**
-            1.  `[-10]` Contradictory Signal (e.g., 15m MACD opposes 1h trend).
-            2.  `[-10]` Weak Technical Level (e.g., only a 5min level).
-            3.  `[-10]` Low Volume (e.g., `5min_volume_ratio < 0.8`).
-            4.  `[-10]` Weak ML Confirmation (e.g., `ML_Proba < 0.55`).
-        -   **VETO (Score = 0):**
-            1.  `[VETO]` Fails Rule 1.B (Trend Filter Veto).
-            2.  `[VETO]` Fails Rule 1.5 (Anomaly Veto).
+    3.  **Data Confirmation (CRITICAL):**
+        * You MUST check the `OI_Regime_1h`.
+        * **P↑ O↑ (Price Up, OI Rising):** Healthy Trend. **CONFIRMS** `LIMIT_BUY` on pullbacks.
+        * **P↓ O↑ (Price Down, OI Rising):** Healthy Downtrend. **CONFIRMS** `LIMIT_SELL` on pullbacks.
+        * **P↑ O↓ (Price Up, OI Falling):** Short Squeeze. **VETO** all new `LIMIT_BUY` plans.
+        * **P↓ O↓ (Price Down, OI Falling):** Long Squeeze/Capitulation. **VETO** all new `LIMIT_SELL` plans.
 
-    7.  **Market Sentiment Filter (Fear & Greed Index):**
+    4.  **Smarter Stop-Loss:**
+        * Your `stop_loss_price` MUST be placed relative to volatility using the **ATR**.
+        * *Example (Long):* Place `stop_loss_price` at `[Confluence_Zone_Low] - (1.5 * 1h_atr_14)`.
+        * *Example (Short):* Place `stop_loss_price` at `[Confluence_Zone_High] + (1.5 * 1h_atr_14)`.
+        
+    5.  **Market Sentiment Filter (Fear & Greed Index):**
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter.
-        -   **Extreme Fear (Index < 25):** ...
-        -   **Fear (Index 25-45):** ...
-        -   **Neutral (Index 45-55):** ...
-        -   **Greed (Index 55-75):** ...
-        -   **Extreme Greed (Index > 75):** ...
-
-    **Multi-Timeframe Confirmation Requirement (CRITICAL):**
-    - You MUST analyze and confirm signals across available timeframes: **5min, 15min, 1hour, and 4hour**.
-    - **High-Confidence Signal Definition:** A signal is only high-confidence when it aligns with the **Market State** (see Rule 6), shows alignment across **at least 3** timeframes, and is confirmed by the **[ML Confirmation]** check.
-    - **Timeframe Hierarchy:** Use longer timeframes (**4h, 1h**) to determine the **Market State** and **Overall Trend**. Use shorter timeframes (**15min, 5min**) for precise entry timing.
-    -   **Signal Veto Rule (CRITICAL):**
-        -   Even if 4h/1h trend signals (e.g., ADX > 25) are strong, if the 15min timeframe shows a **strong opposing signal** (e.g., a bearish RSI divergence, a 15m MACD Dead Cross, or 15m EMA 20 has crossed below 50), you **MUST ABORT** the trade.
-        -   **Never** trade against 15m momentum when trying to enter on a pullback.
-
-    **Psychological Safeguards:**
-    - Confirmation Bias Protection: Seek counter-evidence.
-    - Overtrading Protection: No high-confidence signal = WAIT.
-    - Loss Aversion Protection: Stick to stop losses.
+        * **Extreme Fear (Index < 25):** ...
+        * **Fear (Index 25-45):** ...
+        * **Neutral (Index 45-55):** ...
+        * **Greed (Index 55-75):** ...
+        * **Extreme Greed (Index > 75):** ...
 
     **MANDATORY OUTPUT FORMAT:**
     Your entire response must be a single JSON object with two keys: "chain_of_thought" and "orders".
 
     1.  `"chain_of_thought"` (string): A multi-line string containing your detailed analysis in English. It MUST follow this template precisely:
         ```
-        My Current Assessment & Actions (Rule 6 - Limit Orders)
+        My Current Assessment & Actions (Rule 6 - Strategist)
 
         Market State Analysis:
         - 1h ADX: [Value] | 4h ADX: [Value]
-        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Applying Rule 6: Ranging (ADX<20) / Applying Rule 6: Chop Zone (ADX 20-25) / Applying Rule 6.4: Breakout-Retest]
-        - Key Support/Resistance Levels: [Identify major S/R levels, including BB_Upper/Lower and recent_high/low for relevant symbols]
-        - Market Sentiment: [MUST state the F&G Index value and its implication, e.g., "Extreme Greed (80)"]
+        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Ranging (ADX<20) / Chop (ADX 20-25)]
+        - Market Sentiment: [F&G Index value and its implication]
 
         Portfolio Overview:
-        Total Equity: $X, Available Cash: $Y, Current Margin Usage: Z%
-        Current Market Correlation Assessment: [Assess if positions are overly correlated based on Correlation Control (Rule 4) hard caps]
-
-        Let's break down each position:
-        (Note: Python-based Rule 8 trades are managed by Python and are NOT listed here.)
-
-        1. [SYMBOL] ([SIDE]):
-           UPL: [Current Unrealized PNL and Percent (e.g., +$50.00 (+2.1%))]
-           Peak_Profit_Achieved: [Historical high profit percent (e.g., +5.5%)]
-           Multi-Timeframe Analysis: [Brief assessment across 5m, 15min, 1h, 4h, mentioning ADX/BBands]
-           
-           Anomaly Check: [MUST check Anomaly_Score. If < -0.1, prioritize CLOSE.]
-           
-           Invalidation Check: [The `ai_suggested_stop_loss` is the invalidation. Python will close it if hit.]
-           
-           Losing Position Tighter Stop Check (Rule 2.5):
-           - [Is this position losing money (e.g., UPL < -0.5%)?]
-           - [AND is the market structure now strongly opposing the original thesis? (e.g., for a LONG, has the 15m EMA 20 crossed BELOW the 50? Or for a SHORT, has the 15m EMA 20 crossed ABOVE the 50?)]
-           - [IF YES: The original thesis is likely wrong, and the ATR stop-loss is too far. Decision: MUST issue a CLOSE order to cut losses early.]
-           
-           Reversal & Profit Save Check (With Memory):
-           - [Check 1: Is this position *currently* significantly profitable (e.g., UPL Percent > +1.5%)?]
-           - [Check 2: Has this position *previously* been significantly profitable (e.g., Peak_Profit_Achieved > 1.5%) AND has now pulled back significantly (e.g., UPL is < 80% of Peak_Profit)?]
-           - [IF (Check 1 OR Check 2 is True) AND (it is showing *strong* signs of reversal, e.g., 1h RSI divergence):]
-           - [Decision: MUST issue a CLOSE order to secure profits.]
-
-           Pyramiding Check (Adding to a Winner):
-           - [Is UPL Percent > +2.5% AND is the original trend (ADX > 25) still strong?]
-           - [AND has price pulled back to a key support (for Long) / resistance (for Short)?]
-           
-           - [CRITICAL STATE CHECK: You MUST check the 'Pending Limit Orders' list. If a pending order for this [SYMBOL] already exists, you MUST ABORT this check and NOT issue a new order.]
-           
-           - [IF YES (and no pending order): Consider a `LIMIT_BUY`/`LIMIT_SELL` (Limit) order. This new entry is treated as a separate trade and MUST follow the full Rule 4 (Sizing) / Rule 5 (SL/TP) logic.]
-           - [CRITICAL: You MUST NEVER add to a losing position (UPL < 0). Averaging down is forbidden.]
-           
-           SL/TP Target Update Check:
-           - [NOTE: Python handles 1R Breakeven and Graded Trailing automatically. Your task is to assess if the *Take Profit* target is still optimal.]
-           - [IF TP is NOT OPTIMAL: Issue UPDATE_TAKEPROFIT.]
-           
-           Decision: [Hold/Close/Partial Close/Add/Update TakeProfit + Reason. NOTE: Anomaly, Losing Position Check, and Reversal checks override all "Hold" decisions.]
-
-        ... [Repeat for each open position] ...
+        (Python handles all open positions. I am focused on new opportunities.)
 
         New Trade Opportunities Analysis (Rule 6 - Limit Orders Only):
-        Available Margin for New Trades: [Calculate based on Total Equity and risk rules]
-        Correlation Check: [Ensure new trades don't breach Rule 4 Correlation Control hard caps]
+        
+        [CRITICAL STATE CHECK (NO HEDGING): Before analyzing any new symbol, you MUST check the 'Open Positions' and 'Pending Limit Orders' lists. If a position or pending order for that [SYMBOL] already exists, you MUST SKIP analysis for that symbol.]
 
-        [CRITICAL STATE CHECK: Before analyzing any new symbol, you MUST check the 'Pending Limit Orders' list. If a pending order for a symbol already exists, you MUST SKIP analysis for that symbol to prevent duplicate orders.]
-        
-        [CRITICAL STATE CHECK (NO HEDGING): Before analyzing any new symbol, you MUST check the 'Open Positions (Live / Filled)' list. If a position for that [SYMBOL] already exists, you MUST SKIP analysis for that symbol. AI's role is to MANAGE existing positions (in the section above) or open new ones, NEVER to hold LONG and SHORT on the same symbol (No Hedging).]
-        
-        [Analyze opportunities based ONLY on Rule 6, ensuring they pass Rule 1.B (Trend Filter), Rule 1.5 (Anomaly), and Rule 6 (ML Confirmation)]
-        
         [EXAMPLE - RULE 6.1 (Trending Pullback):]
         ETH Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
-        - Anomaly Score: -0.05 (Safe)
-        - Trend Filter (Rule 1.B): PASS (Price > 4h EMA 50)
-        - 4h Trend: Bullish | 1h Momentum: Strong | 15min Setup: Price pulling back.
-        - Confluence Zone: Found at 3550 (4h BB_Mid) - 3555 (1h EMA 20).
-        - Timing: 15m RSI is 38 (Near reset level < 40).
-        - Data Check: OI_Change_5m_Pct = +0.012 (1.2%), Taker_Buy_Ratio_5m = 0.58.
+        - Thesis: Price is pulling back to a confluence support zone (4h BB_Mid + 1h EMA 20). 15m RSI is low (38), indicating a good entry point.
+        - Data Check: The `OI_Regime_1h` is "Rising", which confirms (P↑ O↑) that new money supports this uptrend.
         - ML Confirmation: ML_Proba_UP = 0.68.
-        - Confidence Score Calculation (Rule 6.5):
-          - Base: 60
-          - [+5] Multi-TF Align: Yes (4h/1h Bullish)
-          - [+5] Strong Level: Yes (4h BB_Mid + 1h EMA 20)
-          - [+5] Volume Confirm: N/A (Assume 1.0)
-          - [+5] ML Confirm: Yes (> 0.65)
-          - [+5] Data Confirm: Yes (OI > 1%, Taker > 0.55)
-          - [+5] R:R: Yes (Assume > 1:3)
-          - [+5] Timing: Yes (RSI < 40)
-          - Total: 95
-        - Final Confidence: High (95) - **PREPARE LIMIT_BUY at 3555 (Rule 6.1)**
+        - Final Confidence: High.
+        - Plan: PREPARE LIMIT_BUY.
 
-        [EXAMPLE - RULE 1.B (Trend Filter VETO):]
-        ETH Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
-        - Anomaly Score: -0.08 (Safe)
-        - Trend Filter (Rule 1.B): FAILED (Price 3850 < 4h EMA 50 3860)
-        - 4h Trend: N/A | 1h Setup: Price is *approaching* 1h BB_Lower.
-        - Confidence Score Calculation (Rule 6.5):
-          - Base: 60
-          - [VETO] Failed Rule 1.B
-          - Total: 0
-        - Final Confidence: VETO - **ABORT LIMIT_BUY due to Trend Filter**
+        [EXAMPLE - RULE 3 (OI VETO):]
+        SOL Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=30):
+        - Thesis: Price is breaking out, pulling back to new support.
+        - Data Check: The `OI_Regime_1h` is "Falling".
+        - Final Confidence: VETO. This is a P↑O↓ (Short Squeeze). It is too dangerous to open a new LONG.
+        - Plan: ABORT.
 
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
         ```
 
-    2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding all.
+    2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding.
 
-    **Order Object Rules:**
-    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Confidence: [Score]/100. Market State: [Trending Pullback or Ranging Support]"}}`
-    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "leverage": [CHOSEN_LEVERAGE], "risk_percent": [CHOSEN_RISK_PERCENT], "limit_price": [CALCULATED_PRICE], "take_profit": ..., "stop_loss": ..., "invalidation_condition": "Stop Loss hit (ATR-based)", "reasoning": "Limit Order (Rule 6). Confidence: [Score]/100. Market State: [Trending Pullback or Ranging Resistance]"}}`
-    -   **To Close Fully:** `{{"action": "CLOSE", "symbol": "...", "reasoning": "Invalidation met / SL hit / TP hit / Max Loss Cutoff / Manual decision..."}}`
-    -   **To Close Partially (Take Profit):** `{{"action": "PARTIAL_CLOSE", "symbol": "...", "size_percent": 0.5, "reasoning": "Taking 50% profit near resistance per Rule 5..."}}` (or `size_absolute`)
-    -   **To Update Stop Loss:** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": ..., "reasoning": "Actively moving SL to new 15m support level..."}}`
-    -   **To Update Take Profit:** `{{"action": "UPDATE_TAKEPROFIT", "symbol": "...", "new_take_profit": ..., "reasoning": "Actively moving TP to new 4h resistance level..."}}`
-    -   **To Hold:** Do NOT include in `orders`.
+    **Order Object Rules (NEW SIMPLIFIED FORMAT):**
+    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "thesis": "Rule 6.1 Pullback. Confidence: High. OI Rising.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "High"}}`
+    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "thesis": "Rule 6.2 Ranging. Confidence: Medium. ML Confirmed.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "Medium"}}`
     -   **Symbol Validity:** `symbol` MUST be one of {symbol_list}.
-
-    **Remember:** Quality over quantity.
     """
 
     def __init__(self, exchange):
@@ -308,11 +168,12 @@ class AlphaTrader:
         
         # 检查交易所能力
         self.has_oi_history = self.client.has.get('fetchOpenInterestHistory', False)
-        self.has_taker_ratio = self.client.has.get('fapiPublicGetTakerlongshortRatio', False)
+        # [V-Final 移除] Taker Ratio 不再使用
+        # self.has_taker_ratio = self.client.has.get('fapiPublicGetTakerlongshortRatio', False)
         if not self.has_oi_history:
              self.logger.warning("Exchange does not support 'fetchOpenInterestHistory'. OI data will be unavailable.")
-        if not self.has_taker_ratio:
-             self.logger.warning("Exchange does not support 'fapiPublicGetTakerlongshortRatio'. Taker Ratio data will be unavailable.")
+        # if not self.has_taker_ratio:
+        #      self.logger.warning("Exchange does not support 'fapiPublicGetTakerlongshortRatio'. Taker Ratio data will be unavailable.")
 
         self.ml_feature_names = [
             '5min_rsi_14', '5min_adx_14', '5min_volume_ratio', '5min_price_change_pct',
@@ -358,7 +219,6 @@ class AlphaTrader:
                 self.logger.error(f"加载 {symbol} 的 Anomaly Detector 模型时出错: {e}", exc_info=True)
         self.logger.info(f"--- 总共加载了 {len(self.ml_anomaly_detectors)} 个 Anomaly ML 模型 ---")
         
-        # [修改] 移除 tp_counters，因为分级止盈不再需要它
         self.peak_profit_tracker: Dict[str, float] = {}
 
 
@@ -383,7 +243,7 @@ class AlphaTrader:
 
     
     async def _gather_all_market_data(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-        self.logger.debug("Gathering multi-TF market data (5m, 15m, 1h, 4h) + Indicators + OI/Taker...")
+        self.logger.debug("Gathering multi-TF market data (5m, 15m, 1h, 4h) + Indicators + OI Regime...")
         market_indicators_data: Dict[str, Dict[str, Any]] = {}
         fetched_tickers: Dict[str, Any] = {}
         
@@ -410,8 +270,8 @@ class AlphaTrader:
             if not self.has_oi_history: return None
             async with semaphore:
                 try:
-                    # 获取最近2个周期的 5m OI
-                    return await self.exchange.fetch_open_interest_history(symbol, timeframe='5m', limit=2)
+                    # [V-Final 修改] 获取最近 50 根 1h OI
+                    return await self.exchange.fetch_open_interest_history(symbol, timeframe='1h', limit=50)
                 except Exception as e:
                     self.logger.error(f"Safe Fetch OI History Error ({symbol}): {e}", exc_info=False)
                     return e
@@ -425,21 +285,20 @@ class AlphaTrader:
                     limit = 150 if timeframe == '15m' else 100
                     tasks.append(_safe_fetch_ohlcv(symbol, timeframe, limit=limit))
                 tasks.append(_safe_fetch_ticker(symbol))
-                # [集成] 添加新数据任务
+                # [V-Final 修改] 添加 OI 任务
                 tasks.append(_safe_fetch_oi_history(symbol))
-               # tasks.append(_safe_fetch_taker_ratio(symbol))
+               # [V-Final 移除] Taker Ratio 任务
                 
             results = await asyncio.gather(*tasks)
             
             total_timeframes = len(timeframes)
-            tasks_per_symbol = total_timeframes + 1 + 1 # 2 个新任务
+            tasks_per_symbol = total_timeframes + 1 + 1 # 1 个新任务 (OI)
             
             for i, symbol in enumerate(self.symbols):
                 start_index = i * tasks_per_symbol
                 symbol_ohlcv_results = results[start_index : start_index + total_timeframes]
                 ticker_result = results[start_index + total_timeframes]
                 oi_history_result = results[start_index + total_timeframes + 1]
-              #  taker_ratio_result = results[start_index + total_timeframes + 2]
 
                 if not isinstance(ticker_result, Exception) and ticker_result and ticker_result.get('last') is not None:
                     fetched_tickers[symbol] = ticker_result; market_indicators_data[symbol] = {'current_price': ticker_result.get('last')}
@@ -447,16 +306,29 @@ class AlphaTrader:
                     market_indicators_data[symbol] = {'current_price': None}
                     self.logger.warning(f"Failed fetch ticker/price for {symbol} (Result: {ticker_result})")
                 
-                # [集成] 处理 OI 数据
-                market_indicators_data[symbol]['oi_change_5m_pct'] = 0.0
-                if isinstance(oi_history_result, list) and len(oi_history_result) == 2:
+                # [V-Final 修改] 处理 1h OI Regime
+                market_indicators_data[symbol]['oi_regime_1h'] = "Neutral" # 默认值
+                if isinstance(oi_history_result, list) and len(oi_history_result) >= 21: # 需要足够数据来计算 20-EMA
                     try:
-                        oi_curr = float(oi_history_result[1]['openInterestValue']) # 最新
-                        oi_prev = float(oi_history_result[0]['openInterestValue']) # 之前
-                        if oi_prev > 0:
-                            market_indicators_data[symbol]['oi_change_5m_pct'] = (oi_curr - oi_prev) / oi_prev
+                        # 转换数据
+                        oi_values = [float(item['openInterestValue']) for item in oi_history_result]
+                        oi_df = pd.DataFrame({'oi': oi_values})
+                        
+                        # 计算 20-EMA
+                        oi_ema_20 = ta.ema(oi_df['oi'], 20)
+                        
+                        if oi_ema_20 is not None and not oi_ema_20.empty:
+                            current_oi = oi_df['oi'].iloc[-1]
+                            current_oi_ema = oi_ema_20.iloc[-1]
+                            
+                            # 比较当前 OI 和 EMA
+                            if current_oi > current_oi_ema:
+                                market_indicators_data[symbol]['oi_regime_1h'] = "Rising"
+                            elif current_oi < current_oi_ema:
+                                market_indicators_data[symbol]['oi_regime_1h'] = "Falling"
                     except Exception as e_oi:
-                        self.logger.warning(f"Error processing OI data for {symbol}: {e_oi}")
+                        self.logger.warning(f"Error processing 1h OI Regime for {symbol}: {e_oi}")
+                # [V-Final 修改结束]
 
 
                 for j, timeframe in enumerate(timeframes):
@@ -625,8 +497,8 @@ class AlphaTrader:
             prompt += f"ML_Proba_UP (15m): {safe_format(d.get('ml_proba_up'), 2)}\n"
             prompt += f"ML_Proba_DOWN (15m): {safe_format(d.get('ml_proba_down'), 2)}\n"
             
-            # [集成] 添加新数据
-            prompt += f"OI_Change_5m_Pct: {safe_format(d.get('oi_change_5m_pct'), 2, is_pct=True)}\n"
+            # [V-Final 修改] 提供 1h OI Regime
+            prompt += f"OI_Regime_1h: {d.get('oi_regime_1h', 'N/A')}\n"
 
             prompt += f"Peak_Profit_Achieved: {safe_format(d.get('peak_profit_achieved_percent'), 1)}%\n"
             
@@ -666,239 +538,176 @@ class AlphaTrader:
         if not self.ai_analyzer: return {}
         return await self.ai_analyzer.get_ai_response(system_prompt, user_prompt)
 
+    # [V-Final 新增] _execute_decisions 的辅助验证函数
+    def _validate_ai_trade(self, order: Dict, market_data: Dict[str, Dict[str, Any]]) -> Tuple[bool, str]:
+        """
+        [V2 核心] Python 执行者：验证 AI 策略的硬规则。
+        """
+        symbol = order.get('symbol')
+        action = order.get('action')
+        limit_price = order.get('entry_price')
+        stop_loss_price = order.get('stop_loss_price')
+        take_profit_price = order.get('take_profit_price')
+        
+        data = market_data.get(symbol)
+        if not data:
+            return False, "Market data unavailable"
+
+        current_price = data.get('current_price')
+        anomaly_score = data.get('anomaly_score', 0.0)
+        ema_50_4h = data.get('4hour_ema_50')
+        oi_regime = data.get('oi_regime_1h')
+        
+        if not all([current_price, ema_50_4h, oi_regime, limit_price, stop_loss_price, take_profit_price]):
+            return False, f"Missing critical data (Price, EMA, OI, or Order Prices)"
+
+        # 1. [VETO] Anomaly Check (Rule 1.5)
+        if anomaly_score < -0.1:
+            return False, f"Anomaly Veto (Score: {anomaly_score:.3f})"
+
+        # 2. [VETO] Trend Filter Check (Rule 1.B)
+        if action == "LIMIT_BUY" and current_price < ema_50_4h:
+            return False, f"Trend Filter Veto (Price {current_price} < 4h EMA {ema_50_4h})"
+        if action == "LIMIT_SELL" and current_price > ema_50_4h:
+            return False, f"Trend Filter Veto (Price {current_price} > 4h EMA {ema_50_4h})"
+            
+        # 3. [VETO] OI Matrix Check (Rule 3)
+        # P↑O↓ (轧空)
+        if action == "LIMIT_BUY" and current_price > ema_50_4h and oi_regime == "Falling":
+             return False, f"OI Matrix Veto (P↑O↓ - Short Squeeze)"
+        # P↓O↓ (多杀多)
+        if action == "LIMIT_SELL" and current_price < ema_50_4h and oi_regime == "Falling":
+             return False, f"OI Matrix Veto (P↓O↓ - Long Squeeze)"
+
+        # 4. [VETO] R:R Check
+        try:
+            if action == "LIMIT_BUY":
+                risk = limit_price - stop_loss_price
+                reward = take_profit_price - limit_price
+            else: # LIMIT_SELL
+                risk = stop_loss_price - limit_price
+                reward = limit_price - take_profit_price
+            
+            if risk <= 1e-9:
+                return False, "Risk is zero or negative (SL too close)"
+            
+            rr = reward / risk
+            MIN_RR = 1.5
+            if rr < MIN_RR:
+                return False, f"R:R Veto (RR: {rr:.2f} < {MIN_RR})"
+        except Exception as e_rr:
+            return False, f"R:R Calc Error: {e_rr}"
+
+        return True, "Validation Passed"
+
+    # [V-Final 重写] _execute_decisions
     async def _execute_decisions(self, decisions: list, market_data: Dict[str, Dict[str, Any]]):
+        """
+        [V2 核心] Python 执行者：
+        1. 验证 AI 策略 (Veto 规则)
+        2. 计算 Risk/Leverage
+        3. 计算 Size
+        4. 执行 (调用 portfolio)
+        """
         MIN_MARGIN_USDT = futures_settings.MIN_NOMINAL_VALUE_USDT
         MIN_SIZE_BTC = 0.001 
 
         for order in decisions:
             try:
-                action = order.get('action'); symbol = order.get('symbol')
-                if not action or not symbol or symbol not in self.symbols: 
-                    self.logger.warning(f"跳过无效指令: {order}"); continue
+                action = order.get('action')
+                symbol = order.get('symbol')
                 
-                reason = order.get('reasoning', 'N/A')
+                # [V-Final 修改] 只处理 AI 的新 'LIMIT' action
+                if action not in ["LIMIT_BUY", "LIMIT_SELL"]:
+                    self.logger.warning(f"跳过 AI 未知指令: {action}"); continue
+                if not symbol or symbol not in self.symbols: 
+                    self.logger.warning(f"跳过无效或不支持的 symbol: {symbol}"); continue
+
+                # 1. 验证 AI 策略 (Veto 规则)
+                is_valid, reason = self._validate_ai_trade(order, market_data)
+                if not is_valid:
+                    self.logger.warning(f"!!! AI 策略 VETO !!! {symbol} | Action: {action} | 原因: {reason}")
+                    continue
                 
-                current_price = market_data.get(symbol, {}).get('current_price')
-                limit_price_from_ai = order.get('limit_price')
+                self.logger.info(f"AI 策略 (Python 验证通过): {symbol} | Action: {action} | 原因: {reason}")
+
+                # 2. 计算 Risk/Leverage/Size (如果验证通过)
                 
-                if action == "CLOSE":
-                    if (not current_price or current_price <= 0) and not self.is_live_trading:
-                        self.logger.error(f"模拟盘平仓失败: 无当前价格 {symbol}"); continue
-                    if self.is_live_trading: await self.portfolio.live_close(symbol, reason=reason)
-                    else: await self.portfolio.paper_close(symbol, current_price, reason=reason)
+                # AI 提供的策略参数
+                limit_price = float(order.get('entry_price'))
+                stop_loss = float(order.get('stop_loss_price'))
+                take_profit = float(order.get('take_profit_price'))
+                confidence = order.get('confidence_level', 'Medium')
+                ai_thesis = order.get('thesis', 'N/A')
                 
-                elif action in ["BUY", "SELL"]:
-                    if not self.is_live_trading:
-                        self.logger.warning(f"模拟盘：跳过 {action} 市价单 (模拟盘仅支持限价单转换)。"); continue
+                # a. 确定 Risk Percent
+                risk_percent = 0.015 # 默认 Medium
+                if confidence == "High":
+                    risk_percent = 0.025 # High
+                
+                # b. 确定 Leverage
+                # (使用配置中的固定杠杆，因为 AI 不再决定这个)
+                leverage = int(futures_settings.FUTURES_LEVERAGE) 
+                
+                # c. 检查是否为模拟盘
+                if not self.is_live_trading:
+                    self.logger.warning(f"模拟盘：跳过 {action} 执行 (逻辑已验证)。"); continue
+                
+                # d. [复用逻辑] 计算保证金和规模
+                # (此逻辑复用自你 V1 的 _execute_decisions)
+                
+                try:
+                    total_equity = float(self.portfolio.equity)
+                    available_cash = float(self.portfolio.cash)
+                    if total_equity <= 0: raise ValueError(f"无效账户状态 (Equity <= 0)")
                     
-                    if (not current_price or current_price <= 0):
-                        self.logger.error(f"无当前价格 {symbol}，跳过 Market Action: {order}"); continue
-                        
-                    side = 'long' if action == 'BUY' else 'short'; final_size = 0.0
-                    price_to_calc = current_price
-
-                    try:
-                        leverage = int(order.get('leverage'))
-                        risk_percent = float(order.get('risk_percent'))
-                        stop_loss = float(order.get('stop_loss'))
-                        take_profit = order.get('take_profit')
-                        
-                        if risk_percent <= 0 or risk_percent > 0.5: raise ValueError(f"无效的 risk_percent: {risk_percent}")
-                        if leverage <= 0 or leverage > 100: raise ValueError(f"无效的 leverage: {leverage}")
-                        
-                        total_equity = float(self.portfolio.equity)
-                        available_cash = float(self.portfolio.cash)
-                        if total_equity <= 0: raise ValueError(f"无效账户状态 (Equity <= 0)")
-                        
-                        calculated_desired_margin = total_equity * risk_percent
-                        
-                        max_margin_cap = total_equity * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
-                        if calculated_desired_margin > max_margin_cap:
-                            self.logger.warning(f"!!! {action} Margin Capped !!! AI 期望保证金 {calculated_desired_margin:.2f} > 最大 {max_margin_cap:.2f} ({futures_settings.MAX_MARGIN_PER_TRADE_RATIO*100}%)")
-                            calculated_desired_margin = max_margin_cap
-                        
-                        if calculated_desired_margin > available_cash:
-                            self.logger.error(f"!!! {action} Aborted (Cash Insufficient) !!! AI 期望保证金 {calculated_desired_margin:.2f} > 可用 {available_cash:.2f}")
-                            continue
-                        
-                        if calculated_desired_margin < MIN_MARGIN_USDT:
-                            self.logger.warning(f"!!! {action} Margin Adjusted !!! AI 期望保证金 {calculated_desired_margin:.2f} < 最小 {MIN_MARGIN_USDT} USDT. 正在上调。")
-                            final_desired_margin = MIN_MARGIN_USDT
-                        else:
-                            final_desired_margin = calculated_desired_margin
-                        
-                        final_size = (final_desired_margin * leverage) / price_to_calc
-
-                        if symbol == "BTC/USDT:USDT":
-                            if final_size < MIN_SIZE_BTC:
-                                self.logger.warning(f"!!! {action} BTC Size Adjusted !!! 计算后 size {final_size} < 最小 {MIN_SIZE_BTC}. 正在上调。")
-                                final_size = MIN_SIZE_BTC
-                                recalculated_margin = (final_size * price_to_calc) / leverage
-                                if recalculated_margin > available_cash:
-                                    self.logger.error(f"!!! {action} Aborted (Cash Insufficient for Min BTC Size) !!! 最小 BTC size 需要 {recalculated_margin:.2f} 保证金 > 可用 {available_cash:.2f}")
-                                    continue
-                        
-                        if final_size <= 0: raise ValueError("最终计算 size 为 0")
-
-                        invalidation_condition = order.get('invalidation_condition')
-                        await self.portfolio.live_open(
-                            symbol, 
-                            side, 
-                            final_size, 
-                            leverage, 
-                            reason=reason, 
-                            stop_loss=stop_loss, 
-                            take_profit=take_profit, 
-                            invalidation_condition=invalidation_condition
-                        )
-                    except (ValueError, TypeError, KeyError) as e: 
-                        self.logger.error(f"跳过 {action} (Python 计算/参数错误): {order}. Err: {e}"); continue
-
-                elif action in ["LIMIT_BUY", "LIMIT_SELL"]:
-                    if not limit_price_from_ai or float(limit_price_from_ai) <= 0:
-                        self.logger.error(f"无效限价 {limit_price_from_ai} {symbol}，跳过 Limit Action: {order}"); continue
+                    calculated_desired_margin = total_equity * risk_percent
                     
-                    if not self.is_live_trading:
-                        try:
-                            price_to_calc = float(limit_price_from_ai)
-                            if (action == 'LIMIT_BUY' and current_price <= price_to_calc) or (action == 'LIMIT_SELL' and current_price >= price_to_calc):
-                                self.logger.warning(f"模拟盘：价格 {current_price} 有利，转为市价单。")
-                                leverage = int(order.get('leverage'))
-                                risk_percent = float(order.get('risk_percent'))
-                                stop_loss = float(order.get('stop_loss'))
-                                take_profit = float(order.get('take_profit'))
-                                invalidation_condition = order.get('invalidation_condition')
-                                
-                                total_equity = float(self.portfolio.equity)
-                                calculated_desired_margin = total_equity * risk_percent
-                                final_margin = max(calculated_desired_margin, MIN_MARGIN_USDT)
-                                final_size = (final_margin * leverage) / current_price
-                                if symbol == "BTC/USDT:USDT" and final_size < MIN_SIZE_BTC:
-                                    final_size = MIN_SIZE_BTC
+                    max_margin_cap = total_equity * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
+                    if calculated_desired_margin > max_margin_cap:
+                        self.logger.warning(f"!!! {action} Margin Capped !!! AI 期望保证金 {calculated_desired_margin:.2f} > 最大 {max_margin_cap:.2f}")
+                        calculated_desired_margin = max_margin_cap
 
-                                await self.portfolio.paper_open(symbol, 'long' if action == 'LIMIT_BUY' else 'short', final_size, price=current_price, leverage=leverage, reason=reason, stop_loss=stop_loss, take_profit=take_profit, invalidation_condition=invalidation_condition)
-                            else:
-                                self.logger.info(f"模拟盘：价格 {current_price} 不利 (vs {price_to_calc})，跳过限价单。")
-                        except Exception as e_paper:
-                             self.logger.error(f"模拟盘限价单转换失败: {e_paper}, Order: {order}"); continue
-                        continue 
+                    if calculated_desired_margin > available_cash:
+                        self.logger.error(f"!!! {action} Aborted (Cash Insufficient) !!! AI 期望保证金 {calculated_desired_margin:.2f} > 可用 {available_cash:.2f}")
+                        continue
+                    
+                    if calculated_desired_margin < MIN_MARGIN_USDT:
+                        self.logger.warning(f"!!! {action} Margin Adjusted !!! AI 期望保证金 {calculated_desired_margin:.2f} < 最小 {MIN_MARGIN_USDT} USDT. 正在上调。")
+                        final_desired_margin = MIN_MARGIN_USDT
+                    else:
+                        final_desired_margin = calculated_desired_margin
+                    
+                    final_size = (final_desired_margin * leverage) / limit_price
 
-                    if self.is_live_trading:
-                        side = 'long' if action == 'LIMIT_BUY' else 'short'; final_size = 0.0
-                        
-                        try:
-                            leverage = int(order.get('leverage'))
-                            risk_percent = float(order.get('risk_percent'))
-                            limit_price = float(limit_price_from_ai)
-                            stop_loss = float(order.get('stop_loss'))
-                            take_profit = float(order.get('take_profit'))
-                            
-                            if risk_percent <= 0 or risk_percent > 0.5: raise ValueError(f"无效的 risk_percent: {risk_percent}")
-                            if leverage <= 0 or leverage > 100: raise ValueError(f"无效的 leverage: {leverage}")
-                            if limit_price <= 0: raise ValueError(f"无效的 limit_price: {limit_price}")
-
-                            total_equity = float(self.portfolio.equity)
-                            available_cash = float(self.portfolio.cash)
-                            if total_equity <= 0: raise ValueError(f"无效账户状态 (Equity <= 0)")
-                            
-                            calculated_desired_margin = total_equity * risk_percent
-                            
-                            max_margin_cap = total_equity * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
-                            if calculated_desired_margin > max_margin_cap:
-                                self.logger.warning(f"!!! {action} Margin Capped !!! AI 期望保证金 {calculated_desired_margin:.2f} > 最大 {max_margin_cap:.2f} ({futures_settings.MAX_MARGIN_PER_TRADE_RATIO*100}%)")
-                                calculated_desired_margin = max_margin_cap
-
-                            if calculated_desired_margin > available_cash:
-                                self.logger.error(f"!!! {action} Aborted (Cash Insufficient) !!! AI 期望保证金 {calculated_desired_margin:.2f} > 可用 {available_cash:.2f}")
+                    if symbol == "BTC/USDT:USDT":
+                        if final_size < MIN_SIZE_BTC:
+                            self.logger.warning(f"!!! {action} BTC Size Adjusted !!! 计算后 size {final_size} < 最小 {MIN_SIZE_BTC}. 正在上调。")
+                            final_size = MIN_SIZE_BTC
+                            recalculated_margin = (final_size * limit_price) / leverage
+                            if recalculated_margin > available_cash:
+                                self.logger.error(f"!!! {action} Aborted (Cash Insufficient for Min BTC Size) !!! 最小 BTC size 需要 {recalculated_margin:.2f} 保证金 > 可用 {available_cash:.2f}")
                                 continue
-                            
-                            if calculated_desired_margin < MIN_MARGIN_USDT:
-                                self.logger.warning(f"!!! {action} Margin Adjusted !!! AI 期望保证金 {calculated_desired_margin:.2f} < 最小 {MIN_MARGIN_USDT} USDT. 正在上调。")
-                                final_desired_margin = MIN_MARGIN_USDT
-                            else:
-                                final_desired_margin = calculated_desired_margin
-                            
-                            final_size = (final_desired_margin * leverage) / limit_price
+                    
+                    if final_size <= 0: raise ValueError("最终计算 size 为 0")
 
-                            if symbol == "BTC/USDT:USDT":
-                                if final_size < MIN_SIZE_BTC:
-                                    self.logger.warning(f"!!! {action} BTC Size Adjusted !!! 计算后 size {final_size} < 最小 {MIN_SIZE_BTC}. 正在上调。")
-                                    final_size = MIN_SIZE_BTC
-                                    recalculated_margin = (final_size * limit_price) / leverage
-                                    if recalculated_margin > available_cash:
-                                        self.logger.error(f"!!! {action} Aborted (Cash Insufficient for Min BTC Size) !!! 最小 BTC size 需要 {recalculated_margin:.2f} 保证金 > 可用 {available_cash:.2f}")
-                                        continue
-                            
-                            if final_size <= 0: raise ValueError("最终计算 size 为 0")
-
-                        except (ValueError, TypeError, KeyError) as e: 
-                            self.logger.error(f"跳过 {action} (Python 计算/参数错误): {order}. Err: {e}"); continue
-                        
-                        invalidation_condition = order.get('invalidation_condition')
-                        if hasattr(self.portfolio, 'live_open_limit'): 
-                            await self.portfolio.live_open_limit(
-                                symbol, 
-                                side, 
-                                final_size, 
-                                leverage, 
-                                limit_price,
-                                reason=reason, 
-                                stop_loss=stop_loss, 
-                                take_profit=take_profit, 
-                                invalidation_condition=invalidation_condition
-                            )
-                        else:
-                             self.logger.error(f"AI 请求 LIMIT_BUY/SELL 但 portfolio 不支持 live_open_limit！")
+                except (ValueError, TypeError, KeyError) as e: 
+                    self.logger.error(f"跳过 {action} (Python 计算/参数错误): {order}. Err: {e}"); continue
                 
-                elif action == "PARTIAL_CLOSE":
-                    if (not current_price or current_price <= 0) and not self.is_live_trading:
-                        self.logger.error(f"模拟盘部分平仓失败: 无当前价格 {symbol}"); continue
-                    size_to_close_percent=None; size_to_close_absolute=None
-                    try:
-                        sp=order.get('size_percent'); sa=order.get('size_absolute')
-                        if sp is not None: size_to_close_percent=float(sp)
-                        elif sa is not None: size_to_close_absolute=float(sa)
-                        else: raise ValueError("需提供 size_% 或 size_abs")
-                        if size_to_close_percent is not None and not (0<size_to_close_percent<1.01):
-                            if abs(size_to_close_percent) < 1e-9: raise ValueError("size_% 必须 > 0")
-                        if size_to_close_absolute is not None and size_to_close_absolute<=0: raise ValueError("size_abs 需 > 0")
-                    except (ValueError,TypeError,KeyError) as e: self.logger.error(f"跳过PARTIAL_CLOSE参数错误: {order}. Err: {e}"); continue
-                    
-                    if self.is_live_trading: await self.portfolio.live_partial_close(symbol, size_percent=size_to_close_percent, size_absolute=size_to_close_absolute, reason=reason)
-                    else: await self.portfolio.paper_partial_close(symbol, current_price, size_percent=size_to_close_percent, size_absolute=size_to_close_absolute, reason=reason)
+                # 4. 执行 (调用 portfolio)
+                # (alpha_portfolio.py 提供了这个强大的函数)
+                await self.portfolio.live_open_limit(
+                    symbol, 
+                    'long' if action == 'LIMIT_BUY' else 'short', 
+                    final_size, 
+                    leverage, 
+                    limit_price,
+                    reason=ai_thesis, 
+                    stop_loss=stop_loss, 
+                    take_profit=take_profit, 
+                    invalidation_condition=f"AI V2 ({confidence})" # 使用 Invalidation 字段记录信心
+                )
 
-                elif action == "UPDATE_STOPLOSS":
-                    new_stop_loss = 0.0
-                    try:
-                        nsl=order.get('new_stop_loss');
-                        if nsl is None: raise ValueError("缺少 new_stop_loss")
-                        new_stop_loss=float(nsl)
-                        if new_stop_loss<=0: raise ValueError("无效止损价")
-                    except (ValueError,TypeError,KeyError) as e: self.logger.error(f"跳过UPDATE_STOPLOSS参数错误: {order}. Err: {e}"); continue
-                    
-                    self.logger.warning(f"AI 请求更新止损 {symbol}: {new_stop_loss:.4f}. 原因: {reason}")
-                    if hasattr(self.portfolio, 'update_position_rules'): 
-                        await self.portfolio.update_position_rules(symbol, stop_loss=new_stop_loss, reason=reason)
-                    else: 
-                        self.logger.error(f"AI 尝试 UPDATE_STOPLOSS 但 portfolio 无 update_position_rules 方法。")
-                
-                elif action == "UPDATE_TAKEPROFIT":
-                    new_take_profit = 0.0
-                    try:
-                        ntp=order.get('new_take_profit');
-                        if ntp is None: raise ValueError("缺少 new_take_profit")
-                        new_take_profit=float(ntp)
-                        if new_take_profit<=0: raise ValueError("无效止盈价")
-                    except (ValueError,TypeError,KeyError) as e: self.logger.error(f"跳过UPDATE_TAKEPROFIT参数错误: {order}. Err: {e}"); continue
-                    
-                    self.logger.warning(f"AI 请求更新止Ying {symbol}: {new_take_profit:.4f}. 原因: {reason}")
-                    if hasattr(self.portfolio, 'update_position_rules'): 
-                        await self.portfolio.update_position_rules(symbol, take_profit=new_take_profit, reason=reason)
-                    else: 
-                        self.logger.error(f"AI 尝试 UPDATE_TAKEPROFIT 但 portfolio 无 update_position_rules 方法。")
-
-                else: 
-                    self.logger.warning(f"收到未知 AI 指令 action: {action} in {order}")
             except Exception as e: 
                 self.logger.error(f"处理 AI 指令时意外错误: {order}. Err: {e}", exc_info=True)
 
@@ -925,184 +734,9 @@ class AlphaTrader:
         return len(to_close) > 0
 
     
-    async def _check_python_rule_8(self, market_data: Dict[str, Dict[str, Any]]) -> list:
-        if not settings.ENABLE_BREAKOUT_MODIFIER:
-            return []
-            
-        orders_to_execute = []
-        
-        open_positions = self.portfolio.position_manager.get_all_open_positions()
-        pending_limits = self.portfolio.pending_limit_orders
+    # [V-Final 移除] _check_python_rule_8
 
-        R8_ADX_MAX = 25.0
-        R8_VOL_RATIO_5M = 2.5
-        R8_VOL_RATIO_15M = 2.0
-        ML_CONFIDENCE_THRESHOLD = 0.65
-        # [集成] Rule 8 确认 OI 和 Taker
-        OI_CHANGE_THRESHOLD = 0.01 # 1% OI 增长
-        TAKER_BUY_RATIO_LONG_THRESHOLD = 0.55 # 55% 买方
-        TAKER_BUY_RATIO_SHORT_THRESHOLD = 0.45 # 45% 买方 (即 55% 卖方)
-        
-        leverage = futures_settings.FUTURES_LEVERAGE
-        risk_percent = futures_settings.FUTURES_RISK_PER_TRADE_PERCENT / 100.0
-
-        for symbol in self.symbols:
-            if symbol in open_positions:
-                continue
-            
-            if symbol in pending_limits:
-                continue
-
-            data = market_data.get(symbol)
-            if not data: continue
-
-            try:
-                price = data.get('current_price')
-                adx_1h = data.get('1hour_adx_14')
-                
-                close_prev = data.get('15min_close_prev')
-                bb_upper_prev = data.get('15min_bb_upper_prev')
-                bb_lower_prev = data.get('15min_bb_lower_prev')
-
-                ohlcv_15m = data.get('ohlcv_15m')
-                vol_ratio_5m = data.get('5min_volume_ratio')
-                vol_ratio_15m = data.get('15min_volume_ratio')
-                ema_50_4h = data.get('4hour_ema_50')
-                
-                # [集成] 获取新数据
-                oi_change_pct = data.get('oi_change_5m_pct')
-                taker_buy_ratio = data.get('taker_buy_ratio_5m')
-                
-                if not all([price, adx_1h, close_prev, bb_upper_prev, bb_lower_prev, vol_ratio_5m, vol_ratio_15m, ema_50_4h, ohlcv_15m, oi_change_pct is not None, taker_buy_ratio is not None]):
-                    self.logger.debug(f"Rule 8 Skipping {symbol}: Missing key data (incl. _prev, ohlcv, oi, or taker).")
-                    continue
-
-                ml_proba_up = 0.5 
-                ml_proba_down = 0.5
-                ml_called = False
-
-                if not (adx_1h < R8_ADX_MAX):
-                    continue 
-
-                volume_confirmed = (vol_ratio_5m > R8_VOL_RATIO_5M) or (vol_ratio_15m > R8_VOL_RATIO_15M)
-                if not volume_confirmed:
-                    continue 
-
-                fng_value = self.fng_data.get('value', 50)
-                
-                action = None
-                
-                if close_prev > bb_upper_prev:
-                    
-                    if price < ema_50_4h: continue
-                    if fng_value > 75: continue
-                    
-                    # [集成] 检查 OI 和 Taker
-                    if oi_change_pct < OI_CHANGE_THRESHOLD:
-                        self.logger.debug(f"Rule 8 (Py) BUY Veto (OI): {symbol} OI Change {oi_change_pct:+.2%} < {OI_CHANGE_THRESHOLD:+.2%}")
-                        continue
-
-                    # [V-FIX] 仅当交易所支持时才检查 Taker Ratio
-                    if self.has_taker_ratio and taker_buy_ratio < TAKER_BUY_RATIO_LONG_THRESHOLD:
-                        self.logger.debug(f"Rule 8 (Py) BUY Veto (Taker): {symbol} Taker Ratio {taker_buy_ratio:.2f} < {TAKER_BUY_RATIO_LONG_THRESHOLD:.2f}")
-                        continue
-                    has_divergence, div_reason = await self._check_divergence(ohlcv_15m)
-                    if has_divergence and "Bearish" in div_reason:
-                        self.logger.warning(f"Rule 8 (Py) BUY Veto (Divergence): {symbol} {div_reason}")
-                        continue
-
-                    if not ml_called:
-                        ml_pred = await self._get_ml_prediction(symbol, market_data)
-                        ml_proba_up = ml_pred['proba_up']
-                        ml_proba_down = ml_pred['proba_down']
-                        ml_called = True
-                    
-                    if ml_proba_up < ML_CONFIDENCE_THRESHOLD:
-                        self.logger.debug(f"Rule 8 (Py) BUY Veto (ML Confidence): {symbol} Prob={ml_proba_up:.2f}")
-                        continue
-                        
-                    action = "BUY"
-
-                elif close_prev < bb_lower_prev:
-                    
-                    if price > ema_50_4h: continue
-                    if fng_value < 25: continue
-                    
-                    # [集成] 检查 OI 和 Taker
-                    if oi_change_pct < OI_CHANGE_THRESHOLD: # OI 增加通常确认下跌
-                        self.logger.debug(f"Rule 8 (Py) SELL Veto (OI): {symbol} OI Change {oi_change_pct:+.2%} < {OI_CHANGE_THRESHOLD:+.2%}")
-                        continue
-
-                    # [V-FIX] 仅当交易所支持时才检查 Taker Ratio
-                    if self.has_taker_ratio and taker_buy_ratio > TAKER_BUY_RATIO_SHORT_THRESHOLD:
-                        self.logger.debug(f"Rule 8 (Py) SELL Veto (Taker): {symbol} Taker Ratio {taker_buy_ratio:.2f} > {TAKER_BUY_RATIO_SHORT_THRESHOLD:.2f}")
-                        continue
-
-                    has_divergence, div_reason = await self._check_divergence(ohlcv_15m)
-                    if has_divergence and "Bullish" in div_reason:
-                        self.logger.warning(f"Rule 8 (Py) SELL Veto (Divergence): {symbol} {div_reason}")
-                        continue
-
-                    if not ml_called:
-                        ml_pred = await self._get_ml_prediction(symbol, market_data)
-                        ml_proba_up = ml_pred['proba_up']
-                        ml_proba_down = ml_pred['proba_down']
-                        ml_called = True
-
-                    if ml_proba_down < ML_CONFIDENCE_THRESHOLD:
-                        self.logger.debug(f"Rule 8 (Py) SELL Veto (ML Confidence): {symbol} Prob={ml_proba_down:.2f}")
-                        continue
-
-                    action = "SELL"
-
-                if action:
-                    self.logger.warning(f"🔥 RULE 8 (Python + K-Line Confirm): {action} Signal for {symbol} (Prob Up: {ml_proba_up:.2f}, Down: {ml_proba_down:.2f})")
-                    order = self._build_python_order(
-                        symbol, 
-                        action, 
-                        risk_percent, 
-                        leverage, 
-                        price, 
-                        market_data.get(symbol, {})
-                    )
-                    if order:
-                        orders_to_execute.append(order)
-
-            except Exception as e:
-                self.logger.error(f"Rule 8 (Python) check failed for {symbol}: {e}")
-                
-        return orders_to_execute
-
-    def _build_python_order(self, symbol: str, action: str, risk: float, lev: int, price: float, symbol_data: Dict) -> Optional[Dict]:
-        stop_loss = 0.0
-        
-        if futures_settings.USE_ATR_FOR_INITIAL_STOP:
-            atr_1h = symbol_data.get('1hour_atr_14')
-            if not atr_1h or atr_1h <= 0:
-                self.logger.warning(f"Rule 8: Missing 1h ATR for {symbol}. Using 2% static SL.")
-                sl_pct = 0.02
-                stop_loss = price * (1 - sl_pct) if action == "BUY" else price * (1 + sl_pct)
-            else:
-                multiplier = futures_settings.INITIAL_STOP_ATR_MULTIPLIER
-                stop_loss = price - (atr_1h * multiplier) if action == "BUY" else price + (atr_1h * multiplier)
-        else:
-            sl_pct = 0.02 
-            stop_loss = price * (1 - sl_pct) if action == "BUY" else price * (1 + sl_pct)
-
-        if stop_loss <= 0:
-            self.logger.error(f"Rule 8: Invalid SL calculated for {symbol} (SL={stop_loss}). Aborting order.")
-            return None
-
-        return {
-            "action": action,
-            "symbol": symbol,
-            "leverage": lev,
-            "risk_percent": risk,
-            "take_profit": None, 
-            "stop_loss": stop_loss,
-            "invalidation_condition": "Python Rule 8", 
-            "reasoning": f"Python Rule 8 ({action}). ATR SL @ {stop_loss:.4f}"
-        }
+    # [V-Final 移除] _build_python_order
 
 
     async def _get_ml_prediction(self, symbol: str, market_data: Dict) -> Dict:
@@ -1353,14 +987,15 @@ class AlphaTrader:
         self.invocation_count += 1
         if not self.is_live_trading: await self._check_and_execute_hard_stops()
 
+        # [V-Final 修复] filter_rule8=True 现在是默认行为
         portfolio_state = self.portfolio.get_state_for_prompt(tickers, filter_rule8=True)
         
         user_prompt_string = self._build_prompt(market_data, portfolio_state, tickers)
 
         try:
             system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
-                symbol_list=self.formatted_symbols,
-                specific_rules_or_notes=""
+                symbol_list=self.formatted_symbols
+                # [V-Final 移除] 'specific_rules_or_notes' 不再需要
             )
         except KeyError as e: self.logger.error(f"Format System Prompt failed: {e}"); return
 
@@ -1379,17 +1014,17 @@ class AlphaTrader:
             extracted_summary = parts[1].strip().lstrip(' :').rstrip('`')
             if extracted_summary:
                 summary_for_ui = extracted_summary 
-                # [修改] 摘要日志记录改为英文
                 self.logger.info(f"Extracted English summary: '{summary_for_ui[:50]}...'")
             else:
-                 summary_for_ui = "AI summary was empty." # 英文
+                 summary_for_ui = "AI summary was empty."
         else:
-            self.logger.warning("AI CoT did not find 'In summary,' keyword.") # 英文
+            self.logger.warning("AI CoT did not find 'In summary,' keyword.")
         
         self.last_strategy_summary = summary_for_ui
 
         if orders:
             self.logger.info(f"AI proposed {len(orders)} order(s), executing...")
+            # [V-Final 修改] 调用 V2 (重写) 的 _execute_decisions
             await self._execute_decisions(orders, market_data)
         else:
             self.logger.info("AI proposed no orders.")
@@ -1400,7 +1035,6 @@ class AlphaTrader:
     async def high_frequency_risk_loop(self):
         self.logger.warning("🚀 高频风控循环 (HF Risk Loop) 已启动 (2s 周期)...")
         
-        # [修改] 移除了固定的 TP STAGES
         MAX_LOSS_PERCENT = settings.MAX_LOSS_CUTOFF_PERCENT / 100.0
         DUST_MARGIN_USDT = 1.0
         
@@ -1423,11 +1057,9 @@ class AlphaTrader:
                         continue
 
                     positions_to_close = {} 
-                    # [修改] 移除了 positions_to_partial_close
                     sl_update_tasks = [] 
 
                     open_symbols = set(open_positions.keys())
-                    # [修改] 移除了 tp_counters
                     for symbol in list(self.peak_profit_tracker.keys()):
                         if symbol not in open_symbols:
                             self.logger.info(f"HF Risk Loop: Removing Peak Profit tracker for closed position: {symbol}")
@@ -1454,22 +1086,11 @@ class AlphaTrader:
                             rate = upl / margin 
 
                             inval_cond = state.get('invalidation_condition') or '' 
-                            is_rule_8_trade = "Python Rule 8" in inval_cond
-
-                            if is_rule_8_trade:
-                                trail_percent = settings.BREAKOUT_TRAIL_STOP_PERCENT
-                                current_sl = initial_sl
-                                new_sl = 0.0
-                                
-                                if side == 'long': new_sl = price * (1 - trail_percent)
-                                else: new_sl = price * (1 + trail_percent)
-                                
-                                if (side == 'long' and new_sl > current_sl) or \
-                                   (side == 'short' and new_sl < current_sl and new_sl > 0 and price < current_sl):
-                                    
-                                    sl_update_tasks.append(
-                                        self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Rule 8 Trail Stop")
-                                    )
+                            
+                            # [V-Final 移除] Rule 8 的特殊追踪止损逻辑
+                            # is_rule_8_trade = "Python Rule 8" in inval_cond
+                            # if is_rule_8_trade:
+                            #   ... (逻辑已删除) ...
 
                             if rate <= -MAX_LOSS_PERCENT:
                                 reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
@@ -1487,59 +1108,59 @@ class AlphaTrader:
                                 self.peak_profit_tracker[symbol] = rate
                                 current_peak_rate = rate # 使用最新峰值
 
-                            if not is_rule_8_trade:
-                                # 1. 1R Breakeven Check
-                                if abs(initial_sl - entry) > 1e-9: 
-                                    initial_risk_distance = abs(entry - initial_sl)
-                                    current_upl_distance = 0.0
-                                    if side == 'long' and price > entry:
-                                        current_upl_distance = price - entry
-                                    elif side == 'short' and price < entry:
-                                        current_upl_distance = entry - price
-                                        
-                                    if current_upl_distance >= initial_risk_distance:
-                                        self.logger.warning(f"🔥 HF Risk Loop (1R Breakeven): {symbol} 达到 1R。正在将 SL 移至 {entry:.4f}")
+                            # [V-Final 修改] 现在所有策略都走这个逻辑
+                            # 1. 1R Breakeven Check
+                            if abs(initial_sl - entry) > 1e-9: 
+                                initial_risk_distance = abs(entry - initial_sl)
+                                current_upl_distance = 0.0
+                                if side == 'long' and price > entry:
+                                    current_upl_distance = price - entry
+                                elif side == 'short' and price < entry:
+                                    current_upl_distance = entry - price
+                                    
+                                if current_upl_distance >= initial_risk_distance:
+                                    self.logger.warning(f"🔥 HF Risk Loop (1R Breakeven): {symbol} 达到 1R。正在将 SL 移至 {entry:.4f}")
+                                    sl_update_tasks.append(
+                                        self.portfolio.update_position_rules(symbol, stop_loss=entry, reason="HF Risk Loop: 1R Breakeven")
+                                    )
+                            
+                            # 2. [集成] Graded Profit Taker (分级主动止盈)
+                            target_profit_rate = 0.0
+                            if current_peak_rate >= 0.15: # > 15%
+                                target_profit_rate = current_peak_rate * 0.70 # 锁定 70%
+                            elif current_peak_rate >= 0.08: # 8% - 15%
+                                target_profit_rate = current_peak_rate * 0.75 # 锁定 75% (回撤 25%)
+                            elif current_peak_rate >= 0.05: # 5% - 8%
+                                target_profit_rate = current_peak_rate * 0.80 # 锁定 80% (回撤 20%)
+                            elif current_peak_rate >= 0.03: # 3% - 5%
+                                target_profit_rate = current_peak_rate * 0.85 # 锁定 85% (回撤 15%)
+                            elif current_peak_rate >= 0.007: # 0.7% - 3%
+                                target_profit_rate = current_peak_rate * 0.65 # 锁定 65% (回撤 35%)
+                            
+                            if target_profit_rate > 0.0:
+                                target_upl = target_profit_rate * margin
+                                new_graded_sl_price = 0.0
+                                if side == 'long':
+                                    new_graded_sl_price = (target_upl / size) + entry
+                                else:
+                                    new_graded_sl_price = entry - (target_upl / size)
+                                
+                                current_sl = state.get('ai_suggested_stop_loss', 0.0)
+                                
+                                if side == 'long':
+                                    # 新 SL 必须高于条目 和 当前 SL
+                                    final_sl_floor = max(entry, current_sl)
+                                    if new_graded_sl_price > final_sl_floor:
                                         sl_update_tasks.append(
-                                            self.portfolio.update_position_rules(symbol, stop_loss=entry, reason="HF Risk Loop: 1R Breakeven")
+                                            self.portfolio.update_position_rules(symbol, stop_loss=new_graded_sl_price, reason="HF Risk Loop: Graded Profit Taker")
                                         )
-                                
-                                # 2. [集成] Graded Profit Taker (分级主动止盈)
-                                target_profit_rate = 0.0
-                                if current_peak_rate >= 0.15: # > 15%
-                                    target_profit_rate = current_peak_rate * 0.70 # 锁定 70%
-                                elif current_peak_rate >= 0.08: # 8% - 15%
-                                    target_profit_rate = current_peak_rate * 0.75 # 锁定 75% (回撤 25%)
-                                elif current_peak_rate >= 0.05: # 5% - 8%
-                                    target_profit_rate = current_peak_rate * 0.80 # 锁定 80% (回撤 20%)
-                                elif current_peak_rate >= 0.03: # 3% - 5%
-                                    target_profit_rate = current_peak_rate * 0.85 # 锁定 85% (回撤 15%)
-                                elif current_peak_rate >= 0.007: # 0.7% - 3%
-                                    target_profit_rate = current_peak_rate * 0.65 # 锁定 65% (回撤 35%)
-                                
-                                if target_profit_rate > 0.0:
-                                    target_upl = target_profit_rate * margin
-                                    new_graded_sl_price = 0.0
-                                    if side == 'long':
-                                        new_graded_sl_price = (target_upl / size) + entry
-                                    else:
-                                        new_graded_sl_price = entry - (target_upl / size)
-                                    
-                                    current_sl = state.get('ai_suggested_stop_loss', 0.0)
-                                    
-                                    if side == 'long':
-                                        # 新 SL 必须高于条目 和 当前 SL
-                                        final_sl_floor = max(entry, current_sl)
-                                        if new_graded_sl_price > final_sl_floor:
-                                            sl_update_tasks.append(
-                                                self.portfolio.update_position_rules(symbol, stop_loss=new_graded_sl_price, reason="HF Risk Loop: Graded Profit Taker")
-                                            )
-                                    elif side == 'short':
-                                        # 新 SL 必须低于条目 和 当前 SL
-                                        final_sl_floor = min(entry, current_sl)
-                                        if new_graded_sl_price < final_sl_floor:
-                                             sl_update_tasks.append(
-                                                self.portfolio.update_position_rules(symbol, stop_loss=new_graded_sl_price, reason="HF Risk Loop: Graded Profit Taker")
-                                            )
+                                elif side == 'short':
+                                    # 新 SL 必须低于条目 和 当前 SL
+                                    final_sl_floor = min(entry, current_sl)
+                                    if new_graded_sl_price < final_sl_floor:
+                                         sl_update_tasks.append(
+                                            self.portfolio.update_position_rules(symbol, stop_loss=new_graded_sl_price, reason="HF Risk Loop: Graded Profit Taker")
+                                        )
                             
                             # 3. 检查 AI 设定的 SL/TP (所有策略)
                             current_active_sl = state.get('ai_suggested_stop_loss') 
@@ -1556,8 +1177,6 @@ class AlphaTrader:
                                     if symbol not in positions_to_close: positions_to_close[symbol] = reason
                                     continue 
 
-                            # [修改] 移除了固定的 4%/10% 部分止盈逻辑
-                    
                     except Exception as e_risk_inner:
                         self.logger.error(f"HF Risk Loop 内部错误: {e_risk_inner}", exc_info=True)
 
@@ -1568,8 +1187,6 @@ class AlphaTrader:
                          await asyncio.gather(*tasks_close, return_exceptions=True)
                          self.logger.info(f"HF Risk Loop: Hard Close actions executed for: {list(positions_to_close.keys())}")
                     
-                    # [修改] 移除了 partial_close 逻辑
-
                 await asyncio.sleep(2) # 2 秒高频循环
                 
             except asyncio.CancelledError: 
@@ -1634,25 +1251,22 @@ class AlphaTrader:
                 await self._update_fear_and_greed_index()
                 market_data, tickers = await self._gather_all_market_data()
 
-                # 步骤 4: [中频] Python Rule 8 执行 (10s 周期)
-                if settings.ENABLE_BREAKOUT_MODIFIER:
-                    if self.is_live_trading:
-                        rule8_orders = await self._check_python_rule_8(market_data)
-                        if rule8_orders:
-                            self.logger.warning(f"🔥 Python Rule 8 (K-Line Confirm) TRIGGERED! Executing {len(rule8_orders)} orders.")
-                            await self._execute_decisions(rule8_orders, market_data)
+                # 步骤 4: [V-Final 移除] Python Rule 8 执行
+                # (逻辑已删除)
                 
                 # 步骤 5: [中频] Rule 6 ATR 追踪止损 (10s 周期)
                 if self.is_live_trading:
                     sl_update_tasks_rule6 = []
                     try:
+                        # [V-Final 修改] 现在所有持仓都由 position_manager 管理
                         open_positions_rule6 = self.portfolio.position_manager.get_all_open_positions()
                         for symbol, state in open_positions_rule6.items():
-                            inval_cond = state.get('invalidation_condition') or '' 
-                            is_rule_8_trade = "Python Rule 8" in inval_cond
                             
-                            if is_rule_8_trade:
-                                continue
+                            # [V-Final 移除] Rule 8 检查
+                            # inval_cond = state.get('invalidation_condition') or '' 
+                            # is_rule_8_trade = "Python Rule 8" in inval_cond
+                            # if is_rule_8_trade:
+                            #     continue
                                 
                             price = tickers.get(symbol, {}).get('last')
                             entry = state.get('avg_entry_price')
@@ -1684,8 +1298,6 @@ class AlphaTrader:
                                          sl_update_tasks_rule6.append(
                                             self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Main Loop: Rule 6 ATR Trail")
                                         )
-
-                        # --- [以下是您缺失的代码] ---
                         
                         if sl_update_tasks_rule6:
                             self.logger.info(f"Main Loop (ATR Trail): 正在为 {len(sl_update_tasks_rule6)} 个 Rule 6 仓位更新追踪止损...")
