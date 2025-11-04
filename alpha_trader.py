@@ -75,7 +75,16 @@ class AlphaTrader:
     1.  **Strategy: Limit Orders Only (CRITICAL):**
         * Your **only** strategy is to be patient and trade pullbacks (Rule 6.1), mean-reversion (Rule 6.2), or chop-zones (Rule 6.3).
         * You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL`.
-
+        
+    1.A. **Macro Market Bias (CRITICAL):**
+        * You MUST use the `4hour_ema_50` (provided in the data) to determine the overall market bias.
+        * **Bull Market Bias:** IF `current_price` is ABOVE `4hour_ema_50`:
+            * Your **primary goal** is to find `LIMIT_BUY` opportunities (Rule 6.1).
+            * `LIMIT_SELL` plans (Rule 6.2) are contrarian (逆势) and **HIGHLY DISCOURAGED**, unless confirmed by 'Extreme Greed' sentiment (Rule 5).
+        * **Bear Market Bias:** IF `current_price` is BELOW `4hour_ema_50`:
+            * Your **primary goal** is to find `LIMIT_SELL` opportunities (Rule 6.1).
+            * `LIMIT_BUY` plans (Rule 6.2) are contrarian (逆势) and **HIGHLY DISCOURAGED**, unless confirmed by 'Extreme Fear' sentiment (Rule 5).
+            
     2.  **Market State Recognition (Default Strategy):**
         You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes. This is your **Default Strategy**.
         * **1. Strong Trend (ADX > 25):**
