@@ -1,8 +1,9 @@
-# 文件: alpha_portfolio.py (V45.40 - 增加 filter_rule8 修复)
+# 文件: alpha_portfolio.py (V-Ultimate + PaperFix)
 # 1. [V45.40 修复] get_state_for_prompt 现已支持 'filter_rule8' 参数。
-#    - 这用于过滤掉 Rule 8 的持仓，防止 AI (LLM) 看到或管理它们。
-# 2. [V45.39 修复] 修复了 sync_state 中 V45.37 逻辑会过早删除"已成交"限价单计划的Bug。
-# 3. [V45.38 修复] 新增 _load/_save_pending_limits，使挂单计划持久化。
+# 2. [V-Ultimate BUG 修复] sync_state (实盘) 现在会根据实际成交价重新计算 SL/TP，防止“有毒”仓位。
+# 3. [V-Ultimate PaperFix] __init__, _load_pending_limits, _save_pending_limits 现在在所有模式下都运行。
+# 4. [V-Ultimate PaperFix] 新增 paper_open_limit 函数，用于接收模拟盘的 AI 限价单计划。
+# 5. [V-Ultimate PaperFix] sync_state (模拟盘) 现在会检查 pending_limit_orders 并模拟限价单成交。
 
 import logging
 import time
@@ -47,6 +48,7 @@ class AlphaPortfolio:
 
         self.pending_limit_orders: Dict[str, Dict] = {}
         self.pending_limits_file = os.path.join(futures_settings.FUTURES_STATE_DIR, 'alpha_pending_limits.json')
+        # [V-Ultimate PaperFix] 修复 1: 始终加载 pending_limits
         self._load_pending_limits()
 
 
@@ -82,7 +84,7 @@ class AlphaPortfolio:
         except Exception as e: self.logger.error(f"保存模拟状态失败: {e}", exc_info=True)
 
     def _load_pending_limits(self):
-        if not self.is_live: return
+        # [V-Ultimate PaperFix] 修复 2a: 移除 'if not self.is_live: return'
         if not os.path.exists(self.pending_limits_file):
             self.logger.info(f"{self.mode_str} 待处理限价单文件不存在，跳过加载。")
             return
@@ -100,7 +102,7 @@ class AlphaPortfolio:
             self.logger.error(f"加载待处理限价单失败: {e}", exc_info=True)
 
     async def _save_pending_limits(self):
-        if not self.is_live: return
+        # [V-Ultimate PaperFix] 修复 2b: 移除 'if not self.is_live: return'
         
         try:
             os.makedirs(os.path.dirname(self.pending_limits_file), exist_ok=True)
@@ -122,7 +124,8 @@ class AlphaPortfolio:
 
     async def sync_state(self):
         """
-        [V45.39 修复] 阻止 V45.37 逻辑过早删除"已成交"订单，确保 V45.38 逻辑能正确获取杠杆。
+        [V-Ultimate PaperFix] 模拟盘逻辑现在会检查并模拟成交 pending_limit_orders。
+        [V-Ultimate BUG 修复] 实盘逻辑现在会根据实际成交价重新计算 SL/TP。
         """
         try:
             if self.is_live:
@@ -183,7 +186,7 @@ class AlphaPortfolio:
                                     # --- [V45.36 策略A 步骤 2: 修复杠杆和通知] ---
                                     self.logger.warning(f"{self.mode_str} sync: 发现交易所新持仓 {symbol}，正在同步到本地...")
                                     
-                                    entry_str = pos.get('entryPrice') or pos.get('basePrice'); entry = float(entry_str) if entry_str else 0.0
+                                    entry_str = pos.get('entryPrice') or pos.get('basePrice'); entry = float(entry_str) if entry_str else 0.0 #
                                     
                                     plan_reason = "live_sync"
                                     plan_sl = None
@@ -193,12 +196,65 @@ class AlphaPortfolio:
                                     exchange_lev_val = pos.get('leverage')
                                     final_leverage = int(exchange_lev_val) if exchange_lev_val is not None and float(exchange_lev_val) > 0 else 1
 
+                                    # --- [V-Ultimate BUG 修复：重新计算 SL/TP] ---
                                     if pending_plan:
-                                        self.logger.warning(f"Sync: 新持仓 {symbol} 匹配到一个AI限价单计划。正在应用 SL/TP/Reason...")
+                                        self.logger.warning(f"Sync: 新持仓 {symbol} 匹配到一个AI限价单计划。正在应用 SL/TP/Reason...") #
                                         plan_reason = pending_plan.get('reason', 'live_sync_with_plan')
-                                        plan_sl = pending_plan.get('stop_loss')
-                                        plan_tp = pending_plan.get('take_profit')
-                                        plan_inval = pending_plan.get('invalidation_condition')
+                                        plan_inval = pending_plan.get('invalidation_condition') #
+                                        
+                                        try:
+                                            plan_limit_price = pending_plan.get('limit_price') #
+                                            original_sl = pending_plan.get('stop_loss') #
+                                            original_tp = pending_plan.get('take_profit') #
+                                            plan_side = pending_plan.get('side') #
+                                            
+                                            # 'entry' 是从交易所获取的实际成交均价
+                                            
+                                            if plan_limit_price and original_sl and original_tp and plan_side == side:
+                                                self.logger.info(f"Sync: 正在为 {symbol} 重新计算 SL/TP。")
+                                                self.logger.info(f"Sync: 实际成交价: {entry} (计划价: {plan_limit_price})")
+                                                
+                                                risk_distance = 0.0
+                                                reward_distance = 0.0
+
+                                                if side == 'long':
+                                                    # 计算原始的风险/回报“距离”
+                                                    risk_distance = plan_limit_price - original_sl #
+                                                    reward_distance = original_tp - plan_limit_price
+                                                    
+                                                    # 将“距离”应用到新的实际成交价上
+                                                    plan_sl = entry - risk_distance #
+                                                    plan_tp = entry + reward_distance #
+                                                    
+                                                elif side == 'short':
+                                                    # 计算原始的风险/回报“距离”
+                                                    risk_distance = original_sl - plan_limit_price
+                                                    reward_distance = plan_limit_price - original_tp
+                                                    
+                                                    # 将“距离”应用到新的实际成交价上
+                                                    plan_sl = entry + risk_distance
+                                                    plan_tp = entry - reward_distance
+
+                                                # 最终安全检查：确保新的SL是有效的
+                                                if (side == 'long' and plan_sl >= entry) or (side == 'short' and plan_sl <= entry):
+                                                    self.logger.error(f"Sync: 重新计算的 SL ({plan_sl}) 对成交价 ({entry}) 无效！")
+                                                    self.logger.error("Sync: 这可能是由于止损距离为0或负数。将使用原始SL值作为回退。")
+                                                    plan_sl = original_sl # 回退
+                                                else:
+                                                    self.logger.warning(f"Sync: SL/TP 已重新计算。")
+                                                    self.logger.warning(f"Sync: 原始 SL/TP: {original_sl}/{original_tp} -> 新 SL/TP: {plan_sl}/{plan_tp}")
+                                                
+                                            else:
+                                                # 如果缺少数据或边不匹配，回退到旧的（有风险的）逻辑
+                                                self.logger.warning(f"Sync: 无法重新计算 SL/TP (缺少数据或边不匹配)。使用原始计划值。")
+                                                plan_sl = pending_plan.get('stop_loss') #
+                                                plan_tp = pending_plan.get('take_profit') #
+
+                                        except Exception as e_recalc:
+                                            self.logger.error(f"Sync: 重新计算 SL/TP 时出错: {e_recalc}。将使用原始计划值。")
+                                            plan_sl = pending_plan.get('stop_loss') #
+                                            plan_tp = pending_plan.get('take_profit') #
+                                        # --- [V-Ultimate BUG 修复结束] ---
                                         
                                         plan_leverage = pending_plan.get('leverage')
                                         if plan_leverage and isinstance(plan_leverage, (int, float)) and plan_leverage > 0:
@@ -217,7 +273,7 @@ class AlphaPortfolio:
                                     else:
                                         self.logger.warning(f"Sync: 新持仓 {symbol} 未匹配到AI计划，使用默认值同步 (杠杆 {final_leverage}x)。")
 
-                                    self.position_manager.open_position(
+                                    self.position_manager.open_position( #
                                         symbol=symbol, 
                                         side=side, 
                                         entry_price=entry, 
@@ -258,8 +314,37 @@ class AlphaPortfolio:
                                              self.logger.warning(f"Sync: 无法反推加仓价格 (AddPrice: {add_price})。将使用交易所均价 {current_avg_price} 作为近似值。")
                                              add_price = current_avg_price
 
-                                        plan_sl = pending_plan.get('stop_loss')
-                                        plan_tp = pending_plan.get('take_profit')
+                                        # [V-Ultimate BUG 修复] 加仓也需要重新计算 SL/TP
+                                        plan_sl = None
+                                        plan_tp = None
+                                        try:
+                                            plan_limit_price = pending_plan.get('limit_price')
+                                            original_sl = pending_plan.get('stop_loss')
+                                            original_tp = pending_plan.get('take_profit')
+                                            
+                                            if plan_limit_price and original_sl and original_tp:
+                                                if side == 'long':
+                                                    risk_distance = plan_limit_price - original_sl
+                                                    reward_distance = original_tp - plan_limit_price
+                                                    plan_sl = add_price - risk_distance
+                                                    plan_tp = add_price + reward_distance
+                                                elif side == 'short':
+                                                    risk_distance = original_sl - plan_limit_price
+                                                    reward_distance = plan_limit_price - original_tp
+                                                    plan_sl = add_price + risk_distance
+                                                    plan_tp = add_price - reward_distance
+                                                
+                                                self.logger.info(f"Sync (Add): SL/TP 已重新计算。")
+                                                self.logger.info(f"Sync (Add): 原始 SL/TP: {original_sl}/{original_tp} -> 新 SL/TP: {plan_sl}/{plan_tp}")
+                                            else:
+                                                plan_sl = pending_plan.get('stop_loss')
+                                                plan_tp = pending_plan.get('take_profit')
+                                        except Exception as e_recalc_add:
+                                            self.logger.error(f"Sync (Add): 重新计算 SL/TP 时出错: {e_recalc_add}。")
+                                            plan_sl = pending_plan.get('stop_loss')
+                                            plan_tp = pending_plan.get('take_profit')
+                                        # [BUG 修复结束]
+
                                         plan_inval = pending_plan.get('invalidation_condition')
                                         plan_reason = pending_plan.get('reason', 'live_sync_add_with_plan')
                                         plan_leverage = pending_plan.get('leverage')
@@ -309,7 +394,87 @@ class AlphaPortfolio:
                         self.logger.debug(f"{self.mode_str} sync: 成功追加净值历史: {history_entry}")
                     else: self.logger.warning(f"{self.mode_str} sync: 跳过追加净值历史，Equity无效: {current_equity_to_append} (Type: {type(current_equity_to_append)})")
                 except Exception as e: self.logger.critical(f"{self.mode_str} sync 失败 (实盘部分): {e}", exc_info=True)
+            
             else: # 模拟盘
+                
+                # --- [V-Ultimate 模拟盘修复] 模拟限价单成交检查 ---
+                if self.pending_limit_orders:
+                    try:
+                        symbols_to_check = list(self.pending_limit_orders.keys())
+                        if symbols_to_check: # 仅在有待处理订单时获取 tickers
+                            tickers_for_paper = await self.exchange.fetch_tickers(symbols_to_check)
+                            
+                            # 迭代副本以允许在循环中删除
+                            for symbol, plan in list(self.pending_limit_orders.items()):
+                                current_price_data = tickers_for_paper.get(symbol)
+                                if not current_price_data or not current_price_data.get('last'):
+                                    self.logger.warning(f"{self.mode_str} 模拟成交: 无法获取 {symbol} 的市价，跳过。")
+                                    continue
+                                    
+                                current_price = current_price_data.get('last')
+                                limit_price = plan.get('limit_price')
+                                side = plan.get('side')
+                                
+                                is_fill = False
+                                if side == 'long' and current_price <= limit_price:
+                                    self.logger.warning(f"✅ {self.mode_str} 模拟成交: LONG {symbol} 挂单 {limit_price} 已被市价 {current_price} 触发。")
+                                    is_fill = True
+                                elif side == 'short' and current_price >= limit_price:
+                                    self.logger.warning(f"✅ {self.mode_str} 模拟成交: SHORT {symbol} 挂单 {limit_price} 已被市价 {current_price} 触发。")
+                                    is_fill = True
+
+                                if is_fill:
+                                    # 1. 从待处理中移除
+                                    plan = await self.remove_pending_limit_order(symbol)
+                                    if not plan: continue # 万一并发
+                                    
+                                    # 2. [V-Ultimate BUG 修复] 重新计算 SL/TP
+                                    entry_price = plan.get('limit_price')
+                                    original_sl = plan.get('stop_loss')
+                                    original_tp = plan.get('take_profit')
+                                    
+                                    new_sl = original_sl
+                                    new_tp = original_tp
+                                    
+                                    # 检查市价是否 *好于* 限价 (滑点)
+                                    if (side == 'long' and current_price < entry_price) or (side == 'short' and current_price > entry_price):
+                                        self.logger.info(f"{self.mode_str} 模拟成交: 成交价 {current_price} 优于挂单价 {entry_price}。使用 {current_price}。")
+                                        entry_price = current_price # 获得更好的价格
+                                    else:
+                                        self.logger.info(f"{self.mode_str} 模拟成交: 成交价 {entry_price} (挂单价)。")
+
+                                    # 重新计算 SL/TP (应用 Bug 修复)
+                                    try:
+                                        if side == 'long':
+                                            risk_distance = plan.get('limit_price') - original_sl
+                                            reward_distance = original_tp - plan.get('limit_price')
+                                            new_sl = entry_price - risk_distance
+                                            new_tp = entry_price + reward_distance
+                                        elif side == 'short':
+                                            risk_distance = original_sl - plan.get('limit_price')
+                                            reward_distance = plan.get('limit_price') - original_tp
+                                            new_sl = entry_price + risk_distance
+                                            new_tp = entry_price - reward_distance
+                                        self.logger.info(f"{self.mode_str} 模拟成交: SL/TP 已重新计算为 {new_sl}/{new_tp} (基于成交价 {entry_price})")
+                                    except Exception as e_recalc:
+                                        self.logger.error(f"{self.mode_str} 模拟成交: SL/TP 重算失败: {e_recalc}，使用原始值。")
+
+                                    # 3. 调用 paper_open (市价模拟器) 来执行
+                                    await self.paper_open(
+                                        symbol=symbol,
+                                        side=plan.get('side'),
+                                        size=plan.get('size'),
+                                        price=entry_price, # 使用我们的成交价
+                                        leverage=plan.get('leverage'),
+                                        reason=plan.get('reason', 'paper_limit_fill'),
+                                        stop_loss=new_sl,
+                                        take_profit=new_tp,
+                                        invalidation_condition=plan.get('invalidation_condition')
+                                    )
+                    except Exception as e_paper_fill:
+                        self.logger.error(f"{self.mode_str} 模拟限价单成交检查失败: {e_paper_fill}", exc_info=True)
+                # --- [模拟盘修复结束] ---
+
                 unrealized_pnl = 0.0; total_margin = 0.0; tickers = {}
                 try: tickers = await self.exchange.fetch_tickers(self.symbols)
                 except Exception as e: self.logger.error(f"{self.mode_str} sync: 获取 Tickers 失败: {e}")
@@ -419,8 +584,8 @@ class AlphaPortfolio:
         
         # --- [V-Pending 修复] 新增挂单详情 ---
         pending_orders_details = []
-        # (只在实盘模式下获取, 模拟盘不支持挂单)
-        if self.is_live and self.pending_limit_orders:
+        # (V-Ultimate PaperFix: 现在模拟盘也支持挂单)
+        if self.pending_limit_orders:
             for symbol, plan in self.pending_limit_orders.items():
                 try:
                     plan_str = ( f"- {symbol.split(':')[0]}: Side={plan.get('side', 'N/A').upper()}, "
@@ -644,6 +809,7 @@ class AlphaPortfolio:
             pending_plan = {
                 'order_id': order_id,
                 'side': side,
+                'size': adjusted_size, # [V-Ultimate PaperFix] 存储最终的 adjusted_size
                 'leverage': int(leverage),
                 'limit_price': limit_price,
                 'stop_loss': stop_loss,
@@ -670,6 +836,61 @@ class AlphaPortfolio:
             await send_bark_notification(f"❌ {self.mode_str} AI {action_type} 失败", f"品种: {symbol}\n错误: {e}")
             await self.remove_pending_limit_order(symbol)
 
+    # --- [V-Ultimate 模拟盘修复] 新增 PAPEPR_OPEN_LIMIT 函数 ---
+    async def paper_open_limit(self, symbol, side, size, leverage, limit_price: float, reason: str = "N/A", stop_loss: float = None, take_profit: float = None, invalidation_condition: str = "N/A"):
+        """
+        模拟盘：接收 AI 的限价单计划，并将其存入待处理列表以供 'sync_state' 模拟。
+        """
+        action_type = "模拟限价开仓"
+        
+        # 检查是否已有持仓 (与 live_open_limit 逻辑相同)
+        if self.paper_positions.get(symbol) and self.paper_positions[symbol].get('size', 0) > 0:
+            pos_state = self.paper_positions[symbol]
+            if pos_state and pos_state.get('side') == side:
+                action_type = "模拟限价加仓"
+            else:
+                self.logger.error(f"!!! {self.mode_str} 模拟限价单失败: {symbol} 已有 *相反* 持仓。")
+                return
+
+        self.logger.warning(f"!!! {self.mode_str} AI 请求 {action_type}: {side.upper()} {size} {symbol} @ {limit_price} !!!")
+
+        # 检查是否已有一个待处理订单
+        if symbol in self.pending_limit_orders:
+            old_plan = await self.remove_pending_limit_order(symbol)
+            old_order_id = old_plan.get('order_id') if old_plan else "N/A"
+            self.logger.warning(f"{self.mode_str} {action_type}: 发现旧的待处理订单 {old_order_id}。正在覆盖...")
+            
+        # 模拟盘不需要复杂的保证金检查，因为我们假设计划总是好的
+        # 我们只在 'sync_state' 中检查 fill
+        
+        # 创建一个假的 order_id
+        order_id = f"PAPER-{symbol}-{int(time.time() * 1000)}"
+
+        pending_plan = {
+            'order_id': order_id, # 模拟盘 ID
+            'side': side,
+            'size': size, # 存储计划的 size
+            'leverage': int(leverage),
+            'limit_price': limit_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'invalidation_condition': invalidation_condition,
+            'reason': reason,
+            'timestamp': time.time() * 1000 
+        }
+        
+        # 将计划存入待处理列表
+        await self.add_pending_limit_order(symbol, pending_plan)
+        
+        self.logger.warning(f"!!! {self.mode_str} {action_type} 挂单(模拟)成功: {side.upper()} {size} {symbol} @ {limit_price}")
+        self.logger.info(f"    SL: {stop_loss}, TP: {take_profit}, Inval: {invalidation_condition}")
+        
+        title_prefix = "⌛" if action_type == "模拟限价开仓" else "🔼"
+        title = f"{title_prefix} {self.mode_str} AI {action_type}: {side.upper()} {symbol.split('/')[0]}"
+        body = f"价格: {limit_price:.4f}\n数量: {size}\n杠杆: {leverage}x\nTP/SL: {take_profit}/{stop_loss}\nAI原因: {reason}"
+        await send_bark_notification(title, body)
+
+    # --- [修复结束] ---
 
     async def live_partial_close(self, symbol: str, size_percent: Optional[float] = None, size_absolute: Optional[float] = None, reason: str = "N/A"):
         self.logger.warning(f"!!! {self.mode_str} AI 请求部分平仓: {symbol} | %: {size_percent} | Abs: {size_absolute} | 原因: {reason} !!!")
