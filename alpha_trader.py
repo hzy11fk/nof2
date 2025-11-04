@@ -44,7 +44,6 @@ except ImportError:
 
 class AlphaTrader:
     
-    # --- [AI (Rule 6) 专用 PROMPT (V-Manager - 整合了修复 1, 2, 3)] ---
     SYSTEM_PROMPT_TEMPLATE = """
     You are an **Expert Market Analyst and Trading Strategist**. Your primary goal is to **identify high-probability trading theses** and **actively manage** the portfolio's risk/reward profile.
 
@@ -58,7 +57,8 @@ class AlphaTrader:
 
     **Python's Task (Do NOT do this yourself):**
     * Python will perform **all** final checks and calculations.
-    * Python will **VETO** your trade if it fails hard rules (e.g., Trend Filter, Anomaly Score, OI Matrix, R:R, Stale Price).
+    * Python will **VETO** your trade if it fails hard rules (e.g., R:R, Stale Price).
+    * Python manages the **Macro Trend Veto (Rule 1.A)** and its **Exceptions (Rule 1.A.E)**.
     * Python will **calculate** all final sizing, leverage, and `risk_percent` based on your `confidence_level` AND asset volatility (ATR).
     * Python will **automatically penalize (reduce risk)** for trades against extreme market sentiment (F&G).
     * Python manages all automated exits (SL/TP, Trailing Stops, Safety Nets) via a high-frequency loop.
@@ -71,19 +71,30 @@ class AlphaTrader:
         * Your **only** strategy for opening new positions or adding to winners is to be patient.
         * You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL` for new entries.
 
+    1.B. **High-Confidence Mandate (CRITICAL):**
+        * You **MUST NOT** submit any new `LIMIT_BUY` or `LIMIT_SELL` order unless your final assessment is **High Confidence**.
+        * If your analysis results in 'Medium' or 'Low' confidence (due to weak ML, data conflicts [OI/Taker], or sentiment conflict), you MUST **ABORT** the plan.
+
     1.A. **Macro Market Bias (CRITICAL)**
         * This rule **ONLY applies to Trend Pullback strategies (Rule 2.1)** when ADX > 20.
         * It MUST NOT be used to filter Ranging/Mean-Reversion strategies (Rule 2.2).
         * **Bull Market Bias:** IF `current_price` is ABOVE `4hour_ema_50`:
             * Your **primary goal** is to find `LIMIT_BUY` opportunities (Rule 2.1).
+            * Python will **strongly VETO** most `LIMIT_SELL` plans.
         * **Bear Market Bias:** IF `current_price` is BELOW `4hour_ema_50`:
             * Your **primary goal** is to find `LIMIT_SELL` opportunities (Rule 2.1).
+            * Python will **strongly VETO** most `LIMIT_BUY` plans.
+
+    1.A.E. **[CRITICAL EXCEPTION (Reversals)]:**
+        * Python's Veto (Rule 1.A) has an exception. You **ARE AUTHORIZED** to propose a counter-trend trade (e.g., a `LIMIT_BUY` in a Bear Market Bias) **ONLY IF** you observe strong, data-driven evidence of a *reversal*.
+        * **Reversal Signal Example:** `1h_ema` has crossed above `4h_ema` AND this cross is supported by `1h_volume_ratio` (e.g., > 1.5x).
+        * **Your Action:** If you identify this signal, you may propose the trade. Python's Executor will then verify your data (EMA cross, Volume) and make the final decision to Override the Veto or not.
 
     2.  **Market State Recognition (Default Strategy)**
         You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes.
         * **2.1. Strong Trend (ADX > 20):**
             * **Strategy (LIMIT ONLY):** Identify a **'Pullback Confluence Zone'**.
-            * **[Trend Filter]:** You MUST obey `Rule 1.A` (Macro Market Bias).
+            * **[Trend Filter]:** You MUST obey `Rule 1.A` (Macro Market Bias) or identify an exception (Rule 1.A.E).
             * **Timing:** Place the `LIMIT_BUY` (in uptrend) or `LIMIT_SELL` (in downtrend) **only if** the pullback appears exhausted (e.g., `15min RSI` < 40 for Long).
             * **[Confirmation]:** This is High-Confidence *only if* `ML_Proba` confirms (e.g., > 0.60) AND `Rule 3` Data Confirmation is met.
         * **2.2. Ranging (ADX < 20):**
@@ -117,13 +128,13 @@ class AlphaTrader:
             * **VETO (Long):** If your calculated TP is $4100, but there is a major 4h Resistance level at $4000, your trade is INVALID. You MUST ABORT.
         * **Conclusion:** Only submit a trade if its 1.5R target is *clear* of any major opposing S/R levels.
         
-    5.  **Market Sentiment Filter (Fear & Gred Index):**
+    5.  **Market Sentiment Filter (Fear & Greed Index):**
         * You must use this filter, but it **must be subservient** to the Macro Bias (Rule 1.A).
         * **Rule 1.A (4h EMA trend) always comes first.**
         
         -   **Extreme Fear (Index < 25):** Market is capitulating.
             -   **IF Macro Bias is Bullish (Rule 1.A):** This is a **HIGH-CONFIDENCE `LIMIT_BUY` signal** (a bull market fear-flush). Aggressively seek entry points.
-            -   **IF Macro Bias is Bearish (Rule 1.A):** This is a **BEARISH TREND CONFIRMATION**. **VETO** all `LIMIT_BUY` plans.
+            -   **IF Macro Bias is Bearish (Rule 1.A):** This is a **BEARISH TREND CONFIRMATION**. This **STRONGLY DISCOURAGES** all `LIMIT_BUY` plans. **DO NOT** propose a `LIMIT_BUY` *unless* you have identified a **Rule 1.A.E. Reversal Exception**.
             -   **Python Penalty:** Python will still penalize (reduce risk) for `LIMIT_SELL` orders opened in this state.
 
         -   **Fear (Index 25-45):** Market is pessimistic.
@@ -137,7 +148,7 @@ class AlphaTrader:
 
         -   **Extreme Greed (Index > 75):** Market is euphoric.
             -   **IF Macro Bias is Bearish (Rule 1.A):** This is a **HIGH-CONFIDENCE `LIMIT_SELL` signal** (a bear market relief-rally). Aggressively seek exit/short points.
-            -   **IF Macro Bias is Bullish (Rule 1.A):** This is a **BULLISH TREND CONFIRMATION**. **VETO** all `LIMIT_SELL` plans.
+            -   **IF Macro Bias is Bullish (Rule 1.A):** This is a **BULLISH TREND CONFIRMATION**. This **STRONGLY DISCOURAGES** all `LIMIT_SELL` plans. **DO NOT** propose a `LIMIT_SELL` *unless* you have identified a **Rule 1.A.E. Reversal Exception**.
             -   **Python Penalty:** Python will still penalize (reduce risk) for `LIMIT_BUY` orders opened in this state.
 
     **MANDATORY OUTPUT FORMAT:**
@@ -151,7 +162,7 @@ class AlphaTrader:
         - 1h ADX: [Value] | 4h ADX: [Value]
         - Macro Bias (Rule 1.A): [Bullish (Price > 4h EMA) / Bearish (Price < 4h EMA)]
         - Regime: [Applying Rule 2.1 (Trending) / Applying Rule 2.2 (Ranging)]
-        - Market Sentiment: [F&G Index value and its implication, e.g., "Extreme Fear (20). Macro Bias is Bearish, so this is a Bear Trend Confirmation. Vetoing all Longs."]
+        - Market Sentiment: [F&G Index value and its implication, e.g., "Extreme Fear (20). Macro Bias is Bearish, so this is a Bear Trend Confirmation. Strongly discouraging Longs."]
 
         Portfolio Overview & Active Management:
         (Python handles all automated exits. Your task is to analyze open positions for strategic changes.)
@@ -188,31 +199,44 @@ class AlphaTrader:
         ETH Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
         - Macro Bias (Rule 1.A): Bullish.
         - Thesis: Price is pulling back to a confluence support zone (4h BB_Mid + 1h EMA 20). 15m RSI is low (38).
-        - Data Check: `OI_Regime_1h` is "Rising" AND `Taker_Ratio_1h_Regime` is "Buying". (P↑ O↑ T↑).
+        - Data Check: `OI_Regime_1h` is "Rising" AND `Taker_Ratio_1h__Regime` is "Buying". (P↑ O↑ T↑).
         - ML Confirmation: ML_Proba_UP = 0.68.
         - Sentiment: F&G is 60 (Greed), which is slightly cautionary, but technicals are strong.
         - SL/TP Plan: Entry=3550, SL=3510 (Risk=40). R:R Check: Min TP=3610. Realism: 4h Res is at 3700 (Clear). Set TP=3690.
         - Final Confidence: High.
         - Plan: PREPARE LIMIT_BUY.
 
-        [EXAMPLE - RULE 1.A (Macro Bias Veto):]
-        SOL Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
+        [EXAMPLE - RULE 1.A.E (Reversal Exception):]
+        BTC Multi-Timeframe Assessment (Market State: Trending, 1h ADX=25):
         - Macro Bias (Rule 1.A): Bearish (Price < 4h EMA).
-        - Thesis: Price is approaching 1h BB_Lower support (Rule 2.2).
-        - Final Confidence: VETO. Rule 1.A (Bear Market Bias) HIGHLY DISCOURAGES contrarian LIMIT_BUY plans, even in ranging markets.
-        - Plan: ABORT.
+        - Thesis: Market is showing a *potential bullish reversal*. 1h EMA has just crossed above 4h EMA, and 1h Volume is high (1.8x ratio). Price is now pulling back to 15m EMA 50 support.
+        - Data Check: `OI_Regime_1h` is "Rising" AND `Taker_Ratio_1h_Regime` is "Buying". (P↑ O↑ T↑).
+        - ML Confirmation: ML_Proba_UP = 0.75.
+        - Sentiment: F&G is 22 (Extreme Fear), which is a Bearish Confirmation (but this reversal signal overrides it).
+        - Final Confidence: High. (This meets the criteria for the Rule 1.A.E. Reversal Exception, which Python will validate).
+        - Plan: PREPARE LIMIT_BUY.
+        
+        [EXAMPLE - RULE 1.B (Medium Confidence Veto):]
+        XRP Multi-Timeframe Assessment (Market State: Trending Bearish, 1h ADX=49):
+        - Macro Bias (Rule 1.A): Bearish.
+        - Thesis: Price below 4h EMA_50, downtrend. 15m RSI=43 (low), potential pullback.
+        - Data Check: OI_Regime_1h is "Rising" AND Taker_Ratio_1h_Regime is "Neutral". (Partial Confirmation).
+        - ML Confirmation: ML_Proba_DOWN=0.45 (Weak).
+        - Final Confidence: Medium. (OI confirms, but Taker/ML is weak).
+        - Plan: ABORT. (Per Rule 1.B, Medium Confidence is insufficient to trade).
 
-        In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
+        In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.] 
         ```
 
     2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding.
 
     **Order Object Rules (NEW SIMPLIFIED FORMAT):**
     -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "thesis": "Rule 2.1 Pullback. Confidence: High. OI/Taker Confirmed.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "High"}}`
-    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "thesis": "Rule 2.2 Ranging. Confidence: Medium. ML Confirmed.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "Medium"}}`
+    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "thesis": "Rule 1.A.E Reversal. Confidence: High. ML Confirmed.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "High"}}`
     -   **To Update Stop Loss (Risk Control):** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": [CALCULATED_PRICE], "reasoning": "Losing Position Check: Tightening SL."}}`
     -   **Symbol Validity:** `symbol` MUST be one of {symbol_list}.
-    """
+    """    
+
 
     def __init__(self, exchange):
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -356,7 +380,7 @@ class AlphaTrader:
             try:
                 market_id = self.client.market(symbol)['id']
             except Exception as e_market:
-                self.logger.error(f"TR-Bypass: 无法从 client.market() 获取 {symbol} 的 market_id: {e_market}")
+                self.logger.info(f"TR-Bypass: 无法从 client.market() 获取 {symbol} 的 market_id: {e_market}")
                 return None 
             
             url = "https://fapi.binance.com/futures/data/takerlongshortRatio"
@@ -650,6 +674,7 @@ class AlphaTrader:
     def _validate_ai_trade(self, order: Dict, market_data: Dict[str, Dict[str, Any]]) -> Tuple[bool, str]:
         """
         Python 执行者：验证 AI 策略的硬规则。
+        [V-Ultimate V7 优化 - 整合了 EMA Cross + Volume Confirmation]
         """
         symbol = order.get('symbol')
         action = order.get('action')
@@ -667,6 +692,16 @@ class AlphaTrader:
         oi_regime = data.get('oi_regime_1h')
         taker_regime = data.get('taker_ratio_1h_regime') 
         
+        # --- [V7 优化] ---
+        # 1. 定义例外规则的参数
+        ema_50_1h = data.get('1hour_ema_50')
+        adx_1h = data.get('1hour_adx_14')
+        volume_ratio_1h = data.get('1hour_volume_ratio') # 使用 1h 成交量比率作为确认
+        
+        # 2. 定义确认阈值 (例如：成交量必须是均值的 1.5 倍)
+        VOL_CONFIRM_THRESHOLD = 1.5 
+        # --- [V7 优化结束] ---
+
         if not all([current_price, ema_50_4h, oi_regime, taker_regime, limit_price, stop_loss_price, take_profit_price]):
             return False, f"Missing critical data (Price, EMA, OI, Taker, or Order Prices)"
 
@@ -674,15 +709,50 @@ class AlphaTrader:
         if anomaly_score < -0.1:
             return False, f"Anomaly Veto (Score: {anomaly_score:.3f})"
 
-        # 2. [VETO] Trend Filter Check (Rule 1.B) - [FIX 1]
+        # 2. [VETO] Trend Filter Check (Rule 1.B) - [V7 优化]
         if settings.ENABLE_4H_EMA_FILTER:
-            # [V-Ultimate V6 修复] 仅在趋势市场 (ADX > 20) 时才应用 4h EMA 过滤器
-            adx_1h = data.get('1hour_adx_14')
+            # 仅在趋势市场 (ADX > 20) 时才应用 4h EMA 过滤器
             if adx_1h and adx_1h > 20:
-                if action == "LIMIT_BUY" and current_price < ema_50_4h:
-                    return False, f"Trend Filter Veto (ADX > 20 & Price < 4h EMA)"
-                if action == "LIMIT_SELL" and current_price > ema_50_4h:
-                    return False, f"Trend Filter Veto (ADX > 20 & Price > 4h EMA)"
+                
+                # 检查 Veto 解除所需的数据是否存在
+                has_override_data = all([ema_50_1h, ema_50_4h, volume_ratio_1h])
+
+                # --- 检查做多 (LIMIT_BUY) Veto ---
+                is_4h_bear_trend = current_price < ema_50_4h
+                if action == "LIMIT_BUY" and is_4h_bear_trend:
+                    
+                    # [V7 例外检查]
+                    is_bullish_reversal_state = has_override_data and (ema_50_1h > ema_50_4h)
+                    is_volume_confirmed = has_override_data and (volume_ratio_1h > VOL_CONFIRM_THRESHOLD)
+                    
+                    if is_bullish_reversal_state and is_volume_confirmed:
+                        # Veto 解除：允许做多
+                        self.logger.warning(f"Trend Filter OVERRIDE (Bullish Reversal): {symbol} 1h EMA > 4h EMA + Vol Confirmed. Allowing LONG.")
+                    else:
+                        # 没有例外：保持 Veto
+                        reason = f"Trend Filter Veto (ADX > 20 & Price < 4h EMA)"
+                        if is_bullish_reversal_state and not is_volume_confirmed:
+                            reason += f" (Reversal lacked Vol Confirmation: {volume_ratio_1h:.1f}x < {VOL_CONFIRM_THRESHOLD}x)"
+                        return False, reason
+
+                # --- 检查做空 (LIMIT_SELL) Veto ---
+                is_4h_bull_trend = current_price > ema_50_4h
+                if action == "LIMIT_SELL" and is_4h_bull_trend:
+                    
+                    # [V7 例外检查]
+                    is_bearish_reversal_state = has_override_data and (ema_50_1h < ema_50_4h)
+                    is_volume_confirmed = has_override_data and (volume_ratio_1h > VOL_CONFIRM_THRESHOLD)
+                    
+                    if is_bearish_reversal_state and is_volume_confirmed:
+                        # Veto 解除：允许做空
+                        self.logger.warning(f"Trend Filter OVERRIDE (Bearish Reversal): {symbol} 1h EMA < 4h EMA + Vol Confirmed. Allowing SHORT.")
+                    else:
+                        # 没有例外：保持 Veto
+                        reason = f"Trend Filter Veto (ADX > 20 & Price > 4h EMA)"
+                        if is_bearish_reversal_state and not is_volume_confirmed:
+                            reason += f" (Reversal lacked Vol Confirmation: {volume_ratio_1h:.1f}x < {VOL_CONFIRM_THRESHOLD}x)"
+                        return False, reason
+            
             else:
                 self.logger.info(f"4H EMA Filter: Skipped (Ranging Market ADX {adx_1h:.1f} <= 20).")
         else:
