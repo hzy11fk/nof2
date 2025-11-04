@@ -1,7 +1,7 @@
-# 文件: alpha_trader.py (V-Ultimate-Bypass - 整合了 Taker Ratio Bypass 和所有优化)
+# 文件: alpha_trader.py (V-Ultimate-V4 - 整合了所有高级优化)
 # 描述: 
 # 1. (已移除) Rule 8 策略。
-# 2. (已优化) _gather_all_market_data 获取 1h OI Regime。
+# 2. (已优化) _gather_all_market_data 获取 1h OI Regime 和 1h Taker Ratio Regime。
 # 3. (已优化) SYSTEM_PROMPT_TEMPLATE (V2.3):
 #    - AI 角色为 "Strategist"。
 #    - Rule 3: 结合 OI 和 Taker Ratio 作为双重信念确认。
@@ -13,9 +13,9 @@
 #    - (新) 基于 ATR 和置信度的动态风险计算。
 #    - (新) Stale Plan Veto (最终价格验证) 防止过时订单成交。
 # 6. (已新增) high_frequency_risk_loop 使用 V3 风险厌恶型阶梯止盈 (1% 启动)。
-# 7. (已新增) start() 循环包含针对"亏损中"仓位的 1h EMA + ATR 缓冲"动态安全网 V3"。
+# 7. (已新增) start() 循环包含 [V4 最终版] 动态安全网 (ADX 过滤 + 1.0*ATR 缓冲)。
 # 8. (已新增) start() 循环包含"过时限价单" (Stale Order) 自动取消逻辑。
-# 9. (已修复) [TR-BYPASS] 绕过 ccxt，使用专用的 httpx 客户端获取 Taker Ratio，以修复 Testnet URL Bug。
+# 9. (已修复) [TR-BYPASS] 绕过 ccxt，使用专用的 httpx 客户端获取 Taker Ratio。
 # 10.(已修复) [PaperFix] _execute_decisions 现在正确调用 paper_open_limit，使模拟盘可用。
 # 11.(已修复) [AsyncioFix] start() 函数的 finally 块移至 while 循环外，防止 httpx 客户端过早关闭。
 
@@ -75,16 +75,16 @@ class AlphaTrader:
     1.  **Strategy: Limit Orders Only (CRITICAL):**
         * Your **only** strategy is to be patient and trade pullbacks (Rule 6.1), mean-reversion (Rule 6.2), or chop-zones (Rule 6.3).
         * You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL`.
-        
+
     1.A. **Macro Market Bias (CRITICAL):**
         * You MUST use the `4hour_ema_50` (provided in the data) to determine the overall market bias.
         * **Bull Market Bias:** IF `current_price` is ABOVE `4hour_ema_50`:
             * Your **primary goal** is to find `LIMIT_BUY` opportunities (Rule 6.1).
-            * `LIMIT_SELL` plans (Rule 6.2) are contrarian (逆势) and **HIGHLY DISCOURAGED**, unless confirmed by 'Extreme Greed' sentiment (Rule 5).
+            * `LIMIT_SELL` plans (Rule 6.2) are contrarian and **HIGHLY DISCOURAGED**, unless confirmed by 'Extreme Greed' sentiment (Rule 5).
         * **Bear Market Bias:** IF `current_price` is BELOW `4hour_ema_50`:
             * Your **primary goal** is to find `LIMIT_SELL` opportunities (Rule 6.1).
-            * `LIMIT_BUY` plans (Rule 6.2) are contrarian (逆势) and **HIGHLY DISCOURAGED**, unless confirmed by 'Extreme Fear' sentiment (Rule 5).
-            
+            * `LIMIT_BUY` plans (Rule 6.2) are contrarian and **HIGHLY DISCOURAGED**, unless confirmed by 'Extreme Fear' sentiment (Rule 5).
+
     2.  **Market State Recognition (Default Strategy):**
         You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes. This is your **Default Strategy**.
         * **1. Strong Trend (ADX > 25):**
@@ -97,7 +97,7 @@ class AlphaTrader:
         * **3. Chop (ADX 20-25):**
             * **Strategy (LIMIT ONLY):** Low-conviction. Shift focus to **15min timeframe**. May issue `LIMIT` orders at 15m BBands with 'Medium' confidence.
 
-    3.  **Data Confirmation (CRITICAL) - [V-Ultimate+TR 优化]**
+    3.  **Data Confirmation (CRITICAL)**
         * You MUST check `OI_Regime_1h` and `Taker_Ratio_1h_Regime`. They are your "Conviction" filter.
         * **Strong Confirmation (High Confidence):**
             * `LIMIT_BUY`: `OI_Regime_1h` is "Rising" **AND** `Taker_Ratio_1h_Regime` is "Buying". (P↑ O↑ T↑)
@@ -124,7 +124,7 @@ class AlphaTrader:
             * **VETO (Short):** If your calculated TP is $3500, but there is a major 4h Support level at $3600, your trade is INVALID. You MUST ABORT.
         * **Conclusion:** Only submit a trade if its 1.5R target is *clear* of any major opposing S/R levels.
         
-    5.  **Market Sentiment Filter (Fear & Greed Index) - [V-Ultimate+ 优化 - 软化 Veto]**
+    5.  **Market Sentiment Filter (Fear & Greed Index)**
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter.
         -   **Extreme Fear (Index < 25):** Market is capitulating. This is a **strong contrarian signal.**
             -   **Action:** Aggressively seek `LIMIT_BUY` opportunities (Rule 6.2 Ranging/Support).
@@ -148,6 +148,7 @@ class AlphaTrader:
 
         Market State Analysis:
         - 1h ADX: [Value] | 4h ADX: [Value]
+        - Macro Bias (Rule 1.A): [Bullish (Price > 4h EMA) / Bearish (Price < 4h EMA)]
         - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Ranging (ADX<20) / Chop (ADX 20-25)]
         - Market Sentiment: [F&G Index value and its implication, e.g., "Extreme Fear (20): Strongly discouraging Sells, seeking Longs."]
 
@@ -160,6 +161,7 @@ class AlphaTrader:
 
         [EXAMPLE - RULE 6.1 (Trending Pullback):]
         ETH Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
+        - Macro Bias (Rule 1.A): Bullish.
         - Thesis: Price is pulling back to a confluence support zone (4h BB_Mid + 1h EMA 20). 15m RSI is low (38).
         - Data Check: `OI_Regime_1h` is "Rising" AND `Taker_Ratio_1h_Regime` is "Buying". This is a Strong Confirmation (P↑ O↑ T↑).
         - ML Confirmation: ML_Proba_UP = 0.68.
@@ -168,13 +170,11 @@ class AlphaTrader:
         - Final Confidence: High.
         - Plan: PREPARE LIMIT_BUY.
 
-        [EXAMPLE - RULE 4.5 (R:R VETO):]
-        ETH Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
-        - Thesis: Pullback to 1h EMA 20 support at 3550.
-        - SL/TP Plan: Entry=3550. SL=3510 (based on 1.5x ATR). Risk_Distance=40.
-        - R:R Check: Min_Reward_Distance=60 (40 * 1.5). Min_TP=3610 (3550 + 60).
-        - Realism Check: There is a major 4h Resistance at 3600.
-        - Final Confidence: VETO. The minimum 1.5R target (3610) is *behind* a major resistance (3600). This trade is invalid.
+        [EXAMPLE - RULE 1.A (Macro Bias Veto):]
+        SOL Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
+        - Macro Bias (Rule 1.A): Bearish (Price < 4h EMA).
+        - Thesis: Price is approaching 1h BB_Lower support (Rule 6.2).
+        - Final Confidence: VETO. Rule 1.A (Bear Market Bias) HIGHLY DISCOURAGES contrarian LIMIT_BUY plans.
         - Plan: ABORT.
 
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
@@ -269,6 +269,9 @@ class AlphaTrader:
         self.logger.info(f"--- 总共加载了 {len(self.ml_anomaly_detectors)} 个 Anomaly ML 模型 ---")
         
         self.peak_profit_tracker: Dict[str, float] = {}
+
+        # [V-Ultimate V4 修复] 动态安全网的宽限期 (毫秒)
+        self.SAFETY_NET_GRACE_PERIOD_MS = 60 * 60 * 1000 # 1 hour
 
 
     def _setup_log_handler(self):
@@ -875,6 +878,7 @@ class AlphaTrader:
                 except (ValueError, TypeError, KeyError) as e: 
                     self.logger.error(f"跳过 {action} (Python 计算/参数错误): {order}. Err: {e}"); continue
                 
+
                 # [V-Ultimate+PaperFix 修复]
                 # 4. 执行 (实盘或模拟盘)
                 if self.is_live_trading:
@@ -1238,6 +1242,14 @@ class AlphaTrader:
         
         while True:
             try:
+                # [PaperFix] 模拟盘风控 (使用 paper_positions)
+                if not self.is_live_trading:
+                    # (由于模拟盘不支持高频 SL/TP, 我们依赖10s主循环中的 _check_and_execute_hard_stops)
+                    # (这里的 HF 循环主要用于实盘)
+                    await asyncio.sleep(2)
+                    continue
+
+                # --- 实盘风控 ---
                 if self.is_live_trading and self.portfolio.position_manager:
                     
                     open_positions = self.portfolio.position_manager.get_all_open_positions()
@@ -1419,26 +1431,32 @@ class AlphaTrader:
                         continue
                     
                     # 步骤 2: 限价单超时清理 (10s 周期)
-                    if self.is_live_trading and self.portfolio.pending_limit_orders:
+                    # [PaperFix] 模拟盘也需要清理
+                    if self.portfolio.pending_limit_orders:
                         now_ms = time.time() * 1000
-                        orders_to_cancel = []
+                        orders_to_cancel = [] # 仅用于实盘
+                        plans_to_remove = []  # 用于实盘和模拟盘
                         try:
                             for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
                                 order_id = plan.get('order_id')
                                 timestamp = plan.get('timestamp')
                                 if not order_id:
-                                    await self.portfolio.remove_pending_limit_order(symbol)
+                                    plans_to_remove.append(symbol)
                                     continue
                                 if not timestamp:
-                                    orders_to_cancel.append((order_id, symbol))
-                                    await self.portfolio.remove_pending_limit_order(symbol)
+                                    plans_to_remove.append(symbol)
+                                    if self.is_live_trading: orders_to_cancel.append((order_id, symbol))
                                     continue
                                 if (now_ms - timestamp) > LIMIT_ORDER_TIMEOUT_MS:
                                     self.logger.warning(f"TIMEOUT VETO: {symbol} 挂单 {order_id} 超时。正在取消...")
-                                    orders_to_cancel.append((order_id, symbol))
+                                    plans_to_remove.append(symbol)
+                                    if self.is_live_trading: orders_to_cancel.append((order_id, symbol))
+                            
+                            if plans_to_remove:
+                                for symbol in plans_to_remove:
                                     await self.portfolio.remove_pending_limit_order(symbol)
                             
-                            if orders_to_cancel:
+                            if self.is_live_trading and orders_to_cancel:
                                 cancel_tasks = [self.client.cancel_order(oid, sym) for oid, sym in orders_to_cancel]
                                 await asyncio.gather(*cancel_tasks, return_exceptions=True)
                                 self.logger.info(f"Main Loop: 成功取消 {len(orders_to_cancel)} 个超时挂单。")
@@ -1450,12 +1468,15 @@ class AlphaTrader:
                     await self._update_fear_and_greed_index()
                     market_data, tickers = await self._gather_all_market_data()
 
-                    # 步骤 4: [V-Ultimate 优化 V3] 动态安全网 (1h EMA + ATR 缓冲)
+                    # 步骤 4: [V-Ultimate 优化 V4] 动态安全网 (ADX 过滤 + 1.0*ATR 缓冲)
+                    # [PaperFix] 只在实盘运行 (模拟盘有 _check_and_execute_hard_stops)
                     if self.is_live_trading:
-                        self.logger.debug("Checking Dynamic Safety Net (1H EMA + ATR Buffer) for losing positions...")
+                        self.logger.debug("Checking Dynamic Safety Net (V4 - ADX Filtered) for losing positions...")
                         try:
                             open_positions = self.portfolio.position_manager.get_all_open_positions()
                             positions_to_close = []
+                            
+                            ADX_TREND_THRESHOLD = 25 # 仅在 ADX > 25 时激活安全网
 
                             for symbol, state in open_positions.items():
                                 price = tickers.get(symbol, {}).get('last')
@@ -1468,39 +1489,61 @@ class AlphaTrader:
                                 is_losing = (side == 'long' and price < entry) or (side == 'short' and price > entry)
                                 
                                 if is_losing:
-                                    # [V3 优化] 从 market_data 获取 1h EMA 和 1h ATR
+                                    # [V4 修复] 检查仓位是否仍在“宽限期”内
+                                    try:
+                                        entries_list = state.get('entries', [])
+                                        if not entries_list: continue # No entries, skip
+                                        
+                                        # 获取最后一次入场(或加仓)的时间
+                                        last_entry_timestamp = entries_list[-1].get('timestamp', 0)
+                                        time_since_entry = (time.time() * 1000) - last_entry_timestamp
+                                        
+                                        if time_since_entry < self.SAFETY_NET_GRACE_PERIOD_MS:
+                                            self.logger.debug(f"Safety Net V4: {symbol} 仍在宽限期内 (Entry {time_since_entry/60000:.0f}m ago < {self.SAFETY_NET_GRACE_PERIOD_MS/60000:.0f}m)。跳过。")
+                                            continue
+                                            
+                                    except Exception as e_ts:
+                                        self.logger.warning(f"Safety Net V4: 无法获取 {symbol} 的 entry timestamp: {e_ts}。将继续检查。")
+
+                                    # [V4 优化] 从 market_data 获取 1h EMA, 1h ATR, 和 1h ADX
                                     data_1h = market_data.get(symbol, {})
                                     ema_50 = data_1h.get('1hour_ema_50')
                                     atr_14 = data_1h.get('1hour_atr_14') # 获取 1h ATR
+                                    adx_14 = data_1h.get('1hour_adx_14') # 获取 1h ADX
 
-                                    if not ema_50 or not atr_14 or atr_14 <= 0:
-                                        self.logger.warning(f"Safety Net V3: 无法获取 {symbol} 的 1h EMA/ATR 数据。跳过。")
+                                    if not ema_50 or not atr_14 or atr_14 <= 0 or not adx_14:
+                                        self.logger.warning(f"Safety Net V4: 无法获取 {symbol} 的 1h EMA/ATR/ADX 数据。跳过。")
                                         continue
                                     
-                                    # [V3 优化] 定义缓冲带
-                                    ATR_BUFFER_MULTIPLIER = 0.5 
+                                    # [V4 优化] ADX 过滤器
+                                    if adx_14 < ADX_TREND_THRESHOLD:
+                                        self.logger.debug(f"Safety Net V4: {symbol} 处于震荡市 (1h ADX {adx_14:.1f} < {ADX_TREND_THRESHOLD})。安全网已禁用。")
+                                        continue # 市场处于震荡中，禁用 EMA 安全网以防噪音
+                                    
+                                    # [V4 优化] 定义缓冲带 (扩大到 1.0)
+                                    ATR_BUFFER_MULTIPLIER = 1.0 
                                     buffer = atr_14 * ATR_BUFFER_MULTIPLIER
                                     
-                                    # [V3 优化] 检查价格是否突破了“缓冲带”
+                                    # 检查价格是否突破了“缓冲带”
                                     if side == 'long':
                                         stop_line = ema_50 - buffer
                                         if price < stop_line:
-                                            # 多头仓位，价格跌破了 1h EMA 50 减去 0.5x ATR 的缓冲线
-                                            positions_to_close.append((symbol, f"Safety Net V3: Price < (1h_EMA - 0.5*ATR) ({price:.4f} < {stop_line:.4f})"))
+                                            # 多头仓位，价格跌破了 1h EMA 50 减去 1.0x ATR 的缓冲线
+                                            positions_to_close.append((symbol, f"Safety Net V4: Price < (1h_EMA - 1.0*ATR) ({price:.4f} < {stop_line:.4f})"))
                                     elif side == 'short':
                                         stop_line = ema_50 + buffer
                                         if price > stop_line:
-                                            # 空头仓位，价格升破了 1h EMA 50 加上 0.5x ATR 的缓冲线
-                                            positions_to_close.append((symbol, f"Safety Net V3: Price > (1h_EMA + 0.5*ATR) ({price:.4f} > {stop_line:.4f})"))
+                                            # 空头仓位，价格升破了 1h EMA 50 加上 1.0x ATR 的缓冲线
+                                            positions_to_close.append((symbol, f"Safety Net V4: Price > (1h_EMA + 1.0*ATR) ({price:.4f} > {stop_line:.4f})"))
 
                             if positions_to_close:
                                 close_tasks = [self.portfolio.live_close(symbol, reason=reason) for symbol, reason in positions_to_close]
-                                self.logger.warning(f"🔥 动态安全网 V3 (EMA+ATR) 触发: 正在平仓 {len(positions_to_close)} 个仓位。")
+                                self.logger.warning(f"🔥 动态安全网 V4 (ADX Filtered) 触发: 正在平仓 {len(positions_to_close)} 个仓位。")
                                 await asyncio.gather(*close_tasks, return_exceptions=True)
                                 await self.portfolio.sync_state() # 平仓后立即同步
 
                         except Exception as e_safety_net:
-                            self.logger.error(f"动态安全网 V3 (1h EMA + ATR) 检查失败: {e_safety_net}", exc_info=True)
+                            self.logger.error(f"动态安全网 V4 (1h EMA + ATR) 检查失败: {e_safety_net}", exc_info=True)
                     
                     # 步骤 4.5: [V-Ultimate+ 优化] 取消过时/偏差过大的限价单
                     # [PaperFix] 必须在实盘和模拟盘都运行
@@ -1562,6 +1605,7 @@ class AlphaTrader:
 
                     
                     # 步骤 5: [中频] Rule 6 ATR 追踪止损 (10s 周期)
+                    # [PaperFix] 只在实盘运行 (模拟盘有 _check_and_execute_hard_stops)
                     if self.is_live_trading:
                         sl_update_tasks_rule6 = []
                         try:
@@ -1624,7 +1668,7 @@ class AlphaTrader:
 
                                     event, ev_reason = await self._check_divergence(ohlcv_15m)
                                     if not event: event, ev_reason = await self._check_ema_squeeze(ohlcv_15m)
-                                    if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_15m)
+                                    if not event: event, ev_reason = await self._check_rsi_threshold_breach(ohlcv_1S5m)
                                     if not event: event, ev_reason = await self._check_bollinger_band_breach(ohlcv_15m)
                                     
                                     if event: 
