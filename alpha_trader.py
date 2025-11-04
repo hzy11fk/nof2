@@ -1459,7 +1459,7 @@ class AlphaTrader:
                             open_positions = self.portfolio.position_manager.get_all_open_positions()
                             positions_to_close = []
                             
-                            ADX_TREND_THRESHOLD = 25 
+                            ADX_TREND_THRESHOLD = 20 
 
                             for symbol, state in open_positions.items():
                                 price = tickers.get(symbol, {}).get('last')
