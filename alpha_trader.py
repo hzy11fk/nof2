@@ -167,7 +167,7 @@ class AlphaTrader:
         - Final Confidence: VETO. The minimum 1.5R target (3610) is *behind* a major resistance (3600). This trade is invalid.
         - Plan: ABORT.
 
-        In summary, [Your final concise decision overview (in English) goes here.]
+        In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
         ```
 
     2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding.
