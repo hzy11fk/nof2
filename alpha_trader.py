@@ -2,13 +2,22 @@
 # 描述: 
 # 1. (已移除) Rule 8 策略。
 # 2. (已优化) _gather_all_market_data 获取 1h OI Regime。
-# 3. (已优化) SYSTEM_PROMPT_TEMPLATE (V2.3) 包含 F&G, R:R 预检查, Taker Ratio。
+# 3. (已优化) SYSTEM_PROMPT_TEMPLATE (V2.3):
+#    - AI 角色为 "Strategist"。
+#    - Rule 3: 结合 OI 和 Taker Ratio 作为双重信念确认。
+#    - Rule 4.5: AI 必须预先计算 R:R > 1.5。
+#    - Rule 5: (已软化) F&G 指导逻辑，移除了硬 Veto。
 # 4. (已新增) _validate_ai_trade 函数执行所有 Python Veto 规则, 包括 4h EMA 开关。
-# 5. (已优化) _execute_decisions 包含动态风险 (F&G 惩罚 和 ATR 调整)。
+# 5. (已优化) _execute_decisions 包含:
+#    - (新) 针对 F&G 极端情绪的风险惩罚 (风险减半)。
+#    - (新) 基于 ATR 和置信度的动态风险计算。
+#    - (新) Stale Plan Veto (最终价格验证) 防止过时订单成交。
 # 6. (已新增) high_frequency_risk_loop 使用 V3 风险厌恶型阶梯止盈 (1% 启动)。
-# 7. (已新增) start() 循环包含"亏损中"仓位的 1h EMA + ATR 缓冲"动态安全网 V3"。
+# 7. (已新增) start() 循环包含针对"亏损中"仓位的 1h EMA + ATR 缓冲"动态安全网 V3"。
 # 8. (已新增) start() 循环包含"过时限价单" (Stale Order) 自动取消逻辑。
 # 9. (已修复) [TR-BYPASS] 绕过 ccxt，使用专用的 httpx 客户端获取 Taker Ratio，以修复 Testnet URL Bug。
+# 10.(已修复) [PaperFix] _execute_decisions 现在正确调用 paper_open_limit，使模拟盘可用。
+# 11.(已修复) [AsyncioFix] start() 函数的 finally 块移至 while 循环外，防止 httpx 客户端过早关闭。
 
 import logging
 import asyncio
@@ -35,7 +44,7 @@ except ImportError:
 
 class AlphaTrader:
     
-    # --- [AI (Rule 6) 专用 PROMPT (V2.3 - 包含 F&G, R:R 预检查, Taker Ratio)] ---
+    # --- [AI (Rule 6) 专用 PROMPT (V2.3 - 包含 F&G(软), R:R 预检查, Taker Ratio)] ---
     SYSTEM_PROMPT_TEMPLATE = """
     You are an **Expert Market Analyst and Trading Strategist**. Your primary goal is to **identify high-probability trading theses** (the 'Why') based on the provided market data.
 
@@ -54,7 +63,7 @@ class AlphaTrader:
 
     **Python's Task (Do NOT do this yourself):**
     * Python will perform **all** final checks and calculations.
-    * Python will **VETO** your trade if it fails hard rules (e.g., Trend Filter, Anomaly Score, OI Matrix, R:R).
+    * Python will **VETO** your trade if it fails hard rules (e.g., Trend Filter, Anomaly Score, OI Matrix, R:R, Stale Price).
     * Python will **calculate** all final sizing, leverage, and `risk_percent` based on your `confidence_level` AND asset volatility (ATR).
     * Python will **automatically penalize (reduce risk)** for trades against extreme market sentiment (F&G).
     * Python manages all open positions (SL/TP adjustments) via a high-frequency loop.
@@ -106,7 +115,7 @@ class AlphaTrader:
             * **VETO (Short):** If your calculated TP is $3500, but there is a major 4h Support level at $3600, your trade is INVALID. You MUST ABORT.
         * **Conclusion:** Only submit a trade if its 1.5R target is *clear* of any major opposing S/R levels.
         
-    5.  **Market Sentiment Filter (Fear & Greed Index) - [V-Final 优化 #6]**
+    5.  **Market Sentiment Filter (Fear & Greed Index) - [V-Ultimate+ 优化 - 软化 Veto]**
         You MUST use the provided `Fear & Greed Index` (from the User Prompt) as a macro filter.
         -   **Extreme Fear (Index < 25):** Market is capitulating. This is a **strong contrarian signal.**
             -   **Action:** Aggressively seek `LIMIT_BUY` opportunities (Rule 6.2 Ranging/Support).
@@ -304,7 +313,7 @@ class AlphaTrader:
                     # [V-Ultimate 优化] 获取最近 50 根 1h OI
                     return await self.exchange.fetch_open_interest_history(symbol, timeframe='1h', limit=50)
                 except Exception as e:
-                    self.logger.error(f"Safe Fetch OI History Error ({symbol}): {e}", exc_info=False)
+                    self.logger.error(f"Safe Fetch OI History Error ({symbol} {timeframe}): {e}", exc_info=False)
                     return e
 
         # [TR-BYPASS 2/3] 重写 _safe_fetch_taker_ratio 以使用 httpx 而不是 self.client
@@ -694,15 +703,14 @@ class AlphaTrader:
 
         return True, "Validation Passed"
 
-    # [V-Ultimate 重写] _execute_decisions
+    # [V-Ultimate+PaperFix 重写] _execute_decisions
     async def _execute_decisions(self, decisions: list, market_data: Dict[str, Dict[str, Any]]):
         """
-        [V-Ultimate+ 核心] Python 执行者：
+        [V-Ultimate+PaperFix 核心] Python 执行者：
         1. 验证 AI 策略 (Veto 规则)
         2. [优化 #7 & #10] 计算动态 Risk (含 F&G 惩罚 和 ATR 调整)
         3. [BUG 修复] 添加最终价格验证 (Stale Plan Veto)
-        4. 计算 Size
-        5. 执行 (调用 portfolio)
+        4. [BUG 修复] 添加 'else' 块以调用 self.portfolio.paper_open_limit
         """
         MIN_MARGIN_USDT = futures_settings.MIN_NOMINAL_VALUE_USDT
         MIN_SIZE_BTC = 0.001 
@@ -726,8 +734,9 @@ class AlphaTrader:
                 self.logger.info(f"AI 策略 (Python 验证通过): {symbol} | Action: {action} | 原因: {reason}")
 
                 # 2. [V-Ultimate BUG 修复] 最终价格验证 (Stale Plan Veto)
-                # 在下单前获取最新的市场价格，防止 AI 计划基于过时数据
-                limit_price = float(order.get('entry_price')) # 我们需要先获取 limit_price
+                limit_price = float(order.get('entry_price'))
+                fresh_price = 0.0 # 初始化
+                is_immediate_fill = False # [PaperFix] 跟踪是否立即成交
                 
                 try:
                     fresh_ticker = await self.client.fetch_ticker(symbol)
@@ -736,24 +745,28 @@ class AlphaTrader:
                         raise ValueError(f"无法获取 {symbol} 的最新价格")
 
                     deviation_threshold = settings.AI_LIMIT_ORDER_DEVIATION_PERCENT / 100.0 # e.g., 0.02
+                    SLIPPAGE_ALLOWANCE = 0.001 # 0.1% 滑点
                     
                     # 检查1: 订单是否会立即成交 (即 "追市")
-                    # (我们允许一点点滑点，比如 0.1% = 0.001)
-                    SLIPPAGE_ALLOWANCE = 0.001 
                     if action == "LIMIT_BUY" and limit_price > (fresh_price * (1 + SLIPPAGE_ALLOWANCE)):
-                        self.logger.error(f"STALE PLAN VETO (Immediate Fill): {symbol} 挂单价 {limit_price} > 现价 {fresh_price}。")
-                        self.logger.error("AI 计划已过时，订单将立即成交。取消。")
-                        continue
+                        if self.is_live_trading: # 实盘：这是个 Bug，取消
+                            self.logger.error(f"STALE PLAN VETO (Immediate Fill): {symbol} 挂单价 {limit_price} > 现价 {fresh_price}。取消。")
+                            continue
+                        else: # 模拟盘：这是我们可以成交的唯一机会
+                            is_immediate_fill = True
+                            
                     if action == "LIMIT_SELL" and limit_price < (fresh_price * (1 - SLIPPAGE_ALLOWANCE)):
-                        self.logger.error(f"STALE PLAN VETO (Immediate Fill): {symbol} 挂单价 {limit_price} < 现价 {fresh_price}。")
-                        self.logger.error("AI 计划已过时，订单将立即成交。取消。")
-                        continue
+                        if self.is_live_trading: # 实盘：这是个 Bug，取消
+                            self.logger.error(f"STALE PLAN VETO (Immediate Fill): {symbol} 挂单价 {limit_price} < 现价 {fresh_price}。取消。")
+                            continue
+                        else: # 模拟盘：这是我们可以成交的唯一机会
+                            is_immediate_fill = True
                         
-                    # 检查2: 挂单是否与 *新* 价格相差太远 (同 Step 4.5 逻辑)
+                    # 检查2: 挂单是否与 *新* 价格相差太远
                     deviation_pct = abs(fresh_price - limit_price) / limit_price
                     if deviation_pct > deviation_threshold:
-                        self.logger.error(f"STALE PLAN VETO (Deviation): {symbol} 挂单价 {limit_price} 与 *最新*现价 {fresh_price} 偏离 ({deviation_pct:.2%}) > 阈值 ({deviation_threshold:.2%})。")
-                        self.logger.error("AI 计划已过时。取消。")
+                        # 这个 Veto 对实盘和模拟盘都有效
+                        self.logger.error(f"STALE PLAN VETO (Deviation): {symbol} 挂单价 {limit_price} 与 *最新*现价 {fresh_price} 偏离 ({deviation_pct:.2%}) > 阈值。取消。")
                         continue
 
                 except Exception as e_fresh_price:
@@ -764,7 +777,6 @@ class AlphaTrader:
                 # 3. 计算 Risk/Leverage/Size (如果验证通过)
                 
                 # AI 提供的策略参数
-                # (limit_price 已在上面获取)
                 stop_loss = float(order.get('stop_loss_price'))
                 take_profit = float(order.get('take_profit_price'))
                 confidence = order.get('confidence_level', 'Medium')
@@ -790,39 +802,36 @@ class AlphaTrader:
                 
                 # c. [V-Ultimate 优化 #7] 根据波动性调整风险
                 try:
-                    # 注意：我们使用 *旧* 的 market_data 来获取 ATR，这没问题
                     data = market_data.get(symbol)
                     atr_1h = data.get('1hour_atr_14')
                     price = data.get('current_price') # 使用旧价格进行 ATR 百分比计算
                     
                     if atr_1h and price and price > 0:
                         atr_pct = (atr_1h / price) # 1小时 ATR 百分比
-                        
-                        # 示例逻辑: 1h ATR 超过 1.5% (0.015) 认为是高波动，应降低风险
                         if atr_pct > 0.015: 
-                            volatility_factor = 0.75 # 波动性高，风险降低 25%
-                            # 注意：我们惩罚两次（如果情绪和波动率都触发）
+                            volatility_factor = 0.75
                             risk_percent_final = risk_percent_final * volatility_factor 
                             self.logger.info(f"动态风险调整: {symbol} 波动率高 ({atr_pct:.2%})，风险进一步调降至 {risk_percent_final}")
                         
                 except Exception as e_vol:
                     self.logger.error(f"动态风险计算失败: {e_vol}，将使用(可能已被情绪惩罚的)风险 {risk_percent_final}")
                 
-                # d. 确定 Leverage (使用固定杠杆 - 优化 #8 的结论)
+                # d. 确定 Leverage (使用固定杠杆)
                 leverage = int(futures_settings.FUTURES_LEVERAGE) 
                 
-                # e. 检查是否为模拟盘
-                if not self.is_live_trading:
-                    self.logger.warning(f"模拟盘：跳过 {action} 执行 (逻辑已验证)。"); continue
-                
-                # f. [复用逻辑] 计算保证金和规模
-                
+                # e. [复用逻辑] 计算保证金和规模
+                # [PaperFix] 我们在实盘和模拟盘中都需要计算 size
+                final_size = 0.0
                 try:
-                    total_equity = float(self.portfolio.equity)
-                    available_cash = float(self.portfolio.cash)
+                    if self.is_live_trading:
+                        total_equity = float(self.portfolio.equity)
+                        available_cash = float(self.portfolio.cash)
+                    else:
+                        total_equity = float(self.portfolio.paper_equity)
+                        available_cash = float(self.portfolio.paper_cash)
+
                     if total_equity <= 0: raise ValueError(f"无效账户状态 (Equity <= 0)")
                     
-                    # [重要] 使用 risk_percent_final 来计算
                     calculated_desired_margin = total_equity * risk_percent_final
                     
                     max_margin_cap = total_equity * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
@@ -830,7 +839,8 @@ class AlphaTrader:
                         self.logger.warning(f"!!! {action} Margin Capped !!! AI 期望保证金 {calculated_desired_margin:.2f} > 最大 {max_margin_cap:.2f}")
                         calculated_desired_margin = max_margin_cap
 
-                    if calculated_desired_margin > available_cash:
+                    # 模拟盘跳过现金检查 (因为保证金是虚拟的)
+                    if self.is_live_trading and (calculated_desired_margin > available_cash):
                         self.logger.error(f"!!! {action} Aborted (Cash Insufficient) !!! AI 期望保证金 {calculated_desired_margin:.2f} > 可用 {available_cash:.2f}")
                         continue
                     
@@ -847,7 +857,7 @@ class AlphaTrader:
                             self.logger.warning(f"!!! {action} BTC Size Adjusted !!! 计算后 size {final_size} < 最小 {MIN_SIZE_BTC}. 正在上调。")
                             final_size = MIN_SIZE_BTC
                             recalculated_margin = (final_size * limit_price) / leverage
-                            if recalculated_margin > available_cash:
+                            if self.is_live_trading and (recalculated_margin > available_cash):
                                 self.logger.error(f"!!! {action} Aborted (Cash Insufficient for Min BTC Size) !!! 最小 BTC size 需要 {recalculated_margin:.2f} 保证金 > 可用 {available_cash:.2f}")
                                 continue
                     
@@ -856,19 +866,37 @@ class AlphaTrader:
                 except (ValueError, TypeError, KeyError) as e: 
                     self.logger.error(f"跳过 {action} (Python 计算/参数错误): {order}. Err: {e}"); continue
                 
-                # 4. 执行 (调用 portfolio)
-                await self.portfolio.live_open_limit(
-                    symbol, 
-                    'long' if action == 'LIMIT_BUY' else 'short', 
-                    final_size, 
-                    leverage, 
-                    limit_price,
-                    reason=ai_thesis, 
-                    stop_loss=stop_loss, 
-                    take_profit=take_profit, 
-                    invalidation_condition=f"AI V2.3 ({confidence})" # 使用 Invalidation 字段记录信心
-                )
-
+                # [V-Ultimate+PaperFix 修复]
+                # 4. 执行 (实盘或模拟盘)
+                if self.is_live_trading:
+                    # --- [A] 实盘逻辑 (Live Trading) ---
+                    await self.portfolio.live_open_limit(
+                        symbol, 
+                        'long' if action == 'LIMIT_BUY' else 'short', 
+                        final_size, 
+                        leverage, 
+                        limit_price,
+                        reason=ai_thesis, 
+                        stop_loss=stop_loss, 
+                        take_profit=take_profit, 
+                        invalidation_condition=f"AI V2.3 ({confidence})"
+                    )
+                
+                else:
+                    # --- [B] 模拟盘逻辑 (Paper Trading) ---
+                    # [PaperFix] 调用新的 paper_open_limit 函数
+                    await self.portfolio.paper_open_limit(
+                        symbol, 
+                        'long' if action == 'LIMIT_BUY' else 'short', 
+                        final_size, 
+                        leverage, 
+                        limit_price,
+                        reason=ai_thesis, 
+                        stop_loss=stop_loss, 
+                        take_profit=take_profit, 
+                        invalidation_condition=f"AI V2.3 ({confidence})"
+                    )
+                
             except Exception as e: 
                 self.logger.error(f"处理 AI 指令时意外错误: {order}. Err: {e}", exc_info=True)
 
@@ -878,7 +906,7 @@ class AlphaTrader:
         self.logger.info("Checking hard TP/SL (Paper)..."); to_close = []; tickers = {}
         try: tickers = await self.exchange.fetch_tickers(self.symbols)
         except Exception as e: self.logger.error(f"Hard stop failed: Fetch Tickers err: {e}"); return False
-        for symbol, pos in list(self.portfolio.paper_positions.items()):
+        for symbol, pos in list(self.paper_positions.items()):
             if not pos or not isinstance(pos, dict) or pos.get('size', 0) <= 0: continue
             price = tickers.get(symbol, {}).get('last');
             if not price: self.logger.warning(f"Hard stop skipped: No price {symbol}."); continue
@@ -1353,6 +1381,7 @@ class AlphaTrader:
                 self.logger.critical(f"HF Risk Loop 致命错误: {e}", exc_info=True); 
                 await asyncio.sleep(10)
 
+
     async def start(self):
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
         if self.is_live_trading:
@@ -1465,38 +1494,63 @@ class AlphaTrader:
                             self.logger.error(f"动态安全网 V3 (1h EMA + ATR) 检查失败: {e_safety_net}", exc_info=True)
                     
                     # 步骤 4.5: [V-Ultimate+ 优化] 取消过时/偏差过大的限价单
+                    # [PaperFix] 必须在实盘和模拟盘都运行
+                    deviation_threshold = settings.AI_LIMIT_ORDER_DEVIATION_PERCENT / 100.0 # e.g., 0.02
+                    
                     if self.is_live_trading and self.portfolio.pending_limit_orders:
-                        self.logger.debug("Checking for stale (price deviation) limit orders...")
+                        # --- [A] 实盘逻辑 ---
+                        self.logger.debug("Checking for stale (price deviation) LIVE limit orders...")
                         try:
                             orders_to_cancel = []
-                            deviation_threshold = settings.AI_LIMIT_ORDER_DEVIATION_PERCENT / 100.0 # e.g., 0.02
-                            
                             for symbol, plan in self.portfolio.pending_limit_orders.items():
                                 current_price = tickers.get(symbol, {}).get('last')
                                 plan_price = plan.get('limit_price')
                                 order_id = plan.get('order_id')
 
                                 if not all([current_price, plan_price, order_id]):
-                                    self.logger.warning(f"Stale Price Check: 缺少 {symbol} 的价格或计划数据。")
+                                    self.logger.warning(f"Stale Price Check (Live): 缺少 {symbol} 的价格或计划数据。")
                                     continue
                                 
-                                # 计算价格偏离百分比
                                 deviation_pct = abs(current_price - plan_price) / plan_price
-                                
                                 if deviation_pct > deviation_threshold:
-                                    # 价格已偏离太多，取消这个挂单
-                                    self.logger.warning(f"STALE PRICE VETO: {symbol} 挂单价 {plan_price} 与现价 {current_price} 偏离 ({deviation_pct:.2%}) > 阈值 ({deviation_threshold:.2%})。正在取消...")
+                                    self.logger.warning(f"STALE PRICE VETO (Live): {symbol} 挂单价 {plan_price} 与现价 {current_price} 偏离 ({deviation_pct:.2%}) > 阈值。正在取消...")
                                     orders_to_cancel.append((order_id, symbol))
-                                    # 立即从 portfolio 中移除，防止重复处理
                                     await self.portfolio.remove_pending_limit_order(symbol)
 
                             if orders_to_cancel:
                                 cancel_tasks = [self.client.cancel_order(oid, sym) for oid, sym in orders_to_cancel]
                                 await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                                self.logger.info(f"Stale Price Check: 成功取消 {len(orders_to_cancel)} 个过时挂单。")
+                                self.logger.info(f"Stale Price Check (Live): 成功取消 {len(orders_to_cancel)} 个过时挂单。")
 
                         except Exception as e_stale_check:
-                             self.logger.error(f"过时挂单 (Stale Price) 检查失败: {e_stale_check}", exc_info=True)
+                             self.logger.error(f"过时挂单 (Live) 检查失败: {e_stale_check}", exc_info=True)
+                    
+                    elif (not self.is_live_trading) and self.portfolio.pending_limit_orders:
+                         # --- [B] 模拟盘逻辑 ---
+                        self.logger.debug("Checking for stale (price deviation) PAPER limit orders...")
+                        try:
+                            plans_to_remove = []
+                            for symbol, plan in self.portfolio.pending_limit_orders.items():
+                                current_price = tickers.get(symbol, {}).get('last')
+                                plan_price = plan.get('limit_price')
+
+                                if not all([current_price, plan_price]):
+                                    self.logger.warning(f"Stale Price Check (Paper): 缺少 {symbol} 的价格或计划数据。")
+                                    continue
+                                
+                                deviation_pct = abs(current_price - plan_price) / plan_price
+                                if deviation_pct > deviation_threshold:
+                                    self.logger.warning(f"STALE PRICE VETO (Paper): {symbol} 挂单价 {plan_price} 与现价 {current_price} 偏离 ({deviation_pct:.2%}) > 阈值。正在移除...")
+                                    plans_to_remove.append(symbol)
+
+                            if plans_to_remove:
+                                for symbol in plans_to_remove:
+                                    await self.portfolio.remove_pending_limit_order(symbol) # 只移除计划，不调用 cancel
+                                self.logger.info(f"Stale Price Check (Paper): 成功移除 {len(plans_to_remove)} 个过时模拟挂单。")
+                        
+                        except Exception as e_stale_paper_check:
+                             self.logger.error(f"过时模拟挂单 (Paper) 检查失败: {e_stale_paper_check}", exc_info=True)
+
                     
                     # 步骤 5: [中频] Rule 6 ATR 追踪止损 (10s 周期)
                     if self.is_live_trading:
