@@ -86,6 +86,43 @@ class ExchangeClient:
     # --- [ V-FIX 2 结束 ] ---
 
     # --- [ V-FIX 4: 导致崩溃的 Taker Ratio 函数已被移除 ] ---
+# [V-Ultimate 优化] 新增 Taker Ratio 方法
+    
+# [V-Ultimate 优化] 新增 Taker Ratio 方法
+    async def fetch_taker_long_short_ratio(self, symbol: str, period: str = '1h', limit: int = 21, params={}):
+        """
+        [V-Ultimate 新增] 获取币安合约 Taker 多空比 (非 CCXT 标准方法)。
+        这会直接调用 ccxt.binance.request() 方法。
+        """
+        if not hasattr(self.exchange, 'request'):
+            self.logger.error("Internal exchange object has no 'request' method. Cannot fetch Taker Ratio.")
+            raise NotImplementedError("Exchange object does not support raw 'request' calls.")
+
+        # [V3 修复] path 只是端点名称。
+        path = 'takerlongshortRatio'
+        
+        market_id = self.exchange.market_id(symbol)
+        
+        request_params = {
+            'symbol': market_id,
+            'period': period,
+            'limit': limit,
+            **params
+        }
+        
+        try:
+            # [V3 修复] API 组必须是 'futuresData' 而不是 'fapiPublic'
+            response = await self._retry_async_method(
+                self.exchange.request,
+                path,
+                'futuresData',  # <-- V3 关键修复
+                'GET',
+                request_params
+            )
+            return response
+        except Exception as e:
+            self.logger.error(f"Failed to fetch taker ratio for {symbol} via self.exchange.request: {e}")
+            raise
 
     async def fetch_balance(self, params={}):
         """获取余额，并应用重试逻辑。"""
