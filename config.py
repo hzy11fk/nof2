@@ -52,6 +52,7 @@ class Settings(BaseSettings):
 
     # AI 事件触发器 (如背离、RSI越界) 的冷却时间 (分钟)
     AI_INDICATOR_TRIGGER_COOLDOWN_MINUTES: int = 14
+    AI_LIMIT_ORDER_DEVIATION_PERCENT: float = 2.0   # 价格偏离挂单价 2.0% 时，自动取消
 
     # AI (Rule 6) 限价单的超时时间 (秒)
     AI_LIMIT_ORDER_TIMEOUT_SECONDS: int = 900
