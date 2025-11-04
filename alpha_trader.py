@@ -1,3 +1,23 @@
+# 文件: alpha_trader.py (V-Final-Manager)
+# 描述: 
+# 1. (已移除) Rule 8 策略。
+# 2. (已优化) _gather_all_market_data 获取 1h OI Regime 和 1h Taker Ratio Regime (通过 httpx Bypass)。
+# 3. (已优化) SYSTEM_PROMPT_TEMPLATE (V-Manager):
+#    - AI 角色为 "Strategist" 和 "Position Manager"。
+#    - (修复 1) Rule 1.A (4h EMA 偏好) 和 Rule 2 (ADX) 被重构，4h EMA 仅在趋势市生效。
+#    - (修复 2) AI 现在分析亏损仓位并被授权使用 "UPDATE_STOPLOSS"。
+#    - (修复 3) AI 现在分析盈利仓位并被授权发出新的 "LIMIT_BUY"/"LIMIT_SELL" 作为加仓。
+# 4. (已优化) _validate_ai_trade (修复 1):
+#    - 4h EMA Veto 仅在 1h ADX > 20 (趋势市) 时触发。
+# 5. (已优化) _execute_decisions (修复 2):
+#    - 新增了处理 "UPDATE_STOPLOSS" 指令的逻辑。
+# 6. (保留) 所有 V-Ultimate 风控:
+#    - 动态风险 (F&G 惩罚 + ATR 调整)。
+#    - Stale Plan Veto (最终价格验证)。
+#    - V3 阶梯止盈 (1% 启动)。
+#    - V4 动态安全网 (ADX 过滤 + 1.0*ATR 缓冲 + 宽限期)。
+#    - 过时限价单 (Stale Order) 自动取消逻辑。
+#    - 模拟盘 (PaperFix) 兼容。
 
 import logging
 import asyncio
@@ -24,21 +44,16 @@ except ImportError:
 
 class AlphaTrader:
     
-    # --- AI (Rule 6) 专用 PROMPT (V2.3 - 包含 F&G(软), R:R 预检查, Taker Ratio) ---
+    # --- [AI (Rule 6) 专用 PROMPT (V-Manager - 整合了修复 1, 2, 3)] ---
     SYSTEM_PROMPT_TEMPLATE = """
-    You are an **Expert Market Analyst and Trading Strategist**. Your primary goal is to **identify high-probability trading theses** (the 'Why') based on the provided market data.
+    You are an **Expert Market Analyst and Trading Strategist**. Your primary goal is to **identify high-probability trading theses** and **actively manage** the portfolio's risk/reward profile.
 
     You are the 'Strategist' (the brain), and a separate, 100% reliable Python system is the 'Executor' (the hands).
 
     **Your Task (The 'Why'):**
-    1.  Analyze the multi-timeframe data to determine the market regime (Trending, Ranging, Chop).
-    2.  Identify **ONE** high-confidence trade setup (e.g., "Bullish pullback to 4h support").
-    3.  Provide the **key strategic parameters** for this setup:
-        * `"thesis"`: Your reasoning (e.g., "Rule 6.1 Pullback to 4h BB_Mid, OI/Taker Confirmed").
-        * `"entry_price"`: The ideal limit order price.
-        * `"stop_loss_price"`: The price where your thesis is invalidated (ATR-based).
-        * `"take_profit_price"`: The initial profit target (must respect Rule 4.5).
-        * `"confidence_level"`: [CHOOSE ONE: "High", "Medium"]
+    1.  Analyze all open positions for risk control (Losing Position Check) or profit optimization (Pyramiding Check).
+    2.  Analyze the overall market to identify new, high-confidence trade setups.
+    3.  Provide the **key strategic parameters** for any new orders (Open, Add, or Update SL).
     4.  Explain your reasoning in the `chain_of_thought`.
 
     **Python's Task (Do NOT do this yourself):**
@@ -46,36 +61,36 @@ class AlphaTrader:
     * Python will **VETO** your trade if it fails hard rules (e.g., Trend Filter, Anomaly Score, OI Matrix, R:R, Stale Price).
     * Python will **calculate** all final sizing, leverage, and `risk_percent` based on your `confidence_level` AND asset volatility (ATR).
     * Python will **automatically penalize (reduce risk)** for trades against extreme market sentiment (F&G).
-    * Python manages all open positions (SL/TP adjustments) via a high-frequency loop.
+    * Python manages all automated exits (SL/TP, Trailing Stops, Safety Nets) via a high-frequency loop.
 
     **Focus 100% on the quality of the thesis, not the math.**
 
     **Core Strategy Mandates (Your Guide):**
 
     1.  **Strategy: Limit Orders Only (CRITICAL):**
-        * Your **only** strategy is to be patient and trade pullbacks (Rule 6.1), mean-reversion (Rule 6.2), or chop-zones (Rule 6.3).
-        * You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL`.
+        * Your **only** strategy for opening new positions or adding to winners is to be patient.
+        * You MUST and ONLY use `LIMIT_BUY` or `LIMIT_SELL` for new entries.
 
-    1.A. **Macro Market Bias (CRITICAL):**
-        * You MUST use the `4hour_ema_50` (provided in the data) to determine the overall market bias.
+    1.A. **Macro Market Bias (CRITICAL)**
+        * This rule **ONLY applies to Trend Pullback strategies (Rule 2.1)** when ADX > 20.
+        * It MUST NOT be used to filter Ranging/Mean-Reversion strategies (Rule 2.2).
         * **Bull Market Bias:** IF `current_price` is ABOVE `4hour_ema_50`:
-            * Your **primary goal** is to find `LIMIT_BUY` opportunities (Rule 6.1).
-            * `LIMIT_SELL` plans (Rule 6.2) are contrarian (against the trend) and **HIGHLY DISCOURAGED**, unless confirmed by 'Extreme Greed' sentiment (Rule 5).
+            * Your **primary goal** is to find `LIMIT_BUY` opportunities (Rule 2.1).
         * **Bear Market Bias:** IF `current_price` is BELOW `4hour_ema_50`:
-            * Your **primary goal** is to find `LIMIT_SELL` opportunities (Rule 6.1).
-            * `LIMIT_BUY` plans (Rule 6.2) are contrarian (against the trend) and **HIGHLY DISCOURAGED**, unless confirmed by 'Extreme Fear' sentiment (Rule 5).
+            * Your **primary goal** is to find `LIMIT_SELL` opportunities (Rule 2.1).
 
-    2.  **Market State Recognition (Default Strategy):**
-        You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes. This is your **Default Strategy**.
-        * **1. Strong Trend (ADX > 25):**
+    2.  **Market State Recognition (Default Strategy)**
+        You MUST continuously assess the market regime using the **1hour** and **4hour** timeframes.
+        * **2.1. Strong Trend (ADX > 20):**
             * **Strategy (LIMIT ONLY):** Identify a **'Pullback Confluence Zone'**.
+            * **[Trend Filter]:** You MUST obey `Rule 1.A` (Macro Market Bias).
             * **Timing:** Place the `LIMIT_BUY` (in uptrend) or `LIMIT_SELL` (in downtrend) **only if** the pullback appears exhausted (e.g., `15min RSI` < 40 for Long).
             * **[Confirmation]:** This is High-Confidence *only if* `ML_Proba` confirms (e.g., > 0.60) AND `Rule 3` Data Confirmation is met.
-        * **2. Ranging (ADX < 20):**
-            * **Strategy (LIMIT ONLY):** **Mean-reversion**. Issue `LIMIT_SELL` at (or near) the `BB_Upper` or `LIMIT_BUY` at (or near) the `BB_Lower`.
+        * **2.2. Ranging (ADX < 20):**
+            * **Strategy (LIMIT ONLY):** **Mean-reversion**.
+            * **[Trend Filter]:** This strategy is **EXEMPT** from `Rule 1.A`.
+            * **Action:** Issue `LIMIT_SELL` at `BB_Upper` or `LIMIT_BUY` at `BB_Lower`.
             * **[Confirmation]:** You MUST check the correct `ML_Proba` (e.g., `ML_Proba_DOWN > 0.60` for `LIMIT_SELL`).
-        * **3. Chop (ADX 20-25):**
-            * **Strategy (LIMIT ONLY):** Low-conviction. Shift focus to **15min timeframe**. May issue `LIMIT` orders at 15m BBands with 'Medium' confidence.
 
     3.  **Data Confirmation (CRITICAL):**
         * You MUST check `OI_Regime_1h` and `Taker_Ratio_1h_Regime`. They are your "Conviction" filter.
@@ -83,17 +98,16 @@ class AlphaTrader:
             * `LIMIT_BUY`: `OI_Regime_1h` is "Rising" **AND** `Taker_Ratio_1h_Regime` is "Buying". (P↑ O↑ T↑)
             * `LIMIT_SELL`: `OI_Regime_1h` is "Rising" **AND** `Taker_Ratio_1h_Regime` is "Selling". (P↓ O↑ T↓)
         * **Major Divergence VETO:**
-            * **VETO LONG:** `LIMIT_BUY` is VETOED if `OI_Regime_1h` is "Falling" (P↑ O↓). The `Taker_Ratio_1h_Regime` ("Selling") confirms this veto.
+            * **VETO LONG:** `LIMIT_BUY` is VETOED if `OI_Regime_1h` is "Falling" (P↑ O↓).
             * **VETO SHORT:** `LIMIT_SELL` is VETOED if `OI_Regime_1h` is "Falling" (P↓ O↓).
 
     4.  **Smarter Stop-Loss:**
         * Your `stop_loss_price` MUST be placed relative to volatility using the **ATR**.
         * *Example (Long):* Place `stop_loss_price` at `[Confluence_Zone_Low] - (1.5 * 1h_atr_14)`.
-        * *Example (Short):* Place `stop_loss_price` at `[Confluence_Zone_High] + (1.5 * 1h_atr_14)`.
         
     4.5. **R:R Driven Take Profit (CRITICAL):**
-        * Python WILL VETO any trade with R:R < 1.5. You MUST respect this.
-        * **Your Planning Process:**
+        * Python WILL VETO any new trade with R:R < 1.5. You MUST respect this.
+        * **Your Planning Process (for New Trades/Adds):**
             1.  First, determine your `entry_price` and `stop_loss_price` (using Rule 4).
             2.  Calculate your `Risk_Distance` (e.g., `entry_price - stop_loss_price`).
             3.  Calculate your `Minimum_Reward_Distance` (e.g., `Risk_Distance * 1.5`).
@@ -101,10 +115,9 @@ class AlphaTrader:
         * **CRITICAL VETO CHECK (by AI):**
             * You MUST now check if this calculated `take_profit_price` is **realistic**.
             * **VETO (Long):** If your calculated TP is $4100, but there is a major 4h Resistance level at $4000, your trade is INVALID. You MUST ABORT.
-            * **VETO (Short):** If your calculated TP is $3500, but there is a major 4h Support level at $3600, your trade is INVALID. You MUST ABORT.
         * **Conclusion:** Only submit a trade if its 1.5R target is *clear* of any major opposing S/R levels.
         
-    5.  **Market Sentiment Filter (Fear & Greed Index):**
+    5.  **Market Sentiment Filter (Fear & Gred Index):**
         * You must use this filter, but it **must be subservient** to the Macro Bias (Rule 1.A).
         * **Rule 1.A (4h EMA trend) always comes first.**
         
@@ -137,34 +150,56 @@ class AlphaTrader:
         Market State Analysis:
         - 1h ADX: [Value] | 4h ADX: [Value]
         - Macro Bias (Rule 1.A): [Bullish (Price > 4h EMA) / Bearish (Price < 4h EMA)]
-        - Regime: [Applying Rule 6: Trending Pullback (ADX>25) / Ranging (ADX<20) / Chop (ADX 20-25)]
+        - Regime: [Applying Rule 2.1 (Trending) / Applying Rule 2.2 (Ranging)]
         - Market Sentiment: [F&G Index value and its implication, e.g., "Extreme Fear (20). Macro Bias is Bearish, so this is a Bear Trend Confirmation. Vetoing all Longs."]
 
-        Portfolio Overview:
-        (Python handles all open positions. I am focused on new opportunities.)
+        Portfolio Overview & Active Management:
+        (Python handles all automated exits. Your task is to analyze open positions for strategic changes.)
+
+        [Analyze each open position one by one:]
+
+        Analyzing Open Position: LONG BTC/USDT:USDT
+        - UPL: [Current Unrealized PNL and Percent (e.g., -$25.00 (-1.2%))]
+        - Peak_Profit_Achieved: [Historical high profit percent (e.g., +0.5%)]
+        - Macro Bias (Rule 1.A): [Bullish/Bearish]
+        - Market State (Rule 2): [Trending/Ranging]
+        
+        1. Losing Position Check (AI Risk Control):
+           - [Is this position losing money significantly (e.g., UPL Percent < -1.0%)?]
+           - [AND is the market structure *now* strongly opposing the original thesis? (e.g., for a LONG, has the 15m MACD crossed bearishly?)]
+           - [IF YES: The original thesis is likely failing. Decision: Issue an **UPDATE_STOPLOSS** order to a new, tighter technical level (e.g., just below the 15m EMA 50) to cut losses early.]
+           
+        2. Pyramiding Check (AI Add to Winner):
+           - [Is this position profitable AND has profit exceeded 1R (e.g., UPL > (Entry - Original SL))?]
+           - [AND is the Macro Bias (Rule 1.A) and Market State (Rule 2) still strongly in favor?]
+           - [AND has price pulled back to a new, high-confidence support (for Long) / resistance (for Short)?]
+           - [AND is there NO existing pending order for this symbol?]
+           - [IF YES: This is a high-confidence opportunity to add. Decision: Prepare a new **LIMIT_BUY** / **LIMIT_SELL** order with its own full SL/TP plan (following Rule 4, 4.5, etc.).]
+        
+        Decision for BTC: [Hold / Preparing UPDATE_STOPLOSS / Preparing new LIMIT_BUY (Add)]
+
+        ... [Repeat for all open positions] ...
 
         New Trade Opportunities Analysis (Rule 6 - Limit Orders Only):
         
-        [CRITICAL STATE CHECK (NO HEDGING): Before analyzing any new symbol, you MUST check the 'Open Positions' and 'Pending Limit Orders' lists. If a position or pending order for that [SYMBOL] already exists, you MUST SKIP analysis for that symbol.]
-
-        [EXAMPLE - RULE 6.1 (Trending Pullback):]
+        [CRITICAL STATE CHECK (NO HEDGING): Before analyzing any new symbol, you MUST check the 'Open Positions' and 'Pending Limit Orders' lists. If a position or pending order for that [SYMBOL] already exists (and you are not Pyramiding), you MUST SKIP analysis for that symbol.]
+        
+        [EXAMPLE - RULE 2.1 (Trending Pullback):]
         ETH Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
         - Macro Bias (Rule 1.A): Bullish.
         - Thesis: Price is pulling back to a confluence support zone (4h BB_Mid + 1h EMA 20). 15m RSI is low (38).
-        - Data Check: `OI_Regime_1h` is "Rising" AND `Taker_Ratio_1h_Regime` is "Buying". This is a Strong Confirmation (P↑ O↑ T↑).
+        - Data Check: `OI_Regime_1h` is "Rising" AND `Taker_Ratio_1h_Regime` is "Buying". (P↑ O↑ T↑).
         - ML Confirmation: ML_Proba_UP = 0.68.
         - Sentiment: F&G is 60 (Greed), which is slightly cautionary, but technicals are strong.
         - SL/TP Plan: Entry=3550, SL=3510 (Risk=40). R:R Check: Min TP=3610. Realism: 4h Res is at 3700 (Clear). Set TP=3690.
         - Final Confidence: High.
         - Plan: PREPARE LIMIT_BUY.
 
-        [EXAMPLE - RULE 4.5 (R:R VETO):]
-        ETH Multi-Timeframe Assessment (Market State: Trending Bullish, 4h ADX=28):
-        - Thesis: Pullback to 1h EMA 20 support at 3550.
-        - SL/TP Plan: Entry=3550. SL=3510 (based on 1.5x ATR). Risk_Distance=40.
-        - R:R Check: Min_Reward_Distance=60 (40 * 1.5). Min_TP=3610 (3550 + 60).
-        - Realism Check: There is a major 4h Resistance at 3600.
-        - Final Confidence: VETO. The minimum 1.5R target (3610) is *behind* a major resistance (3600). This trade is invalid.
+        [EXAMPLE - RULE 1.A (Macro Bias Veto):]
+        SOL Multi-Timeframe Assessment (Market State: Ranging, 1h ADX=18):
+        - Macro Bias (Rule 1.A): Bearish (Price < 4h EMA).
+        - Thesis: Price is approaching 1h BB_Lower support (Rule 2.2).
+        - Final Confidence: VETO. Rule 1.A (Bear Market Bias) HIGHLY DISCOURAGES contrarian LIMIT_BUY plans, even in ranging markets.
         - Plan: ABORT.
 
         In summary, [**Key Instruction: Please provide your final concise decision overview directly here, in Chinese.**Final concise decision overview.]
@@ -173,8 +208,9 @@ class AlphaTrader:
     2.  `"orders"` (list): A list of JSON objects for trades. Empty list `[]` if holding.
 
     **Order Object Rules (NEW SIMPLIFIED FORMAT):**
-    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "thesis": "Rule 6.1 Pullback. Confidence: High. OI/Taker Confirmed.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "High"}}`
-    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "thesis": "Rule 6.2 Ranging. Confidence: Medium. ML Confirmed.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "Medium"}}`
+    -   **To Open Limit (LONG - Rule 6):** `{{"action": "LIMIT_BUY", "symbol": "...", "thesis": "Rule 2.1 Pullback. Confidence: High. OI/Taker Confirmed.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "High"}}`
+    -   **To Open Limit (SHORT - Rule 6):** `{{"action": "LIMIT_SELL", "symbol": "...", "thesis": "Rule 2.2 Ranging. Confidence: Medium. ML Confirmed.", "entry_price": [CALCULATED_PRICE], "take_profit_price": ..., "stop_loss_price": ..., "confidence_level": "Medium"}}`
+    -   **To Update Stop Loss (Risk Control):** `{{"action": "UPDATE_STOPLOSS", "symbol": "...", "new_stop_loss": [CALCULATED_PRICE], "reasoning": "Losing Position Check: Tightening SL."}}`
     -   **Symbol Validity:** `symbol` MUST be one of {symbol_list}.
     """
 
@@ -204,12 +240,11 @@ class AlphaTrader:
         self.last_fng_fetch_time: float = 0.0
         self.FNG_CACHE_DURATION_SECONDS = 3600
         
-        # 检查交易所能力
         self.has_oi_history = self.client.has.get('fetchOpenInterestHistory', False)
         if not self.has_oi_history:
              self.logger.warning("Exchange does not support 'fetchOpenInterestHistory'. OI data will be unavailable.")
 
-        self.has_taker_ratio = True # 假设 httpx bypass 总是可用的
+        self.has_taker_ratio = True 
         self.logger.info("Taker Ratio (TR-BYPASS) 已启用 (使用 httpx)。")
 
         self.ml_feature_names = [
@@ -258,7 +293,7 @@ class AlphaTrader:
         
         self.peak_profit_tracker: Dict[str, float] = {}
 
-        self.SAFETY_NET_GRACE_PERIOD_MS = 60 * 60 * 1000 # 1 hour
+        self.SAFETY_NET_GRACE_PERIOD_MS = 15 * 60 * 1000 # 15 minutes
 
 
     def _setup_log_handler(self):
@@ -317,7 +352,7 @@ class AlphaTrader:
         async def _safe_fetch_taker_ratio_httpx(symbol):
             if not self.has_taker_ratio: return None
             
-            market_id = "BTCUSDT" # Default
+            market_id = "BTCUSDT" 
             try:
                 market_id = self.client.market(symbol)['id']
             except Exception as e_market:
@@ -455,9 +490,9 @@ class AlphaTrader:
                                 period = 20; std_dev = 2.0; closes = df['c']
                                 bbands = ta.bbands(closes, length=period, std=std_dev)
                                 if bbands is not None and not bbands.empty:
-                                    market_indicators_data[symbol][f'{prefix}bb_upper'] = bbands.iloc[:, 2].iloc[-1] # BBU
-                                    market_indicators_data[symbol][f'{prefix}bb_middle'] = bbands.iloc[:, 1].iloc[-1] # BBM
-                                    market_indicators_data[symbol][f'{prefix}bb_lower'] = bbands.iloc[:, 0].iloc[-1] # BBL
+                                    market_indicators_data[symbol][f'{prefix}bb_upper'] = bbands.iloc[:, 2].iloc[-1] 
+                                    market_indicators_data[symbol][f'{prefix}bb_middle'] = bbands.iloc[:, 1].iloc[-1] 
+                                    market_indicators_data[symbol][f'{prefix}bb_lower'] = bbands.iloc[:, 0].iloc[-1] 
                                     
                                     if timeframe == '15m':
                                         market_indicators_data[symbol][f'{prefix}bb_upper_prev'] = bbands.iloc[:, 2].iloc[-2]
@@ -639,17 +674,21 @@ class AlphaTrader:
         if anomaly_score < -0.1:
             return False, f"Anomaly Veto (Score: {anomaly_score:.3f})"
 
-        # 2. [VETO] Trend Filter Check (Rule 1.B)
+        # 2. [VETO] Trend Filter Check (Rule 1.B) - [FIX 1]
         if settings.ENABLE_4H_EMA_FILTER:
-            if action == "LIMIT_BUY" and current_price < ema_50_4h:
-                return False, f"Trend Filter Veto (Price {current_price} < 4h EMA {ema_50_4h})"
-            if action == "LIMIT_SELL" and current_price > ema_50_4h:
-                return False, f"Trend Filter Veto (Price {current_price} > 4h EMA {ema_50_4h})"
+            # [V-Ultimate V6 修复] 仅在趋势市场 (ADX > 20) 时才应用 4h EMA 过滤器
+            adx_1h = data.get('1hour_adx_14')
+            if adx_1h and adx_1h > 20:
+                if action == "LIMIT_BUY" and current_price < ema_50_4h:
+                    return False, f"Trend Filter Veto (ADX > 20 & Price < 4h EMA)"
+                if action == "LIMIT_SELL" and current_price > ema_50_4h:
+                    return False, f"Trend Filter Veto (ADX > 20 & Price > 4h EMA)"
+            else:
+                self.logger.info(f"4H EMA Filter: Skipped (Ranging Market ADX {adx_1h:.1f} <= 20).")
         else:
             self.logger.info(f"4H EMA Filter is DISABLED. Skipping Trend Veto for {symbol}.")
             
         # 3. [VETO] OI Matrix Check (Rule 3)
-        # P↑O↓ (轧空)
         if action == "LIMIT_BUY" and current_price > ema_50_4h and oi_regime == "Falling":
              taker_confirms_veto = (taker_regime == "Selling")
              log_msg = f"OI Matrix Veto (P↑O↓ - Short Squeeze)"
@@ -657,7 +696,6 @@ class AlphaTrader:
                  log_msg += " [Taker Confirmed]"
              return False, log_msg
              
-        # P↓O↓ (多杀多)
         if action == "LIMIT_SELL" and current_price < ema_50_4h and oi_regime == "Falling":
              return False, f"OI Matrix Veto (P↓O↓ - Long Squeeze)"
 
@@ -689,6 +727,7 @@ class AlphaTrader:
         2. 计算动态 Risk (含 F&G 惩罚 和 ATR 调整)
         3. 添加最终价格验证 (Stale Plan Veto)
         4. 添加模拟盘 (Paper Trading) 逻辑
+        5. (修复 2) 新增 "UPDATE_STOPLOSS" 动作
         """
         MIN_MARGIN_USDT = futures_settings.MIN_NOMINAL_VALUE_USDT
         MIN_SIZE_BTC = 0.001 
@@ -698,10 +737,28 @@ class AlphaTrader:
                 action = order.get('action')
                 symbol = order.get('symbol')
                 
+                if not action or not symbol or symbol not in self.symbols:
+                    self.logger.warning(f"跳过无效或不支持的指令: {order}"); continue
+
+                # --- [修复 2] 处理 UPDATE_STOPLOSS ---
+                if action == "UPDATE_STOPLOSS":
+                    new_stop_loss = 0.0
+                    reason = order.get('reasoning', 'AI SL Update')
+                    try:
+                        nsl = order.get('new_stop_loss')
+                        if nsl is None: raise ValueError("缺少 new_stop_loss")
+                        new_stop_loss = float(nsl)
+                        if new_stop_loss <= 0: raise ValueError("无效止损价")
+                    except (ValueError, TypeError, KeyError) as e: 
+                        self.logger.error(f"跳过 UPDATE_STOPLOSS 参数错误: {order}. Err: {e}"); continue
+                    
+                    self.logger.warning(f"AI 请求更新止损 {symbol}: {new_stop_loss:.4f}. 原因: {reason}")
+                    await self.portfolio.update_position_rules(symbol, stop_loss=new_stop_loss, reason=reason)
+                    continue # 处理完此订单，继续下一个
+                # --- [修复 2 结束] ---
+
                 if action not in ["LIMIT_BUY", "LIMIT_SELL"]:
-                    self.logger.warning(f"跳过 AI 未知指令: {action}"); continue
-                if not symbol or symbol not in self.symbols: 
-                    self.logger.warning(f"跳过无效或不支持的 symbol: {symbol}"); continue
+                    self.logger.warning(f"跳过 AI 未知指令 (非 SL): {action}"); continue
 
                 # 1. 验证 AI 策略 (Veto 规则) - 使用 *旧* market_data
                 is_valid, reason = self._validate_ai_trade(order, market_data)
@@ -725,7 +782,6 @@ class AlphaTrader:
                     deviation_threshold = settings.AI_LIMIT_ORDER_DEVIATION_PERCENT / 100.0 
                     SLIPPAGE_ALLOWANCE = 0.001 # 0.1% 滑点
                     
-                    # 检查1: 订单是否会立即成交 (即 "追市")
                     if action == "LIMIT_BUY" and limit_price > (fresh_price * (1 + SLIPPAGE_ALLOWANCE)):
                         if self.is_live_trading: 
                             self.logger.error(f"STALE PLAN VETO (Immediate Fill): {symbol} 挂单价 {limit_price} > 现价 {fresh_price}。取消。")
@@ -740,7 +796,6 @@ class AlphaTrader:
                         else: 
                             is_immediate_fill = True
                         
-                    # 检查2: 挂单是否与 *新* 价格相差太远
                     deviation_pct = abs(fresh_price - limit_price) / limit_price
                     if deviation_pct > deviation_threshold:
                         self.logger.error(f"STALE PLAN VETO (Deviation): {symbol} 挂单价 {limit_price} 与 *最新*现价 {fresh_price} 偏离 ({deviation_pct:.2%}) > 阈值。取消。")
@@ -836,7 +891,6 @@ class AlphaTrader:
 
                 # 4. 执行 (实盘或模拟盘)
                 if self.is_live_trading:
-                    # --- [A] 实盘逻辑 (Live Trading) ---
                     await self.portfolio.live_open_limit(
                         symbol, 
                         'long' if action == 'LIMIT_BUY' else 'short', 
@@ -850,7 +904,6 @@ class AlphaTrader:
                     )
                 
                 else:
-                    # --- [B] 模拟盘逻辑 (Paper Trading) ---
                     await self.portfolio.paper_open_limit(
                         symbol, 
                         'long' if action == 'LIMIT_BUY' else 'short', 
@@ -872,6 +925,8 @@ class AlphaTrader:
         self.logger.info("Checking hard TP/SL (Paper)..."); to_close = []; tickers = {}
         try: tickers = await self.exchange.fetch_tickers(self.symbols)
         except Exception as e: self.logger.error(f"Hard stop failed: Fetch Tickers err: {e}"); return False
+        
+        # [PaperFix] 模拟盘检查 hard stops
         for symbol, pos in list(self.paper_positions.items()):
             if not pos or not isinstance(pos, dict) or pos.get('size', 0) <= 0: continue
             price = tickers.get(symbol, {}).get('last');
@@ -883,6 +938,7 @@ class AlphaTrader:
             elif side=='short':
                 if sl_valid and price >= sl: to_close.append((symbol, price, f"Hard SL @ {sl}"))
                 elif tp_valid and price <= tp: to_close.append((symbol, price, f"Hard TP @ {tp}"))
+        
         for symbol, price, reason in to_close:
             self.logger.warning(f"AUTO-CLOSING (Paper): {symbol} | Reason: {reason}")
             await self.portfolio.paper_close(symbol, price, reason)
@@ -1362,8 +1418,8 @@ class AlphaTrader:
                     # 步骤 2: 限价单超时清理 (10s 周期)
                     if self.portfolio.pending_limit_orders:
                         now_ms = time.time() * 1000
-                        orders_to_cancel = [] # 仅用于实盘
-                        plans_to_remove = []  # 用于实盘和模拟盘
+                        orders_to_cancel = [] 
+                        plans_to_remove = []  
                         try:
                             for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
                                 order_id = plan.get('order_id')
@@ -1403,7 +1459,7 @@ class AlphaTrader:
                             open_positions = self.portfolio.position_manager.get_all_open_positions()
                             positions_to_close = []
                             
-                            ADX_TREND_THRESHOLD = 25 # 仅在 ADX > 25 时激活安全网
+                            ADX_TREND_THRESHOLD = 25 
 
                             for symbol, state in open_positions.items():
                                 price = tickers.get(symbol, {}).get('last')
@@ -1423,7 +1479,7 @@ class AlphaTrader:
                                         time_since_entry = (time.time() * 1000) - last_entry_timestamp
                                         
                                         if time_since_entry < self.SAFETY_NET_GRACE_PERIOD_MS:
-                                            self.logger.debug(f"Safety Net V4: {symbol} 仍在宽限期内 (Entry {time_since_entry/60000:.0f}m ago < {self.SAFETY_NET_GRACE_PERIOD_MS/60000:.0f}m)。跳过。")
+                                            self.logger.debug(f"Safety Net V4: {symbol} 仍在 {self.SAFETY_NET_GRACE_PERIOD_MS/60000:.0f} 分钟宽限期内。跳过。")
                                             continue
                                             
                                     except Exception as e_ts:
@@ -1442,7 +1498,7 @@ class AlphaTrader:
                                         self.logger.debug(f"Safety Net V4: {symbol} 处于震荡市 (1h ADX {adx_14:.1f} < {ADX_TREND_THRESHOLD})。安全网已禁用。")
                                         continue 
                                     
-                                    ATR_BUFFER_MULTIPLIER = 1.0 
+                                    ATR_BUFFER_MULTIPLIER = 1.5 
                                     buffer = atr_14 * ATR_BUFFER_MULTIPLIER
                                     
                                     if side == 'long':
@@ -1470,7 +1526,7 @@ class AlphaTrader:
                         self.logger.debug("Checking for stale (price deviation) LIVE limit orders...")
                         try:
                             orders_to_cancel = []
-                            for symbol, plan in self.portfolio.pending_limit_orders.items():
+                            for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
                                 current_price = tickers.get(symbol, {}).get('last')
                                 plan_price = plan.get('limit_price')
                                 order_id = plan.get('order_id')
@@ -1497,7 +1553,7 @@ class AlphaTrader:
                         self.logger.debug("Checking for stale (price deviation) PAPER limit orders...")
                         try:
                             plans_to_remove = []
-                            for symbol, plan in self.portfolio.pending_limit_orders.items():
+                            for symbol, plan in list(self.portfolio.pending_limit_orders.items()):
                                 current_price = tickers.get(symbol, {}).get('last')
                                 plan_price = plan.get('limit_price')
 
@@ -1526,6 +1582,22 @@ class AlphaTrader:
                             open_positions_rule6 = self.portfolio.position_manager.get_all_open_positions()
                             for symbol, state in open_positions_rule6.items():
                                 
+                                # --- [V5 BUG 修复] 在此添加宽限期检查 ---
+                                try:
+                                    entries_list = state.get('entries', []) 
+                                    if not entries_list: continue 
+                                    
+                                    last_entry_timestamp = entries_list[-1].get('timestamp', 0) 
+                                    time_since_entry = (time.time() * 1000) - last_entry_timestamp
+                                    
+                                    if time_since_entry < self.SAFETY_NET_GRACE_PERIOD_MS:
+                                        self.logger.debug(f"ATR Trail: {symbol} 仍在 {self.SAFETY_NET_GRACE_PERIOD_MS/60000:.0f} 分钟宽限期内。跳过 ATR 追踪止损。")
+                                        continue
+                                        
+                                except Exception as e_ts:
+                                    self.logger.warning(f"ATR Trail: 无法获取 {symbol} 的 entry timestamp: {e_ts}。将继续检查。")
+                                # --- [V5 修复结束] ---
+                                    
                                 price = tickers.get(symbol, {}).get('last')
                                 entry = state.get('avg_entry_price')
                                 side = state.get('side')
