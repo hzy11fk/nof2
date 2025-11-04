@@ -58,12 +58,12 @@ class Settings(BaseSettings):
 
     ### 3. Python (Rule 8 - 突破) 策略配置 (被 settings.XXX 调用) ###
     
-    # [Rule 8 主开关] 是否启用 Python 高频突破策略（已失效）
-    ENABLE_BREAKOUT_MODIFIER: bool = True
+    # [Rule 8 主开关] 是否启用 Python 高频突破策略（已弃用）
+    ENABLE_BREAKOUT_MODIFIER: bool = False
     #是否启用4H EMA 判断
     ENABLE_4H_EMA_FILTER: bool = True
 
-    # [Rule 8 止盈] Python 突破策略的动态追踪止损百分比
+    # [Rule 8 止盈] Python 突破策略的动态追踪止损百分比（已弃用）
     # (被 alpha_trader.py:start() 中的 settings.BREAKOUT_TRAIL_STOP_PERCENT 调用)
     BREAKOUT_TRAIL_STOP_PERCENT: float = 0.003
 
@@ -103,18 +103,18 @@ class FuturesSettings(BaseSettings):
     调用的所有交易和风险参数。
     """
 
-    # [Rule 8 杠杆] Python 突破策略使用的杠杆
-    FUTURES_LEVERAGE: int = 5 
+    # 全局杠杆
+    FUTURES_LEVERAGE: int = 10
 
     FUTURES_MARGIN_MODE: str = 'isolated'
 
-    # [Rule 8 风险] Python 突破策略的单笔风险 (占总权益的百分比)
+    # [Rule 8 风险] Python 突破策略的单笔风险 (占总权益的百分比)（已弃用）
     FUTURES_RISK_PER_TRADE_PERCENT: float = 1.5 
 
-    # [Rule 8 止损] 是否使用 ATR 来计算初始止损
+    # [Rule 8 止损] 是否使用 ATR 来计算初始止损（已弃用）
     USE_ATR_FOR_INITIAL_STOP: bool = True 
 
-    # [Rule 8 止损] 如果使用 ATR，ATR 的乘数
+    # [Rule 8 止损] 如果使用 ATR，ATR 的乘数（已弃用）
     INITIAL_STOP_ATR_MULTIPLIER: float = 2.6 
 
     # [全局风控] 最小开仓保证金 (USDT)
