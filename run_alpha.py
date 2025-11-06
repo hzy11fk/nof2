@@ -5,10 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
-# [V-FIX] 错误: ccxt.pro 是 WebSocket 库。
-# import ccxt.pro as ccxtpro 
-# [V-FIX] 正确: ccxt.async_support 是 asyncio REST 库。
-#import ccxt.async_support as ccxt
+
 import ccxt.pro as ccxt
 import logging
 from config import settings
