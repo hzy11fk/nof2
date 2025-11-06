@@ -1,9 +1,12 @@
-# 文件: alpha_portfolio.py (V-Ultimate + PaperFix)
+# 文件: alpha_portfolio.py (V-Ultimate + PaperFix + FeeFix + OrphanFix)
 # 1. [V45.40 修复] get_state_for_prompt 现已支持 'filter_rule8' 参数。
 # 2. [V-Ultimate BUG 修复] sync_state (实盘) 现在会根据实际成交价重新计算 SL/TP，防止“有毒”仓位。
 # 3. [V-Ultimate PaperFix] __init__, _load_pending_limits, _save_pending_limits 现在在所有模式下都运行。
 # 4. [V-Ultimate PaperFix] 新增 paper_open_limit 函数，用于接收模拟盘的 AI 限价单计划。
 # 5. [V-Ultimate PaperFix] sync_state (模拟盘) 现在会检查 pending_limit_orders 并模拟限价单成交。
+# 6. [FEE FIX (User)] _parse_fee_from_order 现已修复 BNB 换算逻辑。
+# 7. [FEE FIX (User)] sync_state 现已修复限价单手续费获取逻辑 (不再是 0.0)。
+# 8. [ORPHAN FIX (User)] 所有平仓函数 (live_close, live_partial_close, paper_close, paper_partial_close) 现在会自动取消待处理的限价单。
 
 import logging
 import time
@@ -126,6 +129,7 @@ class AlphaPortfolio:
         """
         [V-Ultimate PaperFix] 模拟盘逻辑现在会检查并模拟成交 pending_limit_orders。
         [V-Ultimate BUG 修复] 实盘逻辑现在会根据实际成交价重新计算 SL/TP。
+        [FEE FIX (User)] 实盘逻辑现在会获取已成交限价单的实际手续费。
         """
         try:
             if self.is_live:
@@ -196,6 +200,32 @@ class AlphaPortfolio:
                                     exchange_lev_val = pos.get('leverage')
                                     final_leverage = int(exchange_lev_val) if exchange_lev_val is not None and float(exchange_lev_val) > 0 else 1
 
+                                    # --- [FEE FIX START (新开仓)] ---
+                                    calculated_entry_fee = 0.0 # 默认手续费
+                                    
+                                    if pending_plan:
+                                        order_id = pending_plan.get('order_id')
+                                        if order_id:
+                                            try:
+                                                self.logger.info(f"Sync: 正在为新持仓 {symbol} (Order ID: {order_id}) 获取成交手续费...")
+                                                # 从交易所获取已成交订单的详情
+                                                order_result = await self.client.fetch_order(order_id, symbol) 
+                                                
+                                                if order_result and order_result.get('status') in ['closed', 'filled']:
+                                                    # 调用您已有的手续费解析函数
+                                                    calculated_entry_fee = await self._parse_fee_from_order(order_result, symbol)
+                                                    self.logger.warning(f"Sync: 成功获取 {symbol} (Order ID: {order_id}) 的手续费: {calculated_entry_fee:.4f} USDT")
+                                                else:
+                                                    self.logger.warning(f"Sync: 无法从 {order_id} (Status: {order_result.get('status') if order_result else 'N/A'}) 获取手续费，将使用 0.0。")
+                                            
+                                            except Exception as e_fetch_fee:
+                                                self.logger.error(f"Sync: 尝试为 {order_id} 获取手续费时出错: {e_fetch_fee}。将使用 0.0。")
+                                        else:
+                                            self.logger.warning(f"Sync: 匹配到AI计划，但计划中无 Order ID。手续费将为 0.0。")
+                                    else:
+                                        self.logger.warning(f"Sync: 新持仓 {symbol} 未匹配到AI计划。手续费将为 0.0。")
+                                    # --- [FEE FIX END] ---
+
                                     # --- [V-Ultimate BUG 修复：重新计算 SL/TP] ---
                                     if pending_plan:
                                         self.logger.warning(f"Sync: 新持仓 {symbol} 匹配到一个AI限价单计划。正在应用 SL/TP/Reason...") #
@@ -265,7 +295,7 @@ class AlphaPortfolio:
 
                                         try:
                                             title = f"✅ {self.mode_str} AI 限价单成交: {side.upper()} {symbol.split('/')[0]}"
-                                            body = f"成交价格: {entry:.4f}\n数量: {abs(size)}\n杠杆: {final_leverage}x\nTP/SL: {plan_tp}/{plan_sl}\nAI原因: {plan_reason}"
+                                            body = f"成交价格: {entry:.4f}\n数量: {abs(size)}\n杠杆: {final_leverage}x\nTP/SL: {plan_tp}/{plan_sl}\nAI原因: {plan_reason}\n手续费: {calculated_entry_fee:.4f} USDT" # [FEE FIX] 添加手续费到通知
                                             await send_bark_notification(title, body)
                                         except Exception as e_notify:
                                             self.logger.error(f"Sync: 发送成交通知失败: {e_notify}")
@@ -278,7 +308,7 @@ class AlphaPortfolio:
                                         side=side, 
                                         entry_price=entry, 
                                         size=abs(size), 
-                                        entry_fee=0.0, 
+                                        entry_fee=calculated_entry_fee, # <--- [FEE FIX] 应用获取到的手续费
                                         leverage=final_leverage, 
                                         stop_loss=plan_sl, 
                                         take_profit=plan_tp, 
@@ -313,6 +343,27 @@ class AlphaPortfolio:
                                         if add_price <= 0:
                                              self.logger.warning(f"Sync: 无法反推加仓价格 (AddPrice: {add_price})。将使用交易所均价 {current_avg_price} 作为近似值。")
                                              add_price = current_avg_price
+                                        
+                                        # --- [FEE FIX START (加仓)] ---
+                                        calculated_entry_fee = 0.0 # 默认手续费
+                                        order_id = pending_plan.get('order_id')
+                                        if order_id:
+                                            try:
+                                                self.logger.info(f"Sync (Add): 正在为 {symbol} (Order ID: {order_id}) 获取成交手续费...")
+                                                order_result = await self.client.fetch_order(order_id, symbol) 
+                                                
+                                                if order_result and order_result.get('status') in ['closed', 'filled']:
+                                                    calculated_entry_fee = await self._parse_fee_from_order(order_result, symbol)
+                                                    self.logger.warning(f"Sync (Add): 成功获取 {symbol} (Order ID: {order_id}) 的手续费: {calculated_entry_fee:.4f} USDT")
+                                                else:
+                                                    self.logger.warning(f"Sync (Add): 无法从 {order_id} (Status: {order_result.get('status') if order_result else 'N/A'}) 获取手续费，将使用 0.0。")
+                                            
+                                            except Exception as e_fetch_fee_add:
+                                                self.logger.error(f"Sync (Add): 尝试为 {order_id} 获取手续费时出错: {e_fetch_fee_add}。将使用 0.0。")
+                                        else:
+                                            self.logger.warning(f"Sync (Add): 匹配到AI计划，但计划中无 Order ID。手续费将为 0.0。")
+                                        # --- [FEE FIX END (加仓)] ---
+
 
                                         # [V-Ultimate BUG 修复] 加仓也需要重新计算 SL/TP
                                         plan_sl = None
@@ -353,7 +404,7 @@ class AlphaPortfolio:
                                             symbol=symbol,
                                             entry_price=add_price,
                                             size=added_size,
-                                            entry_fee=0.0,
+                                            entry_fee=calculated_entry_fee, # <--- [FEE FIX] 应用获取到的手续费
                                             leverage=plan_leverage, 
                                             stop_loss=plan_sl,
                                             take_profit=plan_tp,
@@ -365,7 +416,7 @@ class AlphaPortfolio:
                                         final_avg_price = final_state.get('avg_entry_price', current_avg_price)
                                         final_total_size = final_state.get('total_size', current_total_size)
 
-# --- [新逻辑: 移动止损至新的 (含手续费) 成本价] ---
+                                        # --- [新逻辑: 移动止损至新的 (含手续费) 成本价] ---
                                         try:
                                             fee_rate = 0.001 # 0.1%
                                             new_breakeven_sl = 0.0
@@ -390,7 +441,7 @@ class AlphaPortfolio:
                                         
                                         try:
                                             title = f"🔼 {self.mode_str} AI 限价加仓成交: {side.upper()} {symbol.split('/')[0]}"
-                                            body = f"成交价格: {add_price:.4f}\n数量: {added_size}\n杠杆: {plan_leverage}x\n新均价: {final_avg_price:.4f}\n新总量: {final_total_size}\nAI原因: {plan_reason}"
+                                            body = f"成交价格: {add_price:.4f}\n数量: {added_size}\n杠杆: {plan_leverage}x\n新均价: {final_avg_price:.4f}\n新总量: {final_total_size}\nAI原因: {plan_reason}\n手续费: {calculated_entry_fee:.4f} USDT" # [FEE FIX] 添加手续费到通知
                                             await send_bark_notification(title, body)
                                         except Exception as e_notify:
                                             self.logger.error(f"Sync: 发送加仓成交通知失败: {e_notify}")
@@ -916,6 +967,25 @@ class AlphaPortfolio:
     # --- [修复结束] ---
 
     async def live_partial_close(self, symbol: str, size_percent: Optional[float] = None, size_absolute: Optional[float] = None, reason: str = "N/A"):
+        # --- [ORPHAN FIX START] ---
+        # 在执行部分平仓时，自动取消所有相关的“待处理”限价单 (例如AI的加仓计划)
+        # 因为部分平仓意味着原始的仓位结构已改变，AI应在下一个周期重新评估是否加仓。
+        self.logger.warning(f"!!! {self.mode_str} [ORPHAN FIX] (部分平仓) 检查并取消 {symbol} 的待处理限价单 (如有)...")
+        try:
+            pending_plan = await self.remove_pending_limit_order(symbol)
+            if pending_plan:
+                order_id = pending_plan.get('order_id')
+                if order_id:
+                    self.logger.warning(f"[ORPHAN FIX] 正在取消与 {symbol} 相关的待处理订单 {order_id}...")
+                    await self.client.cancel_order(order_id, symbol)
+                else:
+                    self.logger.warning(f"[ORPHAN FIX] {symbol} 有一个待处理计划但没有 order_id。")
+        except OrderNotFound:
+            self.logger.info(f"[ORPHAN FIX] 待处理订单 {order_id} 在交易所未找到 (可能已成交/取消)。")
+        except Exception as e_cancel:
+            self.logger.error(f"[ORPHAN FIX] 取消待处理订单 {order_id} 失败: {e_cancel}。继续部分平仓...")
+        # --- [ORPHAN FIX END] ---
+
         self.logger.warning(f"!!! {self.mode_str} AI 请求部分平仓: {symbol} | %: {size_percent} | Abs: {size_absolute} | 原因: {reason} !!!")
 
         pos_state = self.position_manager.get_position_state(symbol)
@@ -928,13 +998,13 @@ class AlphaPortfolio:
         if size_percent is not None and 0 < size_percent <= 1: 
             if abs(size_percent - 1.0) < 1e-9:
                  self.logger.warning(f"{self.mode_str} 部分平仓请求 100%，转为全平。")
-                 await self.live_close(symbol, reason=f"{reason} (转为全平)")
+                 await self.live_close(symbol, reason=f"{reason} (转为全平)") # live_close 会处理孤儿单
                  return
             size_to_close = current_total_size * size_percent
         elif size_absolute is not None and 0 < size_absolute <= current_total_size + 1e-9: 
              if abs(size_absolute - current_total_size) < 1e-9:
                  self.logger.warning(f"{self.mode_str} 部分平仓请求绝对数量等于全仓，转为全平。")
-                 await self.live_close(symbol, reason=f"{reason} (转为全平)")
+                 await self.live_close(symbol, reason=f"{reason} (转为全平)") # live_close 会处理孤儿单
                  return
              size_to_close = min(size_absolute, current_total_size) 
         else: 
@@ -1050,6 +1120,24 @@ class AlphaPortfolio:
         except Exception as e: self.logger.error(f"!!! {self.mode_str} 部分平仓失败: {e}", exc_info=True); await send_bark_notification(f"❌ {self.mode_str} AI 部分平仓失败", f"品种: {symbol}\n错误: {e}")
 
     async def live_close(self, symbol, reason: str = "N/A"):
+        # --- [ORPHAN FIX START] ---
+        # 在执行(全)平仓时，自动取消所有相关的“待处理”限价单
+        self.logger.warning(f"!!! {self.mode_str} [ORPHAN FIX] (全平仓) 检查并取消 {symbol} 的待处理限价单 (如有)...")
+        try:
+            pending_plan = await self.remove_pending_limit_order(symbol)
+            if pending_plan:
+                order_id = pending_plan.get('order_id')
+                if order_id:
+                    self.logger.warning(f"[ORPHAN FIX] 正在取消与 {symbol} 相关的待处理订单 {order_id}...")
+                    await self.client.cancel_order(order_id, symbol)
+                else:
+                    self.logger.warning(f"[ORPHAN FIX] {symbol} 有一个待处理计划但没有 order_id。")
+        except OrderNotFound:
+            self.logger.info(f"[ORPHAN FIX] 待处理订单 {order_id} 在交易所未找到 (可能已成交/取消)。")
+        except Exception as e_cancel:
+            self.logger.error(f"[ORPHAN FIX] 取消待处理订单 {order_id} 失败: {e_cancel}。继续全平仓...")
+        # --- [ORPHAN FIX END] ---
+
         self.logger.warning(f"!!! {self.mode_str} 正在尝试(全)平仓: {symbol} | 原因: {reason} !!!")
         pos_state = self.position_manager.get_position_state(symbol) 
         if not pos_state or pos_state.get('total_size', 0) <= 0:
@@ -1125,6 +1213,11 @@ class AlphaPortfolio:
         await self.sync_state()
 
     async def paper_close(self, symbol, price, reason: str = "N/A"):
+        # --- [ORPHAN FIX START] ---
+        # (模拟盘) 在全平仓时，移除所有相关的待处理限价单
+        await self.remove_pending_limit_order(symbol)
+        # --- [ORPHAN FIX END] ---
+
         pos = self.paper_positions.pop(symbol, None)
         if not pos or not isinstance(pos, dict) or pos.get('size', 0) <= 0: self.logger.error(f"{self.mode_str} (全)平仓失败: 未找到 {symbol} 持仓。"); return
         entry_price = pos.get('entry_price', 0.0); size = pos.get('size', 0.0); leverage = pos.get('leverage'); margin_recorded = pos.get('margin', 0.0)
@@ -1140,6 +1233,11 @@ class AlphaPortfolio:
         await self.sync_state()
 
     async def paper_partial_close(self, symbol: str, price: float, size_percent: Optional[float] = None, size_absolute: Optional[float] = None, reason: str = "N/A"):
+        # --- [ORPHAN FIX START] ---
+        # (模拟盘) 在部分平仓时，移除所有相关的待处理限价单
+        await self.remove_pending_limit_order(symbol)
+        # --- [ORPHAN FIX END] ---
+        
         pos = self.paper_positions.get(symbol)
         if not pos or not isinstance(pos, dict) or pos.get('size', 0) <= 0: self.logger.error(f"{self.mode_str} 部分平仓失败: 未找到 {symbol} 持仓。"); return
         current_total_size = pos.get('size', 0.0); current_total_margin = pos.get('margin', 0.0); size_to_close = 0.0
@@ -1203,20 +1301,22 @@ class AlphaPortfolio:
                 bnb_contract_symbol = 'BNB/USDT:USDT' 
                 
                 try:
-                    if bnb_contract_symbol not in self.symbols:
-                        self.logger.error(f"BNB 手续费转换失败: '{bnb_contract_symbol}' 不在 self.symbols 列表中。")
-                        fees_paid_usdt = 0.0 
+                    # --- [FIX START] ---
+                    # 移除了 'if bnb_contract_symbol not in self.symbols:' 的检查
+                    # 无论 self.symbols 中是否包含 BNB，我们都将尝试获取其价格
+                    
+                    self.logger.debug(f"Fee Parsing: 正在强制获取 {bnb_contract_symbol} Ticker (无论是否在 self.symbols 中)...")
+                    bnb_ticker = await self.client.fetch_ticker(bnb_contract_symbol) 
+                    bnb_price = bnb_ticker.get('last')
+                    
+                    if bnb_price and bnb_price > 0:
+                        fees_paid_usdt = fee_cost * bnb_price
+                        self.logger.warning(f"BNB 手续费已转换为 USDT: {fee_cost:.6f} BNB * {bnb_price} USD/BNB = {fees_paid_usdt:.4f} USDT")
                     else:
-                        bnb_ticker = await self.client.fetch_ticker(bnb_contract_symbol) 
-                        bnb_price = bnb_ticker.get('last')
-                        
-                        if bnb_price and bnb_price > 0:
-                            fees_paid_usdt = fee_cost * bnb_price
-                            self.logger.warning(f"BNB 手续费已转换为 USDT: {fee_cost:.6f} BNB * {bnb_price} USD/BNB = {fees_paid_usdt:.4f} USDT")
-                        else:
-                            self.logger.error(f"无法获取有效的 {bnb_contract_symbol} 价格，BNB 手续费将记录为 0 USDT。")
-                            fees_paid_usdt = 0.0
-                
+                        self.logger.error(f"无法获取有效的 {bnb_contract_symbol} 价格，BNB 手续费将记录为 0 USDT。")
+                        fees_paid_usdt = 0.0
+                    # --- [FIX END] ---
+
                 except ExchangeError as e:
                      self.logger.error(f"获取 {bnb_contract_symbol} ticker 时交易所错误: {e}。BNB 手续费将记录为 0 USDT。")
                      fees_paid_usdt = 0.0
