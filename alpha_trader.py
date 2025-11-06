@@ -114,18 +114,25 @@ class AlphaTrader:
 
     4.  **Smarter Stop-Loss:**
         * Your `stop_loss_price` MUST be placed relative to volatility using the **ATR**.
-        * *Example (Long):* Place `stop_loss_price` at `[Confluence_Zone_Low] - (1.5 * 1h_atr_14)`.
+        * *Example (Long):* Place `stop_loss_price` at `[Confluence_Zone_Low] - (2.0 * 1h_atr_14)`.
+        * *Example (Short):* Place `stop_loss_price` at `[Confluence_Zone_High] + (2.0 * 1h_atr_14)`.
         
     4.5. **R:R Driven Take Profit (CRITICAL):**
         * Python WILL VETO any new trade with R:R < 1.5. You MUST respect this.
         * **Your Planning Process (for New Trades/Adds):**
             1.  First, determine your `entry_price` and `stop_loss_price` (using Rule 4).
-            2.  Calculate your `Risk_Distance` (e.g., `entry_price - stop_loss_price`).
-            3.  Calculate your `Minimum_Reward_Distance` (e.g., `Risk_Distance * 1.5`).
-            4.  Set your ideal `take_profit_price` (e.g., `entry_price + Minimum_Reward_Distance`).
+            2.  **For LONG:**
+                - `Risk_Distance` = `entry_price - stop_loss_price`
+                - `Minimum_Reward_Distance` = `Risk_Distance * 1.5`
+                - Set ideal `take_profit_price` = `entry_price + Minimum_Reward_Distance`
+            3.  **For SHORT:**
+                - `Risk_Distance` = `stop_loss_price - entry_price`
+                - `Minimum_Reward_Distance` = `Risk_Distance * 1.5`
+                - Set ideal `take_profit_price` = `entry_price - Minimum_Reward_Distance`
         * **CRITICAL VETO CHECK (by AI):**
             * You MUST now check if this calculated `take_profit_price` is **realistic**.
             * **VETO (Long):** If your calculated TP is $4100, but there is a major 4h Resistance level at $4000, your trade is INVALID. You MUST ABORT.
+            * **VETO (Short):** If your calculated TP is $3900, but there is a major 4h Support level at $4000, your trade is INVALID. You MUST ABORT.
         * **Conclusion:** Only submit a trade if its 1.5R target is *clear* of any major opposing S/R levels.
         
     5.  **Market Sentiment Filter (Fear & Greed Index):**
@@ -316,7 +323,16 @@ class AlphaTrader:
         self.logger.info(f"--- 总共加载了 {len(self.ml_anomaly_detectors)} 个 Anomaly ML 模型 ---")
         
         self.peak_profit_tracker: Dict[str, float] = {}
-
+        # --- [新代码] 为“分批止盈”策略添加状态 ---
+        # 追踪仓位当前所处的盈利阶段 (0=初始, 1=1-2.5%, 2=2.5-5%, 3=5%+)
+        self.partial_tp_stage: Dict[str, int] = {}
+        # 追踪您的计数器 (1=可用, 0=已用)
+        self.partial_tp_counter: Dict[str, int] = {}
+        # --- [新代码结束] ---
+# --- [吊灯止损 升级] ---
+        # 允许 10 秒循环将 ATR 和 High/Low 数据传递给毫秒级循环
+        self.current_indicator_data: Dict[str, Dict[str, float]] = {}
+        # --- [升级结束] ---
         self.SAFETY_NET_GRACE_PERIOD_MS = 15 * 60 * 1000 # 15 minutes
 
 
@@ -798,6 +814,8 @@ class AlphaTrader:
         3. 添加最终价格验证 (Stale Plan Veto)
         4. 添加模拟盘 (Paper Trading) 逻辑
         5. (修复 2) 新增 "UPDATE_STOPLOSS" 动作
+        [V-FIX] 验证逻辑 (validate_ai_trade 和 Stale Plan Veto)
+        已移至循环顶部，确保在实盘和模拟盘中都能执行。
         """
         MIN_MARGIN_USDT = futures_settings.MIN_NOMINAL_VALUE_USDT
         MIN_SIZE_BTC = 0.001 
@@ -830,7 +848,8 @@ class AlphaTrader:
                 if action not in ["LIMIT_BUY", "LIMIT_SELL"]:
                     self.logger.warning(f"跳过 AI 未知指令 (非 SL): {action}"); continue
 
-                # 1. 验证 AI 策略 (Veto 规则) - 使用 *旧* market_data
+                # --- [新位置: 验证块] ---
+                # 1. 验证 AI 策略 (Veto 规则) - (适用于实盘和模拟盘)
                 is_valid, reason = self._validate_ai_trade(order, market_data)
                 if not is_valid:
                     self.logger.warning(f"!!! AI 策略 VETO !!! {symbol} | Action: {action} | 原因: {reason}")
@@ -838,7 +857,7 @@ class AlphaTrader:
                 
                 self.logger.info(f"AI 策略 (Python 验证通过): {symbol} | Action: {action} | 原因: {reason}")
 
-                # 2. 最终价格验证 (Stale Plan Veto)
+                # 2. 最终价格验证 (Stale Plan Veto) - (适用于实盘和模拟盘)
                 limit_price = float(order.get('entry_price'))
                 fresh_price = 0.0 
                 is_immediate_fill = False 
@@ -874,6 +893,8 @@ class AlphaTrader:
                 except Exception as e_fresh_price:
                     self.logger.error(f"STALE PLAN VETO (Fetch Error): 无法在下单前获取最新价格: {e_fresh_price}。取消订单。")
                     continue
+                # --- [验证块结束] ---
+
 
                 # 3. 计算 Risk/Leverage/Size (如果验证通过)
                 stop_loss = float(order.get('stop_loss_price'))
@@ -988,7 +1009,6 @@ class AlphaTrader:
                 
             except Exception as e: 
                 self.logger.error(f"处理 AI 指令时意外错误: {order}. Err: {e}", exc_info=True)
-
 
     async def _check_and_execute_hard_stops(self):
         if self.is_live_trading: return False
@@ -1304,162 +1324,301 @@ class AlphaTrader:
         self.logger.info("="*20 + " AI Cycle Finished " + "="*20 + "\n")
 
 
-    async def high_frequency_risk_loop(self):
-        self.logger.warning("🚀 高频风控循环 (HF Risk Loop) 已启动 (2s 周期)...")
+    async def websocket_risk_loop(self):
+        """
+        [架构升级 - WebSocket + 统一止损 V5 (Bug 修复)]
+        此版本修复了一个致命缺陷 (Bug):
+        最终止损检查 [I] 错误地使用了 "potential_sl" (候选 SL)，
+        而不是 "active_sl" (只紧不松原则后的生效 SL)。
         
-        MAX_LOSS_PERCENT = settings.MAX_LOSS_CUTOFF_PERCENT / 100.0
-        DUST_MARGIN_USDT = 1.0
+        新逻辑:
+        1. [G] 计算 `potential_sl` (5 个候选者中的最优者)。
+        2. [H] 决定 `active_sl` (比较 `potential_sl` 和 `current_sl`)。
+        3. [I] 检查 `price` 是否突破了 `active_sl`。
+        """
+        self.logger.warning("🚀 实时风控循环 (WebSocket + 统一止损 V5) 已启动...")
         
+        self.partial_tp_stage.clear()
+        self.partial_tp_counter.clear()
+        self.peak_profit_tracker.clear()
+        self.logger.info("WebSocket Loop: 状态追踪器已重置。")
+        
+        CHANDELIER_MULTIPLIER = 2.5 # [新] 吊灯止损的 ATR 倍率 (标准值是 3.0)
+        ATR_TRAIL_MULTIPLIER = 1.5 # [旧] Rule 6 的 ATR 倍率
+
         while True:
             try:
-                # 模拟盘风控 (使用 _check_and_execute_hard_stops)
-                if not self.is_live_trading:
-                    await asyncio.sleep(2)
+                open_positions = self.portfolio.position_manager.get_all_open_positions()
+                open_symbols = set(open_positions.keys())
+                
+                for symbol in list(self.peak_profit_tracker.keys()):
+                    if symbol not in open_symbols:
+                        self.logger.info(f"WS Risk Loop: Removing trackers for closed position: {symbol}")
+                        del self.peak_profit_tracker[symbol]
+                        self.partial_tp_stage.pop(symbol, None)
+                        self.partial_tp_counter.pop(symbol, None)
+
+                if not open_symbols:
+                    await asyncio.sleep(2) 
                     continue
 
-                # --- 实盘风控 ---
-                if self.is_live_trading and self.portfolio.position_manager:
+                tickers = await self.client.watch_tickers(list(open_symbols)) 
+
+                positions_to_close = {} 
+                sl_update_tasks = [] 
+                tasks_partial_close = [] 
+
+                for symbol, ticker_data in tickers.items():
                     
-                    open_positions = self.portfolio.position_manager.get_all_open_positions()
-                    if not open_positions:
-                        await asyncio.sleep(2) 
-                        continue
+                    state = open_positions.get(symbol)
+                    if not state: continue
                         
-                    symbols_to_check = list(open_positions.keys())
-                    tickers = {}
+                    price = ticker_data.get('last')
+                    if not price or price <= 0: continue
+                    
+                    # ----------------------------------------------------
+                    # --- [统一风控逻辑 V5] ---
+                    # ----------------------------------------------------
                     try:
-                        tickers = await self.client.fetch_tickers(symbols_to_check)
-                    except Exception as e_ticker:
-                        self.logger.error(f"HF Risk Loop: 获取 tickers 失败: {e_ticker}")
-                        await asyncio.sleep(2) 
-                        continue
+                        # [A] 获取所有状态
+                        entry = state.get('avg_entry_price')
+                        size = state.get('total_size')
+                        side = state.get('side')
+                        lev = state.get('leverage')
+                        margin = state.get('margin')
+                        initial_sl = state.get('ai_initial_stop_loss', 0.0)
+                        
+                        # [B] 计算含手续费的保本价格
+                        fee_rate = 0.001 # 0.1% (0.001)
+                        breakeven_price = 0.0
+                        if entry and entry > 0 and side:
+                            if side == 'long':
+                                breakeven_price = entry * (1 + fee_rate)
+                            elif side == 'short':
+                                breakeven_price = entry * (1 - fee_rate)
 
-                    positions_to_close = {} 
-                    sl_update_tasks = [] 
+                        # [C] 验证数据
+                        if not all([entry, size, side, lev, margin, initial_sl, breakeven_price]) or lev <= 0 or entry <= 0 or margin <= 0 or initial_sl <= 0 or size <= 0 or breakeven_price <= 0:
+                            self.logger.debug(f"WS Risk Loop: Skipping {symbol}, invalid state data.")
+                            continue
 
-                    open_symbols = set(open_positions.keys())
-                    for symbol in list(self.peak_profit_tracker.keys()):
-                        if symbol not in open_symbols:
-                            self.logger.info(f"HF Risk Loop: Removing Peak Profit tracker for closed position: {symbol}")
-                            del self.peak_profit_tracker[symbol]
+                        upl = (price - entry) * size if side == 'long' else (entry - price) * size
+                        rate = upl / margin if margin > 0 else 0.0 # 当前盈利率
+                        is_profitable = rate > 0
 
-                    try:
-                        for symbol, state in open_positions.items():
-                            price = tickers.get(symbol, {}).get('last')
-                            if not price or price <= 0: continue
+                        # [D] 硬性风控检查
+                        MAX_LOSS_PERCENT = settings.MAX_LOSS_CUTOFF_PERCENT / 100.0
+                        if rate <= -MAX_LOSS_PERCENT:
+                            reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
+                            if symbol not in positions_to_close: positions_to_close[symbol] = reason
+                            continue 
+                        
+                        DUST_MARGIN_USDT = 1.0
+                        if margin < DUST_MARGIN_USDT:
+                            reason = f"Dust Close (<{DUST_MARGIN_USDT:.1f}U)"
+                            if symbol not in positions_to_close: positions_to_close[symbol] = reason
+                            continue 
+
+                        # [E] 峰值利润追踪
+                        current_peak_rate = self.peak_profit_tracker.get(symbol, 0.0)
+                        if rate > current_peak_rate:
+                            self.peak_profit_tracker[symbol] = rate
+                            current_peak_rate = rate 
+
+                        # [F] 检查宽限期 (Grace Period)
+                        is_in_grace_period = False
+                        try:
+                            entries_list = state.get('entries', []) 
+                            if not entries_list: continue 
+                            last_entry_timestamp = entries_list[-1].get('timestamp', 0) 
+                            time_since_entry = (time.time() * 1000) - last_entry_timestamp
+                            if time_since_entry < self.SAFETY_NET_GRACE_PERIOD_MS:
+                                is_in_grace_period = True
+                        except Exception as e_ts:
+                            self.logger.warning(f"WS Loop: 无法获取 {symbol} 的 entry timestamp: {e_ts}。将继续检查。")
+
+                        # =======================================================
+                        # [G] 统一止损计算 (计算“候选”最优者)
+                        # =======================================================
+                        
+                        # 候选者 1: 初始 SL
+                        potential_sl = initial_sl
+                        
+                        # 候选者 2: 1R 保本 (B/E+Fee)
+                        if abs(initial_sl - entry) > 1e-9: 
+                            initial_risk_distance = abs(entry - initial_sl)
+                            current_upl_distance = 0.0
+                            if side == 'long' and price > entry:
+                                current_upl_distance = price - entry
+                            elif side == 'short' and price < entry:
+                                current_upl_distance = entry - price
                             
-                            entry = state.get('avg_entry_price')
-                            size = state.get('total_size')
-                            side = state.get('side')
-                            lev = state.get('leverage')
-                            margin = state.get('margin')
-                            
-                            initial_sl = state.get('ai_initial_stop_loss', 0.0) 
-                            
-                            if not all([entry, size, side, lev, margin, initial_sl]) or lev <= 0 or entry <= 0 or margin <= 0 or initial_sl <= 0 or size <= 0:
-                                self.logger.warning(f"HF Risk Loop: Skipping {symbol}, invalid state data (entry, size, side, lev, margin, or initial_sl missing/zero).")
-                                continue
-
-                            upl = (price - entry) * size if side == 'long' else (entry - price) * size
-                            rate = upl / margin 
-
-                            if rate <= -MAX_LOSS_PERCENT:
-                                reason = f"Hard Max Loss ({-MAX_LOSS_PERCENT:.0%})"
-                                if symbol not in positions_to_close: positions_to_close[symbol] = reason
-                                continue 
-
-                            if margin < DUST_MARGIN_USDT:
-                                reason = f"Dust Close (<{DUST_MARGIN_USDT:.1f}U)"
-                                if symbol not in positions_to_close: positions_to_close[symbol] = reason
-                                continue 
-
-                            current_peak_rate = self.peak_profit_tracker.get(symbol, 0.0)
-                            if rate > current_peak_rate:
-                                self.peak_profit_tracker[symbol] = rate
-                                current_peak_rate = rate 
-
-                            # 1. 1R Breakeven Check
-                            if abs(initial_sl - entry) > 1e-9: 
-                                initial_risk_distance = abs(entry - initial_sl)
-                                current_upl_distance = 0.0
-                                if side == 'long' and price > entry:
-                                    current_upl_distance = price - entry
-                                elif side == 'short' and price < entry:
-                                    current_upl_distance = entry - price
-                                        
-                                if current_upl_distance >= initial_risk_distance:
-                                    self.logger.warning(f"🔥 HF Risk Loop (1R Breakeven): {symbol} 达到 1R。正在将 SL 移至 {entry:.4f}")
-                                    sl_update_tasks.append(
-                                        self.portfolio.update_position_rules(symbol, stop_loss=entry, reason="HF Risk Loop: 1R Breakeven")
-                                    )
-                                
-                            # 2. V3 Risk-Averse Graded Profit Taker
-                            target_profit_rate = 0.0
-                            
-                            if current_peak_rate >= 0.05: # > 5% 
-                                target_profit_rate = current_peak_rate * 0.80 # 锁定 80%
-                            elif current_peak_rate >= 0.025: # 2.5% - 5%
-                                target_profit_rate = current_peak_rate * 0.70 # 锁定 70%
-                            elif current_peak_rate >= 0.01: # 1% - 2.5%
-                                target_profit_rate = current_peak_rate * 0.60 # 锁定 60%
-                            
-                            if target_profit_rate > 0.0:
-                                target_upl = target_profit_rate * margin
-                                new_graded_sl_price = 0.0
+                            if current_upl_distance >= initial_risk_distance:
                                 if side == 'long':
-                                    new_graded_sl_price = (target_upl / size) + entry
-                                else:
-                                    new_graded_sl_price = entry - (target_upl / size)
-                                
-                                current_sl = state.get('ai_suggested_stop_loss', 0.0)
-                                
-                                if side == 'long':
-                                    final_sl_floor = max(entry, current_sl)
-                                    if new_graded_sl_price > final_sl_floor:
-                                        sl_update_tasks.append(
-                                            self.portfolio.update_position_rules(symbol, stop_loss=new_graded_sl_price, reason="HF Risk Loop: Graded Profit Taker (V3)")
-                                        )
+                                    potential_sl = max(potential_sl, breakeven_price)
                                 elif side == 'short':
-                                    final_sl_floor = min(entry, current_sl)
-                                    if new_graded_sl_price < final_sl_floor:
-                                         sl_update_tasks.append(
-                                            self.portfolio.update_position_rules(symbol, stop_loss=new_graded_sl_price, reason="HF Risk Loop: Graded Profit Taker (V3)")
-                                        )
+                                    potential_sl = min(potential_sl, breakeven_price)
+
+                        # 候选者 3: V3 阶梯止盈 (按峰值锁定利润)
+                        target_profit_rate_v3 = 0.0
+                        if current_peak_rate >= 0.05: # > 5% 
+                            target_profit_rate_v3 = current_peak_rate * 0.75 # 锁定 75%
+                        elif current_peak_rate >= 0.025: # 2.5% - 5%
+                            target_profit_rate_v3 = current_peak_rate * 0.65 # 锁定 65%
+                        elif current_peak_rate >= 0.01: # 1% - 2.5%
+                            target_profit_rate_v3 = current_peak_rate * 0.55 # 锁定 55%
+                        
+                        if target_profit_rate_v3 > 0.0:
+                            target_upl_v3 = target_profit_rate_v3 * margin
+                            new_graded_sl_price = 0.0
+                            if side == 'long':
+                                new_graded_sl_price = (target_upl_v3 / size) + entry
+                                potential_sl = max(potential_sl, new_graded_sl_price)
+                            else: # short
+                                new_graded_sl_price = entry - (target_upl_v3 / size)
+                                potential_sl = min(potential_sl, new_graded_sl_price)
+
+                        # --- [获取 ATR 和 High/Low 数据] ---
+                        indicator_data = self.current_indicator_data.get(symbol)
+                        
+                        if is_profitable and not is_in_grace_period and indicator_data:
+                            atr_15m = indicator_data.get('atr', 0.0)
                             
-                            # 3. 检查 AI 设定的 SL/TP (所有策略)
-                            current_active_sl = state.get('ai_suggested_stop_loss') 
-                            if current_active_sl and current_active_sl > 0:
-                                if (side == 'long' and price <= current_active_sl) or (side == 'short' and price >= current_active_sl):
-                                    reason = f"AI SL Hit ({current_active_sl:.4f})"
-                                    if symbol not in positions_to_close: positions_to_close[symbol] = reason
-                                    continue 
+                            if atr_15m > 0:
+                                # 候选者 4: ATR 追踪止损 (Rule 6)
+                                new_atr_sl = 0.0
+                                if side == 'long':
+                                    new_atr_sl = price - (ATR_TRAIL_MULTIPLIER * atr_15m)
+                                    potential_sl = max(potential_sl, new_atr_sl)
+                                elif side == 'short':
+                                    new_atr_sl = price + (ATR_TRAIL_MULTIPLIER * atr_15m)
+                                    potential_sl = min(potential_sl, new_atr_sl)
+                                
+                                # 候选者 5: [新] 吊灯追踪止损 (Chandelier Exit)
+                                new_chandelier_sl = 0.0
+                                if side == 'long':
+                                    high_15m_20p = indicator_data.get('high', price) # 回退到 price
+                                    new_chandelier_sl = high_15m_20p - (CHANDELIER_MULTIPLIER * atr_15m)
+                                    potential_sl = max(potential_sl, new_chandelier_sl)
+                                elif side == 'short':
+                                    low_15m_20p = indicator_data.get('low', price) # 回退到 price
+                                    new_chandelier_sl = low_15m_20p + (CHANDELIER_MULTIPLIER * atr_15m)
+                                    potential_sl = min(potential_sl, new_chandelier_sl)
+                        
+                        # =======================================================
+                        # [H] 最终止损决策 ("只紧不松" 逻辑)
+                        # =======================================================
+                        
+                        # [BUG 修复] 'active_sl' 必须是 "当前交易所生效的 SL"
+                        current_sl_on_exchange = state.get('ai_suggested_stop_loss', 0.0)
+                        active_sl = current_sl_on_exchange # 默认使用当前 SL
 
-                            ai_tp = state.get('ai_suggested_take_profit')
-                            if ai_tp and ai_tp > 0:
-                                if (side == 'long' and price >= ai_tp) or (side == 'short' and price <= ai_tp):
-                                    reason = f"AI TP Hit ({ai_tp:.4f})"
-                                    if symbol not in positions_to_close: positions_to_close[symbol] = reason
-                                    continue 
-                    
+                        if (side == 'long' and potential_sl > current_sl_on_exchange) or \
+                           (side == 'short' and potential_sl < current_sl_on_exchange):
+                            # 新计算的 SL 更好 (更紧)
+                            self.logger.info(f"WS Risk Loop (SL Update): 正在更新 {symbol} 止损至 {potential_sl:.4f} (旧: {current_sl_on_exchange:.4f})")
+                            sl_update_tasks.append(
+                                self.portfolio.update_position_rules(symbol, stop_loss=potential_sl, reason="WS Risk Loop: Unified SL V5")
+                            )
+                            state['ai_suggested_stop_loss'] = potential_sl # 更新本地状态
+                            active_sl = potential_sl # [BUG 修复] 最终生效的 SL 是新的 potential_sl
+                        else:
+                            # 新计算的 SL 更松，拒绝更新
+                            # [BUG 修复] 最终生效的 SL 必须保持为旧的 current_sl_on_exchange
+                            active_sl = current_sl_on_exchange
+                        
+                        # =======================================================
+                        # [I] 检查最终止损 (使用 'active_sl')
+                        # =======================================================
+                        if (side == 'long' and price <= active_sl) or (side == 'short' and price >= active_sl):
+                            reason = f"Unified SL V5 Hit (Price: {price} vs Active SL: {active_sl:.4f})"
+                            if symbol not in positions_to_close: positions_to_close[symbol] = reason
+                            continue 
+
+                        # [J] 检查 AI 止盈 (保持不变)
+                        ai_tp = state.get('ai_suggested_take_profit')
+                        if ai_tp and ai_tp > 0:
+                            if (side == 'long' and price >= ai_tp) or (side == 'short' and price <= ai_tp):
+                                reason = f"AI TP Hit ({ai_tp:.4f})"
+                                if symbol not in positions_to_close: positions_to_close[symbol] = reason
+                                continue 
+
+                        # =======================================================
+                        # [K] 分批止盈 (V-Partial-TP) - (保持不变)
+                        # =======================================================
+                        current_stage = self.partial_tp_stage.get(symbol, 0)
+                        counter = self.partial_tp_counter.get(symbol, 1) 
+
+                        new_stage = current_stage
+                        if current_peak_rate >= 0.05: new_stage = 3
+                        elif current_peak_rate >= 0.025: new_stage = 2
+                        elif current_peak_rate >= 0.01: new_stage = 1
+                        
+                        if new_stage > current_stage:
+                            self.logger.info(f"WS Risk Loop ({symbol}): 进入阶段 {new_stage} (Peak: {current_peak_rate:.2%})。计数器重置为 1。")
+                            self.partial_tp_stage[symbol] = new_stage
+                            self.partial_tp_counter[symbol] = 1
+                            current_stage = new_stage
+                            counter = 1
+
+                        # --- 检查阶段 1 ---
+                        if current_stage == 1 and counter == 1:
+                            target_profit_rate = current_peak_rate * 0.55
+                            if rate < target_profit_rate:
+                                self.logger.warning(f"WS Risk Loop (Stage 1): {symbol} 触发回撤! (Peak: {current_peak_rate:.2%}, Curr: {rate:.2%}).")
+                                self.logger.warning(f"WS Risk Loop (Stage 1): 正在卖出 50%。")
+                                tasks_partial_close.append(
+                                    self.portfolio.live_partial_close(symbol, size_percent=0.50, reason="WS Risk Loop: Stage 1 TP (50%)")
+                                )
+                                self.partial_tp_counter[symbol] = 0 
+                        
+                        # --- 检查阶段 2 ---
+                        elif current_stage == 2 and counter == 1:
+                            target_profit_rate = current_peak_rate * 0.65
+                            if rate < target_profit_rate:
+                                self.logger.warning(f"WS Risk Loop (Stage 2): {symbol} 触发回撤! (Peak: {current_peak_rate:.2%}, Curr: {rate:.2%}).")
+                                self.logger.warning(f"WS Risk Loop (Stage 2): 正在卖出 30%。")
+                                tasks_partial_close.append(
+                                    self.portfolio.live_partial_close(symbol, size_percent=0.30, reason="WS Risk Loop: Stage 2 TP (30%)")
+                                )
+                                self.partial_tp_counter[symbol] = 0
+                        
+                        # --- 检查阶段 3 ---
+                        elif current_stage == 3 and counter == 1:
+                            target_profit_rate = current_peak_rate * 0.75
+                            if rate < target_profit_rate:
+                                self.logger.warning(f"WS Risk Loop (Stage 3): {symbol} 触发回撤! (Peak: {current_peak_rate:.2%}, Curr: {rate:.2%}).")
+                                self.logger.warning(f"WS Risk Loop (Stage 3): 正在卖出所有剩余仓位。")
+                                if symbol not in positions_to_close:
+                                    positions_to_close[symbol] = "WS Risk Loop: Stage 3 TP (Full)"
+                                self.partial_tp_counter[symbol] = 0
+
                     except Exception as e_risk_inner:
-                        self.logger.error(f"HF Risk Loop 内部错误: {e_risk_inner}", exc_info=True)
+                        self.logger.error(f"WS Risk Loop 内部错误: {e_risk_inner}", exc_info=True)
+                    # ----------------------------------------------------
+                    # --- [统一风控逻辑 V5 结束] ---
+                    # ----------------------------------------------------
 
-                    if sl_update_tasks:
-                        await asyncio.gather(*sl_update_tasks, return_exceptions=True)
-                    if positions_to_close:
-                         tasks_close = [self.portfolio.live_close(symbol, reason=f"HF Risk Loop: {reason}") for symbol, reason in positions_to_close.items()]
-                         await asyncio.gather(*tasks_close, return_exceptions=True)
-                         self.logger.info(f"HF Risk Loop: Hard Close actions executed for: {list(positions_to_close.keys())}")
+                # 7. (同旧) 批量执行任务
+                if tasks_partial_close:
+                    self.logger.info(f"WS Risk Loop: 正在执行 {len(tasks_partial_close)} 个部分平仓任务...")
+                    await asyncio.gather(*tasks_partial_close, return_exceptions=True)
+                
+                if sl_update_tasks:
+                    await asyncio.gather(*sl_update_tasks, return_exceptions=True)
                     
-                await asyncio.sleep(2) # 2 秒高频循环
+                if positions_to_close:
+                     tasks_close = [self.portfolio.live_close(symbol, reason=f"WS Risk Loop: {reason}") for symbol, reason in positions_to_close.items()]
+                     await asyncio.gather(*tasks_close, return_exceptions=True)
+                     self.logger.info(f"WS Risk Loop: Hard Close actions executed for: {list(positions_to_close.keys())}")
                 
             except asyncio.CancelledError: 
-                self.logger.warning("HF Risk Loop task cancelled, shutting down..."); 
+                self.logger.warning("WS Risk Loop task cancelled, shutting down..."); 
                 break
             except Exception as e: 
-                self.logger.critical(f"HF Risk Loop 致命错误: {e}", exc_info=True); 
-                await asyncio.sleep(10)
-
+                self.logger.critical(f"WS Risk Loop 致命错误: {e}", exc_info=True); 
+                self.logger.critical("将在 5 秒后尝试重启 WebSocket...")
+                await asyncio.sleep(5) # 在重试 WebSocket 连接前等待 5 秒
 
     async def start(self):
         self.logger.warning(f"🚀 AlphaTrader starting! Mode: {'LIVE' if self.is_live_trading else 'PAPER'}")
@@ -1470,7 +1629,8 @@ class AlphaTrader:
                 await self.portfolio.sync_state(); self.logger.warning("!!! LIVE State Sync Complete !!!")
             except Exception as e_sync: self.logger.critical(f"Initial LIVE state sync failed: {e_sync}", exc_info=True)
         
-        asyncio.create_task(self.high_frequency_risk_loop())
+        # [WebSocket 升级] 启动新的风控循环
+        asyncio.create_task(self.websocket_risk_loop())
         
         LIMIT_ORDER_TIMEOUT_MS = settings.AI_LIMIT_ORDER_TIMEOUT_SECONDS * 1000
         
@@ -1522,6 +1682,27 @@ class AlphaTrader:
                     await self._update_fear_and_greed_index()
                     market_data, tickers = await self._gather_all_market_data()
 
+                    # --- [吊灯止损 升级] ---
+                    # 步骤 2: 将 15m ATR 和 15m High/Low 数据传递给毫秒级循环
+                    try:
+                        temp_indicator_data = {}
+                        for symbol, data in market_data.items():
+                            atr_15m = data.get('15min_atr_14')
+                            high_15m_20p = data.get('15min_recent_high') # 来自 20 周期
+                            low_15m_20p = data.get('15min_recent_low')  # 来自 20 周期
+
+                            if atr_15m and atr_15m > 0 and high_15m_20p and low_15m_20p:
+                                temp_indicator_data[symbol] = {
+                                    "atr": atr_15m,
+                                    "high": high_15m_20p,
+                                    "low": low_15m_20p
+                                }
+                        self.current_indicator_data = temp_indicator_data # 原子性更新
+                        self.logger.debug(f"Indicator data (ATR/High/Low) updated for {len(self.current_indicator_data)} symbols.")
+                    except Exception as e_indicator_pass:
+                        self.logger.error(f"Failed to pass indicator data to WS loop: {e_indicator_pass}")
+                    # --- [吊灯止损 升级结束] ---
+
                     # 步骤 4: [V-Ultimate 优化 V4] 动态安全网 (ADX 过滤 + 1.0*ATR 缓冲)
                     if self.is_live_trading:
                         self.logger.debug("Checking Dynamic Safety Net (V4 - ADX Filtered) for losing positions...")
@@ -1568,7 +1749,7 @@ class AlphaTrader:
                                         self.logger.debug(f"Safety Net V4: {symbol} 处于震荡市 (1h ADX {adx_14:.1f} < {ADX_TREND_THRESHOLD})。安全网已禁用。")
                                         continue 
                                     
-                                    ATR_BUFFER_MULTIPLIER = 1.5 
+                                    ATR_BUFFER_MULTIPLIER = 1.5
                                     buffer = atr_14 * ATR_BUFFER_MULTIPLIER
                                     
                                     if side == 'long':
@@ -1646,65 +1827,10 @@ class AlphaTrader:
 
                     
                     # 步骤 5: [中频] Rule 6 ATR 追踪止损 (10s 周期)
-                    if self.is_live_trading:
-                        sl_update_tasks_rule6 = []
-                        try:
-                            open_positions_rule6 = self.portfolio.position_manager.get_all_open_positions()
-                            for symbol, state in open_positions_rule6.items():
-                                
-                                # --- [V5 BUG 修复] 在此添加宽限期检查 ---
-                                try:
-                                    entries_list = state.get('entries', []) 
-                                    if not entries_list: continue 
-                                    
-                                    last_entry_timestamp = entries_list[-1].get('timestamp', 0) 
-                                    time_since_entry = (time.time() * 1000) - last_entry_timestamp
-                                    
-                                    if time_since_entry < self.SAFETY_NET_GRACE_PERIOD_MS:
-                                        self.logger.debug(f"ATR Trail: {symbol} 仍在 {self.SAFETY_NET_GRACE_PERIOD_MS/60000:.0f} 分钟宽限期内。跳过 ATR 追踪止损。")
-                                        continue
-                                        
-                                except Exception as e_ts:
-                                    self.logger.warning(f"ATR Trail: 无法获取 {symbol} 的 entry timestamp: {e_ts}。将继续检查。")
-                                # --- [V5 修复结束] ---
-                                    
-                                price = tickers.get(symbol, {}).get('last')
-                                entry = state.get('avg_entry_price')
-                                side = state.get('side')
-                                if not price or not entry:
-                                    continue
-                                
-                                is_profitable = (side == 'long' and price > entry) or (side == 'short' and price < entry)
-                                
-                                if is_profitable:
-                                    atr_15m = market_data.get(symbol, {}).get('15min_atr_14')
-                                    if not atr_15m or atr_15m <= 0:
-                                        self.logger.warning(f"Main Loop (ATR Trail): 无法获取 {symbol} 的 15min_atr_14")
-                                        continue
-                                    
-                                    ATR_TRAIL_MULTIPLIER = 2.0 
-                                    current_sl = state.get('ai_suggested_stop_loss', 0.0)
-                                    new_sl = 0.0
-
-                                    if side == 'long':
-                                        new_sl = price - (ATR_TRAIL_MULTIPLIER * atr_15m)
-                                        if new_sl > current_sl:
-                                            sl_update_tasks_rule6.append(
-                                                self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Main Loop: Rule 6 ATR Trail")
-                                            )
-                                    elif side == 'short':
-                                        new_sl = price + (ATR_TRAIL_MULTIPLIER * atr_15m)
-                                        if new_sl < current_sl:
-                                             sl_update_tasks_rule6.append(
-                                                self.portfolio.update_position_rules(symbol, stop_loss=new_sl, reason="Main Loop: Rule 6 ATR Trail")
-                                            )
-                            
-                            if sl_update_tasks_rule6:
-                                self.logger.info(f"Main Loop (ATR Trail): 正在为 {len(sl_update_tasks_rule6)} 个 Rule 6 仓位更新追踪止损...")
-                                await asyncio.gather(*sl_update_tasks_rule6, return_exceptions=True)
-
-                        except Exception as e_atr_trail:
-                            self.logger.error(f"Main Loop: Rule 6 ATR 追踪止损失败: {e_atr_trail}", exc_info=True)
+                    # --- [WebSocket 升级] ---
+                    # [已删除] 此模块 (Rule 6 ATR Trail) 已被移除
+                    # 它的逻辑已合并到 websocket_risk_loop 的统一止损计算中
+                    # --- [升级结束] ---
                     
                     
                     # 步骤 6: [低频] 决定是否触发 AI (Rule 6)
