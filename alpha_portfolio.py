@@ -364,6 +364,29 @@ class AlphaPortfolio:
                                         final_state = self.position_manager.get_position_state(symbol)
                                         final_avg_price = final_state.get('avg_entry_price', current_avg_price)
                                         final_total_size = final_state.get('total_size', current_total_size)
+
+# --- [新逻辑: 移动止损至新的 (含手续费) 成本价] ---
+                                        try:
+                                            fee_rate = 0.001 # 0.1%
+                                            new_breakeven_sl = 0.0
+                                            if side == 'long':
+                                                new_breakeven_sl = final_avg_price * (1 + fee_rate)
+                                            elif side == 'short':
+                                                new_breakeven_sl = final_avg_price * (1 - fee_rate)
+                                            
+                                            if new_breakeven_sl > 0:
+                                                self.logger.warning(f"Sync (Add): 正在将止损移动到新的 (含手续费) 成本价: {new_breakeven_sl:.4f}")
+                                                # 直接调用 position_manager.update_rules (它在 portfolio 中)
+                                                self.position_manager.update_rules(
+                                                    symbol, 
+                                                    stop_loss=new_breakeven_sl, 
+                                                    reason="Pyramiding: SL to new B/E+Fee"
+                                                )
+                                            else:
+                                                self.logger.error(f"Sync (Add): 计算新的保本止损失败 (Price: {new_breakeven_sl:.4f})")
+                                        except Exception as e_breakeven:
+                                            self.logger.error(f"Sync (Add): 更新止损至新成本价时出错: {e_breakeven}")
+                                        # --- [新逻辑结束] ---
                                         
                                         try:
                                             title = f"🔼 {self.mode_str} AI 限价加仓成交: {side.upper()} {symbol.split('/')[0]}"
@@ -914,28 +937,61 @@ class AlphaPortfolio:
                  await self.live_close(symbol, reason=f"{reason} (转为全平)")
                  return
              size_to_close = min(size_absolute, current_total_size) 
-        else: self.logger.error(f"!!! {self.mode_str} 部分平仓失败: 无效数量参数..."); await send_bark_notification(f"❌ {self.mode_str} AI 部分平仓失败", f"品种: {symbol}\n原因: 无效数量参数"); return
+        else: 
+            self.logger.error(f"!!! {self.mode_str} 部分平仓失败: 无效数量参数..."); 
+            await send_bark_notification(f"❌ {self.mode_str} AI 部分平仓失败", f"品种: {symbol}\n原因: 无效数量参数"); 
+            return
 
         try:
              raw_exchange = self.client.exchange
              if not raw_exchange.markets: await self.client.load_markets()
              market = raw_exchange.markets.get(symbol)
              if not market: raise ValueError(f"无法找到市场信息 {symbol}")
-             size_to_close = float(raw_exchange.amount_to_precision(symbol, size_to_close))
+
+             # --- [BUG 修复 V2 (按用户要求调整) 开始] ---
+             
+             # 1. 提前获取最小下单量
              min_amount = market.get('limits', {}).get('amount', {}).get('min')
+             if min_amount is None:
+                 self.logger.warning(f"无法获取 {symbol} 的 min_amount，将跳过最小量检查。")
+
+             # 2. 检查计算出的 size_to_close 是否小于 min_amount
              if min_amount is not None and size_to_close < min_amount:
-                 if size_to_close > 1e-9:
-                      if current_total_size - size_to_close < min_amount: 
-                           self.logger.warning(f"{self.mode_str} 部分平仓 {symbol}: 计算量 {size_to_close} < 最小量 {min_amount} 且剩余量也小，转为全平。")
-                           await self.live_close(symbol, reason=f"{reason} (转为全平)")
-                           return
-                      else:
-                           self.logger.warning(f"{self.mode_str} 部分平仓 {symbol}: 计算量 {size_to_close} < 最小量 {min_amount}，尝试平最小量。")
-                           size_to_close = min_amount
-                 else: 
-                      self.logger.error(f"!!! {self.mode_str} 部分平仓失败: 数量过小 ({size_to_close})"); await send_bark_notification(f"❌ {self.mode_str} AI 部分平仓失败", f"品种: {symbol}\n原因: 平仓数量过小"); return
-             if size_to_close <= 0: self.logger.error(f"!!! {self.mode_str} 部分平仓失败: 计算数量为 0"); return
-        except Exception as e: self.logger.error(f"!!! {self.mode_str} 部分平仓失败 (检查数量时出错): {e}", exc_info=True); return
+                 self.logger.warning(f"!!! {self.mode_str} 部分平仓: 计算量 {size_to_close:.8f} < 交易所最小量 {min_amount}。")
+                 
+                 # 3. [用户请求] 尝试将数量增加到 min_amount，而不是跳过
+                 
+                 # 3a. (Edge Case) 检查 min_amount 是否大于或等于我们的总持仓
+                 if min_amount >= current_total_size:
+                     self.logger.warning(f"!!! {self.mode_str} 最小量 {min_amount} >= 总持仓 {current_total_size}。转为全平。")
+                     await self.live_close(symbol, reason=f"{reason} (Partial < Min, convert to Full)")
+                     return # 任务完成，退出函数
+                 
+                 # 3b. (正常) 增加到 min_amount
+                 else:
+                     self.logger.warning(f"!!! {self.mode_str} 正在将平仓量从 {size_to_close:.8f} 增加到 {min_amount} (交易所最小量)。")
+                     size_to_close = min_amount
+             
+             # 4. 检查 (可能已调整的) 数量是否仍为 0 (例如 size_percent=0 导致)
+             if size_to_close <= 0: 
+                 self.logger.error(f"!!! {self.mode_str} 部分平仓失败: 最终计算数量为 0"); 
+                 return
+
+             # 5. [安全] 现在，在所有检查和调整之后，才调用 amount_to_precision
+             size_to_close = float(raw_exchange.amount_to_precision(symbol, size_to_close))
+             
+             # 6. [最终安全检查] 再次检查格式化后的值
+             if min_amount is not None and size_to_close < min_amount:
+                 self.logger.error(f"!!! {self.mode_str} 部分平仓失败 (Precision Fallback): 格式化后 {size_to_close} < {min_amount}。")
+                 return
+             if size_to_close <= 0: 
+                 self.logger.error(f"!!! {self.mode_str} 部分平仓失败 (Precision Fallback): 格式化后数量为 0。")
+                 return
+             # --- [BUG 修复 V2 结束] ---
+
+        except Exception as e: 
+            self.logger.error(f"!!! {self.mode_str} 部分平仓失败 (检查数量时出错): {e}", exc_info=True); 
+            return
 
         try:
             internal_side = pos_state['side']; avg_entry_price = pos_state['avg_entry_price']
@@ -953,7 +1009,7 @@ class AlphaPortfolio:
             filled_size = float(order_result['filled']); timestamp = int(order_result['timestamp'])
             
             if filled_size <= 0:
-                self.logger.error(f"!!! {self.mode_str} 部分平仓失败: 交易所返回成交量为 0 (Filled=0)。仓位可能过小。")
+                self.logger.error(f"!!! {self.mode_str} 部分平仓失败: 交易所返回成交量为 0 (Filled=0)。")
                 return
 
             close_fee = await self._parse_fee_from_order(order_result, symbol)
@@ -992,7 +1048,6 @@ class AlphaPortfolio:
             else: raise RuntimeError("position_manager.reduce_position 返回失败")
         except InsufficientFunds as e: self.logger.error(f"!!! {self.mode_str} 部分平仓失败 (资金不足): {e}", exc_info=False); await send_bark_notification(f"❌ {self.mode_str} AI 部分平仓失败", f"品种: {symbol}\n原因: 资金不足")
         except Exception as e: self.logger.error(f"!!! {self.mode_str} 部分平仓失败: {e}", exc_info=True); await send_bark_notification(f"❌ {self.mode_str} AI 部分平仓失败", f"品种: {symbol}\n错误: {e}")
-
 
     async def live_close(self, symbol, reason: str = "N/A"):
         self.logger.warning(f"!!! {self.mode_str} 正在尝试(全)平仓: {symbol} | 原因: {reason} !!!")
