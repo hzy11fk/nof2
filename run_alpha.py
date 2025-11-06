@@ -8,7 +8,8 @@ import asyncio
 # [V-FIX] 错误: ccxt.pro 是 WebSocket 库。
 # import ccxt.pro as ccxtpro 
 # [V-FIX] 正确: ccxt.async_support 是 asyncio REST 库。
-import ccxt.async_support as ccxt 
+#import ccxt.async_support as ccxt
+import ccxt.pro as ccxt
 import logging
 from config import settings
 from exchange_client import ExchangeClient
@@ -41,9 +42,13 @@ async def main():
         logger.info("正在连接到币安合约测试网 (binanceusdm)...")
     else:
         # [V-FIX] 确保使用 U本位合约 和正确的 ccxt 对象
-        exchange = ccxt.binanceusdm(exchange_config)
-        logger.info("正在连接到币安合约实盘 (binanceusdm)...")
-    
+        exchange = ccxt.binanceusdm(exchange_config) #
+        
+        # [V-Ultimate 修复] 必须显式设置 sandbox_mode=False
+        # 否则 ccxt 可能会保留在沙盒模式
+        exchange.set_sandbox_mode(False) 
+        
+        logger.info("正在连接到币安合约实盘 (binanceusdm)...") 
     exchange_client = ExchangeClient(exchange)
 
     # 创建 AI Alpha Trader 实例
