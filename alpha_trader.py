@@ -1461,12 +1461,12 @@ class AlphaTrader:
 
                         # 候选者 3: V3 阶梯止盈 (按峰值锁定利润)
                         target_profit_rate_v3 = 0.0
-                        if current_peak_rate >= 0.05: # > 5% 
+                        if current_peak_rate >= 0.06: # > 6% 
+                            target_profit_rate_v3 = current_peak_rate * 0.85 # 锁定 85%
+                        elif current_peak_rate >= 0.04: # 4% - 6%
                             target_profit_rate_v3 = current_peak_rate * 0.75 # 锁定 75%
-                        elif current_peak_rate >= 0.025: # 2.5% - 5%
+                        elif current_peak_rate >= 0.02: # 2% - 4%
                             target_profit_rate_v3 = current_peak_rate * 0.65 # 锁定 65%
-                        elif current_peak_rate >= 0.01: # 1% - 2.5%
-                            target_profit_rate_v3 = current_peak_rate * 0.55 # 锁定 55%
                         
                         if target_profit_rate_v3 > 0.0:
                             target_upl_v3 = target_profit_rate_v3 * margin
