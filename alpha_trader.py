@@ -1017,7 +1017,7 @@ class AlphaTrader:
         except Exception as e: self.logger.error(f"Hard stop failed: Fetch Tickers err: {e}"); return False
         
         # [PaperFix] 模拟盘检查 hard stops
-        for symbol, pos in list(self.paper_positions.items()):
+        for symbol, pos in list(self.portfolio.paper_positions.items()):
             if not pos or not isinstance(pos, dict) or pos.get('size', 0) <= 0: continue
             price = tickers.get(symbol, {}).get('last');
             if not price: self.logger.warning(f"Hard stop skipped: No price {symbol}."); continue
