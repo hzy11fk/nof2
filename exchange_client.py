@@ -66,7 +66,21 @@ class ExchangeClient:
     async def fetch_tickers(self, symbols: list):
         """[新增整合] 获取多个交易对的 Tickers，并应用重试逻辑。"""
         return await self._retry_async_method(self.exchange.fetch_tickers, symbols)
-
+    async def watch_tickers(self, symbols: list):
+        """
+        [WebSocket 升级] 传递 ccxt.pro 的 watch_tickers 方法。
+        ccxt.pro 会自动处理重连。
+        """
+        if not hasattr(self.exchange, 'watch_tickers'):
+            self.logger.critical("!!! 严重错误: 内部交易所对象没有 'watch_tickers'。")
+            self.logger.critical("!!! 确认您在 run_alpha.py 中导入了 'ccxt.pro'!")
+            raise NotImplementedError("Exchange object does not support WebSocket (watch_tickers).")
+            
+        try:
+            return await self.exchange.watch_tickers(symbols)
+        except Exception as e:
+            self.logger.error(f"watch_tickers 发生错误: {e}")
+            raise # 重新抛出错误，让上层 (websocket_risk_loop) 处理
     async def fetch_ticker(self, symbol: str):
         """获取最新价格，并应用重试逻辑。"""
         return await self._retry_async_method(self.exchange.fetch_ticker, symbol)
